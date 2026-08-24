@@ -1469,6 +1469,7 @@ func followTranscripts(_ options: Options) {
         var report = "transcript: \(transcript.path)"
         let json = transcript.deletingPathExtension().appendingPathExtension("jsonl")
         if FileManager.default.fileExists(atPath: json.path) { report += "\n  jsonl: \(json.path)" }
+        stdout.write(Data("\n".utf8)) // stand the report off from the last thing said
         status(report)
     }
 }
