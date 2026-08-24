@@ -144,6 +144,11 @@ func axClasses(_ element: AXUIElement) -> [String] {
 
 func axDomID(_ element: AXUIElement) -> String { axString(element, "AXDOMIdentifier") }
 
+/// Native apps expose AXIdentifier where Chromium ones expose DOM ids.
+func axIdentifier(_ element: AXUIElement) -> String { axString(element, "AXIdentifier") }
+
+func axDescription(_ element: AXUIElement) -> String { axString(element, kAXDescriptionAttribute) }
+
 func axNodeID(_ element: AXUIElement) -> String { axString(element, "ChromeAXNodeId") }
 
 /// Visible text of a subtree, in document order, without the duplication you
@@ -187,6 +192,7 @@ struct Utterance {
     var speaker: String
     var text: String
     var startedAt: Date
+    var changedAt: Date
 }
 
 /// The scrolling terminal view: finished lines scroll up, in-progress speech
@@ -368,6 +374,20 @@ protocol MeetingApp {
 
     func chatContainer(_ app: AXUIElement) -> AXUIElement?
     func chatMessages(in container: AXUIElement) -> [ChatMessage]
+
+    /// True when finished utterances stay on screen, so waiting for one to
+    /// disappear would hold the whole transcript back. Such an app is assumed
+    /// to append: anything above the newest entry is done being edited.
+    var finalizesWhenSuperseded: Bool { get }
+    /// Write an utterance out once its text has been unchanged this long, for
+    /// apps that would otherwise leave the last line pending indefinitely.
+    var idleFinalizeSeconds: TimeInterval? { get }
+}
+
+extension MeetingApp {
+    // Teams-style: an utterance is done when its element disappears.
+    var finalizesWhenSuperseded: Bool { false }
+    var idleFinalizeSeconds: TimeInterval? { nil }
 }
 
 func windowTitle(containing element: AXUIElement) -> String? {
@@ -494,7 +514,84 @@ struct TeamsApp: MeetingApp {
     }
 }
 
-let supportedApps: [MeetingApp] = [TeamsApp()]
+// MARK: - Zoom
+
+/// Zoom is a native app, so there are no DOM ids, but it labels its controls
+/// with AXIdentifier (`leave`, `captions`, `chat`) and its caption list with a
+/// description, which serve the same purpose.
+struct ZoomApp: MeetingApp {
+    let id = "zoom"
+    let displayName = "Zoom"
+    let processPattern = "zoom.us.app/Contents/MacOS/zoom.us"
+
+    private let captionTableDescription = "Closed caption subtitles"
+
+    /// The End/Leave button exists only during a call.
+    func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) { axIdentifier($0) == "leave" }
+    }
+
+    /// Every Zoom window is called "Zoom Meeting", so use the topic button in
+    /// the title bar, which reads e.g. "Ada's Personal Meeting Room".
+    func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String {
+        if let info = findElement(from: app, where: { axIdentifier($0) == "MeetingTopBarInfoButton" }) {
+            let topic = axDescription(info).trimmingCharacters(in: .whitespaces)
+            if !topic.isEmpty { return topic }
+        }
+        return "Zoom meeting"
+    }
+
+    func captionsContainer(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) { axDescription($0) == captionTableDescription }
+    }
+
+    /// Rows are AXRow > AXCell > [speaker, text]. Zoom hands out no ids, but
+    /// the row elements themselves stay put, so their hash identifies them.
+    func captionEntries(in container: AXUIElement) -> [CaptionEntry] {
+        axChildren(container).compactMap { row in
+            let texts = axStaticTexts(row)
+            guard texts.count >= 2 else { return nil }
+            return CaptionEntry(
+                id: String(CFHash(row)),
+                speaker: texts[0],
+                text: texts.dropFirst().joined(separator: " ")
+            )
+        }
+    }
+
+    private func captionsButton(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) { axIdentifier($0) == "captions" }
+    }
+
+    func captionsPanelOpen(_ app: AXUIElement) -> Bool {
+        if captionsContainer(app) != nil { return true }
+        // "Hide captions" means they are already showing.
+        guard let button = captionsButton(app) else { return false }
+        return axDescription(button).localizedCaseInsensitiveContains("hide captions")
+    }
+
+    /// No synthetic keystroke needed: the toolbar button is pressable, and its
+    /// description says which way it will toggle.
+    func requestCaptions(pid: pid_t) {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 5.0)
+        guard let button = captionsButton(app),
+              axDescription(button).localizedCaseInsensitiveContains("show captions") else { return }
+        AXUIElementPerformAction(button, kAXPressAction as CFString)
+    }
+
+    // Zoom's chat panel is a separate surface that has to be open to read; not
+    // wired up yet, so chat is simply skipped.
+    func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
+    func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
+
+    // Rows accumulate rather than being cleared, so finalize on being pushed
+    // up by a newer row, and give the newest row a few seconds to settle.
+    var finalizesWhenSuperseded: Bool { true }
+    var idleFinalizeSeconds: TimeInterval? { 6 }
+}
+
+let supportedApps: [MeetingApp] = [TeamsApp(), ZoomApp()]
 
 
 // MARK: - Session
@@ -518,8 +615,10 @@ final class Session {
     private var captionAttempts = 0
     private var lastCaptionCheck = Date.distantPast
     private var sawCaptions = false
-    /// Recently written utterances, to catch Teams re-rendering a finished one.
+    /// Recently written utterances, to catch an app re-rendering a finished one.
     private var written: [(speaker: String, text: String, at: Date)] = []
+    /// Ids already written but still on screen.
+    private var finalized = Set<String>()
 
     init(options: Options, live: LiveView, meetingApp: MeetingApp, title: String) {
         self.options = options
@@ -594,14 +693,32 @@ final class Session {
         }
         let visible = Set(entries.map(\.id))
         for id in captionOrder where !visible.contains(id) { finalizeCaption(id, at: now) }
+        finalized.formIntersection(visible) // let ids be reused once they are gone
         for entry in entries {
+            // Written already, but still on screen: leave it alone.
+            guard !finalized.contains(entry.id) else { continue }
             if var utterance = activeCaptions[entry.id] {
+                if utterance.text != entry.text { utterance.changedAt = now }
                 utterance.speaker = entry.speaker
                 utterance.text = entry.text
                 activeCaptions[entry.id] = utterance
             } else {
-                activeCaptions[entry.id] = Utterance(speaker: entry.speaker, text: entry.text, startedAt: now)
+                activeCaptions[entry.id] = Utterance(
+                    speaker: entry.speaker, text: entry.text, startedAt: now, changedAt: now)
                 captionOrder.append(entry.id)
+            }
+        }
+
+        // Apps that keep finished utterances on screen need another way to tell
+        // that one is done.
+        if meetingApp.finalizesWhenSuperseded, let newest = entries.last?.id {
+            for id in captionOrder where id != newest { finalizeCaption(id, at: now) }
+        }
+        if let idle = meetingApp.idleFinalizeSeconds {
+            for id in captionOrder {
+                guard let utterance = activeCaptions[id],
+                      now.timeIntervalSince(utterance.changedAt) > idle else { continue }
+                finalizeCaption(id, at: now)
             }
         }
         guard recorder != nil || !captionOrder.isEmpty else { return }
@@ -655,6 +772,7 @@ final class Session {
     private func finalizeCaption(_ id: String, at date: Date) {
         guard let utterance = activeCaptions.removeValue(forKey: id) else { return }
         captionOrder.removeAll { $0 == id }
+        finalized.insert(id)
         guard !utterance.text.isEmpty else { return }
         guard !supersededByActive(utterance, id: id), !alreadyWritten(utterance, now: date) else { return }
         emit(
