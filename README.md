@@ -23,7 +23,7 @@ $ meeting-capture
 The last line updates in place as the sentence is spoken, then scrolls up when
 it's final.
 
-**Status:** Microsoft Teams works. Zoom is next.
+**Supported:** Microsoft Teams, Zoom.
 
 ## Why the Accessibility API
 
@@ -37,12 +37,15 @@ Every other option is worse:
 | Chrome DevTools protocol | The desktop app opens no debugging port |
 | Audio + Whisper | No speaker names, and you still need the audio |
 
-Teams renders its UI in a Chromium WebView, which exposes DOM ids and class
-lists to the accessibility tree. That gives stable anchors — caption entries
-are `fui-ChatMessageCompact__body` groups holding `[speaker, text]`, chat
-messages carry `message-body-<epoch_ms>` ids — and it costs no CPU worth
-mentioning, works with the window in the background, and hands you speaker
-names for free.
+Both apps label the parts we need. Teams renders its UI in a Chromium WebView,
+so the accessibility tree carries DOM ids and class lists: caption entries are
+`fui-ChatMessageCompact__body` groups holding `[speaker, text]`, chat messages
+carry `message-body-<epoch_ms>` ids. Zoom is native but sets `AXIdentifier` on
+its controls (`leave`, `captions`, `chat`) and describes its caption list as
+`Closed caption subtitles`.
+
+Reading those costs no CPU worth mentioning, works with the window in the
+background, and hands you speaker names for free.
 
 ## Install
 
@@ -107,7 +110,7 @@ write a second transcript of the same meeting.
 
 | Flag | Effect |
 | --- | --- |
-| `--app <name>` | Only watch one app (`teams`) |
+| `--app <name>` | Only watch one app (`teams`, `zoom`) |
 | `--auto-captions` | Turn live captions on when a meeting starts |
 | `--dir <path>` | Output directory |
 | `--interval <ms>` | Poll interval during a meeting (default 250) |
@@ -118,10 +121,11 @@ write a second transcript of the same meeting.
 
 ### Automatic captions
 
-`--auto-captions` (on by default in the agent) presses the app's own captions
-shortcut when it finds a meeting without them. The keystroke goes straight to
-the process with `CGEvent.postToPid`, which bypasses global event taps — so a
-Hammerspoon or Karabiner remap of that shortcut won't intercept it.
+`--auto-captions` (on by default in the agent) turns captions on when it finds
+a meeting without them. Zoom exposes a pressable captions button, so it just
+presses it. Teams doesn't, so its shortcut (⇧⌘A) goes straight to the process
+with `CGEvent.postToPid`, which bypasses global event taps — a Hammerspoon or
+Karabiner remap of that shortcut won't intercept it.
 
 It checks the captions panel chrome rather than whether captions are visible,
 because apps clear the text after a few seconds of silence, and it stops trying
@@ -156,16 +160,24 @@ can attribute diarised audio to real names.
 
 The daemon polls the accessibility tree of each supported app:
 
-1. **Is there a meeting?** Teams shows a Leave button (`hangup-button`) only
-   during a call. Its absence for ten consecutive seconds ends the session —
-   the button also disappears briefly during UI transitions, hence the debounce.
-2. **Read the captions.** Each on-screen utterance has a stable node id. When an
-   id disappears, that utterance is finished and gets written out.
-3. **Read the chat.** Message ids are epoch milliseconds, which double as
-   timestamps. Anything already on screen when you join is treated as seen.
+1. **Is there a meeting?** Both apps show a Leave button only during a call
+   (`hangup-button` in Teams, `AXIdentifier=leave` in Zoom). Its absence for ten
+   consecutive seconds ends the session — the button also disappears briefly
+   during UI transitions, hence the debounce.
+2. **Read the captions**, and decide when an utterance is finished. The two apps
+   differ here, which is why `MeetingApp` gets a say:
 
-A finished utterance is often re-rendered under a fresh node id, so identical
-text from the same speaker is dropped if an active node already carries it as a
+   - **Teams** clears old captions, keeping about three on screen. An utterance
+     is done when its node id disappears.
+   - **Zoom** appends rows and keeps them, so nothing would ever "disappear". A
+     row is done once a newer row appears beneath it, or once its text has been
+     unchanged for six seconds.
+3. **Read the chat.** In Teams, message ids are epoch milliseconds, which double
+   as timestamps; anything already on screen when you join is treated as seen.
+   Zoom chat is not wired up yet.
+
+A finished utterance is often re-rendered under a fresh id, so identical text
+from the same speaker is dropped if an active entry already carries it as a
 prefix, or if it was written in the last thirty seconds.
 
 ### Adding an app
