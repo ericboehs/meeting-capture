@@ -59,6 +59,7 @@ func usage() -> String {
 
       --once               capture only the meeting happening now, then stop
       --follow             just watch the newest transcript, never record
+                           (--watch does the same)
       --app <name>         only watch one app (\(supportedApps.map(\.id).joined(separator: ", ")))
       --auto-captions      turn live captions on when a meeting starts
       --interval <ms>      poll interval while in a meeting (default 250)
@@ -92,7 +93,7 @@ func parseOptions() -> Options {
     while !args.isEmpty {
         let flag = args.removeFirst()
         switch flag {
-        case "--watch": break // leftover; same as no args. Use --follow to only watch.
+        case "--watch": options.follow = true // reads as the passive verb; treat it as one
         case "--once": options.once = true
         case "--follow": options.follow = true
         case "--auto-captions": options.autoCaptions = true
@@ -317,6 +318,10 @@ struct Recorder {
     /// that report how long the call has been running let us number lines from
     /// the start of the meeting instead of from when we joined it.
     var timelineStart: Date
+    /// False when the app has no call clock: `[HH:MM:SS]` is then the time of
+    /// day, which is true whenever we joined, rather than a count from zero
+    /// that would imply the meeting began when we started watching.
+    var countsFromMeetingStart = true
     let jsonlURL: URL
     let textURL: URL
     private let jsonl: FileHandle
@@ -367,7 +372,17 @@ struct Recorder {
         return formatter
     }()
 
-    func elapsed(_ date: Date) -> String { elapsedString(from: timelineStart, to: date) }
+    func elapsed(_ date: Date) -> String {
+        countsFromMeetingStart
+            ? elapsedString(from: timelineStart, to: date)
+            : Recorder.clockFormatter.string(from: date)
+    }
+
+    static let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     func writeJSON(_ payload: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
@@ -459,6 +474,12 @@ protocol MeetingApp {
     /// apps that would otherwise leave the last line pending indefinitely.
     var idleFinalizeSeconds: TimeInterval? { get }
 
+    /// True when the app shows how long the call has been running, so lines
+    /// can be numbered from the start of the meeting. An app without one can
+    /// only count from when we joined, which says nothing useful about a
+    /// meeting already in progress - those transcripts get the time of day.
+    var reportsMeetingClock: Bool { get }
+
     /// True when the caption surface is only present while someone is
     /// speaking. Its absence then says nothing about whether captions are
     /// switched on, so once it has been seen the app must not be asked again.
@@ -479,6 +500,7 @@ extension MeetingApp {
     var captionsSurfaceIsTransient: Bool { false }
     // Most apps don't say how long the call has been going.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
+    var reportsMeetingClock: Bool { false }
     var captionPressToggles: Bool { false }
     // Assume native AppKit; only opt in to the wake where it is needed.
     var rendersWebContent: Bool { false }
@@ -565,6 +587,8 @@ struct TeamsApp: MeetingApp {
             return title.hasPrefix("Meeting with ")
         }
     }
+
+    let reportsMeetingClock = true
 
     /// Teams paints the ticking clock as a child AXStaticText ("31:01").
     /// The group's title ("Elapsed time 21:54") is frozen at first render.
@@ -865,6 +889,8 @@ struct ZoomApp: MeetingApp {
     }
 
     /// Zoom keeps a clock in the title bar, described as "My connected time is
+    let reportsMeetingClock = true
+
     /// 34:50" (or "1:34:50"). It's the only account of when the call actually
     /// began that survives us being started late.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? {
@@ -1027,6 +1053,7 @@ final class Session {
         if let recorder { return recorder }
         var created = Recorder(options: options, meeting: title, startedAt: startedAt)
         created.timelineStart = timelineStart
+        created.countsFromMeetingStart = meetingApp.reportsMeetingClock
         var metadata: [String: Any] = [
             "type": "metadata",
             "source": "\(meetingApp.id)-ax",
@@ -1104,6 +1131,14 @@ final class Session {
         if stamp != date { extra["started_at"] = Recorder.isoFormatter.string(from: date) }
         let line = recorderForWriting().record(kind: kind, speaker: speaker, body: body, at: stamp, extra: extra)
         live.permanent(line)
+    }
+
+    /// Matches how the recorder stamps finished lines, so the live region and
+    /// the transcript above it read the same way.
+    private func stamp(_ date: Date) -> String {
+        meetingApp.reportsMeetingClock
+            ? elapsedString(from: timelineStart, to: date)
+            : Recorder.clockFormatter.string(from: date)
     }
 
     func tick(app: AXUIElement, pid: pid_t, now: Date) {
@@ -1228,7 +1263,7 @@ final class Session {
         let pending = captionOrder.compactMap { id -> String? in
             guard let utterance = activeCaptions[id],
                   !supersededByActive(utterance, id: id) else { return nil }
-            return "[\(elapsedString(from: timelineStart, to: utterance.startedAt))] \(utterance.speaker): \(utterance.text)"
+            return "[\(stamp(utterance.startedAt))] \(utterance.speaker): \(utterance.text)"
         }
         let shown = pending.enumerated().map { $0.offset == pending.count - 1 ? "\($0.element) ▍" : $0.element }
         live.set(shown)
@@ -1428,6 +1463,14 @@ func followTranscripts(_ options: Options) {
         usleep(250_000)
     }
     eraseLive()
+    // On the way out, say where the words went. The filename alone was shown
+    // when the meeting started, which may be a long way up the scrollback.
+    if let transcript = current ?? newestTranscript(in: options.directory) {
+        var report = "transcript: \(transcript.path)"
+        let json = transcript.deletingPathExtension().appendingPathExtension("jsonl")
+        if FileManager.default.fileExists(atPath: json.path) { report += "\n  jsonl: \(json.path)" }
+        status(report)
+    }
 }
 
 // MARK: - Main

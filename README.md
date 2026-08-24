@@ -173,6 +173,11 @@ in its title bar. Attach to a meeting already in progress and the first line
 reads `[00:36:41]` rather than `[00:00:00]`, and `meeting_started_at` records
 what it was measured against.
 
+Slack publishes no such clock, so a huddle is stamped with the time of day
+instead. Counting from zero there would claim the huddle began when the capture
+did, which is only true if you opened it; the time of day is true whenever you
+joined, and lines up with the channel it happened in.
+
 Wall-clock `ts` and `ended_at` on every caption make this useful beyond reading:
 align the timestamps against a Whisper transcript of the same meeting and you
 can attribute diarised audio to real names.
