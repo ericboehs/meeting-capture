@@ -18,6 +18,7 @@
 // compiled binary when run from launchd).
 
 import ApplicationServices
+import AppKit
 import CoreGraphics
 import Foundation
 
@@ -91,7 +92,7 @@ func parseOptions() -> Options {
     while !args.isEmpty {
         let flag = args.removeFirst()
         switch flag {
-        case "--watch": break // now the default; accepted so old invocations work
+        case "--watch": break // leftover; same as no args. Use --follow to only watch.
         case "--once": options.once = true
         case "--follow": options.follow = true
         case "--auto-captions": options.autoCaptions = true
@@ -209,7 +210,7 @@ final class LiveView {
         updatesRegion = printsLines && isatty(STDOUT_FILENO) == 1
     }
 
-    private static func terminalWidth() -> Int {
+    static func terminalWidth() -> Int {
         var size = winsize()
         if ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0, size.ws_col > 0 { return Int(size.ws_col) }
         return 100
@@ -391,6 +392,9 @@ protocol MeetingApp {
     func captionsPanelOpen(_ app: AXUIElement) -> Bool
     /// Ask the app to show captions.
     func requestCaptions(pid: pid_t) -> CaptionRequest
+    /// True when the captions control is a toggle (Teams' ⇧⌘A). A second
+    /// press would turn them back off, so we must not retry blindly.
+    var captionPressToggles: Bool { get }
 
     func chatContainer(_ app: AXUIElement) -> AXUIElement?
     func chatMessages(in container: AXUIElement) -> [ChatMessage]
@@ -402,6 +406,12 @@ protocol MeetingApp {
     /// Write an utterance out once its text has been unchanged this long, for
     /// apps that would otherwise leave the last line pending indefinitely.
     var idleFinalizeSeconds: TimeInterval? { get }
+
+    /// True when the UI is a Chromium/Electron web view. Such apps keep their
+    /// accessibility tree switched off until a client asks for it, and must be
+    /// woken before anything can be read. Native apps must NOT be poked this
+    /// way: AXEnhancedUserInterface triggers window-resize bugs in AppKit.
+    var rendersWebContent: Bool { get }
 }
 
 extension MeetingApp {
@@ -410,6 +420,9 @@ extension MeetingApp {
     var idleFinalizeSeconds: TimeInterval? { nil }
     // Most apps don't say how long the call has been going.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
+    var captionPressToggles: Bool { false }
+    // Assume native AppKit; only opt in to the wake where it is needed.
+    var rendersWebContent: Bool { false }
 }
 
 func windowTitle(containing element: AXUIElement) -> String? {
@@ -449,6 +462,12 @@ struct TeamsApp: MeetingApp {
     let id = "teams"
     let displayName = "Microsoft Teams"
     let processPattern = "Microsoft Teams.app/Contents/MacOS/MSTeams"
+    let captionPressToggles = true
+    // Teams 2 is Edge WebView2, so its tree starts switched off.
+    let rendersWebContent = true
+    // Teams keeps ~3 lines on screen; without this, --follow sees nothing
+    // until they scroll away.
+    var idleFinalizeSeconds: TimeInterval? { 6 }
 
     /// Caption entries are groups of [speaker, text] carrying this class.
     private let captionEntryClass = "fui-ChatMessageCompact__body"
@@ -459,9 +478,53 @@ struct TeamsApp: MeetingApp {
         "captions-settings-menu-trigger-button-non-overflow"
     ]
 
-    /// The Leave button only exists while a call is up.
+    /// Meeting-only chrome. hangup-button is the obvious one, but Teams'
+    /// WebView can take minutes to expose the full toolbar; the call timer
+    /// often appears first and is just as reliable.
+    private let meetingAnchorIDs: Set<String> = ["hangup-button", "call-duration-custom"]
+
     func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
-        findElement(from: app) { axDomID($0) == "hangup-button" }
+        if let chrome = findElement(from: app, where: { meetingAnchorIDs.contains(axDomID($0)) }) {
+            return chrome
+        }
+        // Teams often takes minutes to put the WebView in the accessibility
+        // tree (229 native nodes, zero DOM ids). The window title still says
+        // "Meeting with …" for a 1:1 call, which is enough to start and to
+        // press the captions shortcut.
+        return meetingWindow(app)
+    }
+
+    /// 1:1 calls are titled "Meeting with Name (Org) | Microsoft Teams".
+    /// Chat windows use the person's name without that prefix, so this stays
+    /// off when you are just messaging.
+    private func meetingWindow(_ app: AXUIElement) -> AXUIElement? {
+        let windows = axAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        return windows.first { window in
+            let title = axString(window, kAXTitleAttribute)
+                .replacingOccurrences(of: "| Microsoft Teams", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            return title.hasPrefix("Meeting with ")
+        }
+    }
+
+    /// Teams paints the ticking clock as a child AXStaticText ("31:01").
+    /// The group's title ("Elapsed time 21:54") is frozen at first render.
+    func meetingElapsed(_ app: AXUIElement) -> TimeInterval? {
+        guard let clock = findElement(from: app, where: { axDomID($0) == "call-duration-custom" }) else {
+            return nil
+        }
+        if let elapsed = Self.parseClock(axStaticTexts(clock).joined(separator: " ")) { return elapsed }
+        return Self.parseClock(axString(clock, kAXTitleAttribute))
+    }
+
+    private static func parseClock(_ raw: String) -> TimeInterval? {
+        let digits = raw.split(whereSeparator: { !$0.isNumber && $0 != ":" }).first { $0.contains(":") } ?? ""
+        let parts = digits.split(separator: ":").compactMap { Int($0) }
+        switch parts.count {
+        case 2: return TimeInterval(parts[0] * 60 + parts[1])
+        case 3: return TimeInterval(parts[0] * 3600 + parts[1] * 60 + parts[2])
+        default: return nil
+        }
     }
 
     func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String {
@@ -705,6 +768,9 @@ final class Session {
     private var written: [(speaker: String, text: String, at: Date)] = []
     /// Ids already written but still on screen.
     private var finalized = Set<String>()
+    private var wakeAttempts = 0
+    private var nextWake = Date.distantPast
+    private var treePopulated = false
     /// What `[HH:MM:SS]` counts from: the start of the meeting once the app
     /// tells us, otherwise the moment we attached.
     private var timelineStart: Date
@@ -740,10 +806,45 @@ final class Session {
         }
         created.writeJSON(metadata)
         recorder = created
+        let pointer = options.stateDirectory + "/current"
+        try? created.textURL.path.write(toFile: pointer, atomically: true, encoding: .utf8)
         if !options.quiet {
             status("recording \"\(title)\"\n  jsonl: \(created.jsonlURL.path)\n  text:  \(created.textURL.path)")
         }
         return created
+    }
+
+    /// Chromium keeps its accessibility tree switched off until a client asks
+    /// for it, so a fresh Teams launch is a hollow window: ~229 nodes, no DOM
+    /// ids, no captions. Two attributes turn it on, and which one applies
+    /// depends on how the app is built:
+    ///
+    ///   AXManualAccessibility   Electron's documented opt-in (Slack, VS Code).
+    ///   AXEnhancedUserInterface Chromium's own switch, which is what Teams 2
+    ///                           needs — it is Edge WebView2, not Electron
+    ///                           (see the EdgeBrowserFrameViewMac DOM class).
+    ///
+    /// Both report failure on Teams (attributeUnsupported / notImplemented) yet
+    /// the tree still populates within a second, because Chromium activates on
+    /// the attempt rather than on a successful set. So ignore the return codes
+    /// and check whether DOM ids showed up instead.
+    private func wakeTreeIfNeeded(app: AXUIElement, pid: pid_t, now: Date) {
+        guard meetingApp.rendersWebContent else { treePopulated = true; return }
+        if findElement(from: app, where: { !axDomID($0).isEmpty }) != nil {
+            if !treePopulated, wakeAttempts > 0, !options.quiet {
+                status("\(meetingApp.displayName) exposed its accessibility tree")
+            }
+            treePopulated = true
+            return
+        }
+        guard now >= nextWake else { return }
+        nextWake = now.addingTimeInterval(5)
+        wakeAttempts += 1
+        AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        if !options.quiet, wakeAttempts <= 3 {
+            status("asked \(meetingApp.displayName) to expose its accessibility tree (attempt \(wakeAttempts))")
+        }
     }
 
     /// Ask the app how long the call has been running, so lines are numbered
@@ -751,7 +852,7 @@ final class Session {
     /// part of the window chrome, which Zoom hides along with its toolbar, so
     /// keep asking until it answers.
     private func resolveTimeline(app: AXUIElement, now: Date) {
-        guard !timelineResolved, now >= nextTimelineCheck else { return }
+        guard now >= nextTimelineCheck else { return }
         nextTimelineCheck = now.addingTimeInterval(5)
         guard let elapsed = meetingApp.meetingElapsed(app), elapsed > 0 else { return }
         timelineResolved = true
@@ -765,6 +866,7 @@ final class Session {
     }
 
     func tick(app: AXUIElement, pid: pid_t, now: Date) {
+        wakeTreeIfNeeded(app: app, pid: pid, now: now)
         resolveTimeline(app: app, now: now)
         let needsCaptions = options.captureCaptions && captionsContainer == nil
         let needsChat = options.captureChat && chatContainer == nil
@@ -782,35 +884,43 @@ final class Session {
     /// Turn captions on if the panel isn't up. Gives up quickly: toggling a
     /// shortcut we can't verify is worse than missing a transcript.
     private func ensureCaptionsOn(app: AXUIElement, pid: pid_t, now: Date) {
-        guard !sawCaptions, captionAttempts < 2,
+        if meetingApp.captionsPanelOpen(app) {
+            sawCaptions = true
+            return
+        }
+        // Panel looks closed. If we already pressed while the tree was hollow,
+        // do not guess again. Once the tree is readable we can see it is
+        // really off and it is safe to toggle back on.
+        if sawCaptions {
+            guard treePopulated else { return }
+            sawCaptions = false
+            captionAttempts = 0
+        }
+        guard captionAttempts < 2,
               now.timeIntervalSince(startedAt) > 3,
               now >= nextCaptionCheck else { return }
         nextCaptionCheck = now.addingTimeInterval(8)
-        guard !meetingApp.captionsPanelOpen(app) else {
-            sawCaptions = true // panel is up, just idle — never press again
-            return
-        }
         switch meetingApp.requestCaptions(pid: pid) {
         case .alreadyOn:
-            // Captions are running but their panel isn't readable yet; pressing
-            // again would only turn them back off.
             sawCaptions = true
             return
         case .unreachable:
-            // Out of reach for now (Zoom hides its toolbar until the pointer is
-            // over the window), so keep looking rather than spending a try.
             if !warnedCaptionsUnreachable, !options.quiet {
                 warnedCaptionsUnreachable = true
                 status("\(meetingApp.displayName) is hiding its captions control; will turn captions on when it reappears")
             }
             return
         case .pressed:
-            // Captions take a few seconds to start, and Zoom's panel doesn't
-            // exist until they do, so don't judge the result too soon.
-            nextCaptionCheck = now.addingTimeInterval(20)
+            captionAttempts += 1
+            if !options.quiet {
+                status("asked \(meetingApp.displayName) to show live captions (attempt \(captionAttempts))")
+            }
+            if meetingApp.captionPressToggles && !treePopulated {
+                sawCaptions = true
+            } else {
+                nextCaptionCheck = now.addingTimeInterval(20)
+            }
         }
-        captionAttempts += 1
-        if !options.quiet { status("asked \(meetingApp.displayName) to show live captions (attempt \(captionAttempts))") }
     }
 
     private func pollCaptions(now: Date) {
@@ -824,10 +934,21 @@ final class Session {
         for id in captionOrder where !visible.contains(id) { finalizeCaption(id, at: now) }
         finalized.formIntersection(visible) // let ids be reused once they are gone
         for entry in entries {
-            // Written already, but still on screen: leave it alone.
-            guard !finalized.contains(entry.id) else { continue }
+            if finalized.contains(entry.id) {
+                // Same row kept growing after we idle-finalized it (Zoom).
+                let grew = written.contains {
+                    $0.speaker == entry.speaker && entry.text.hasPrefix($0.text) && entry.text != $0.text
+                }
+                if grew { finalized.remove(entry.id) } else { continue }
+            }
             if var utterance = activeCaptions[entry.id] {
-                if utterance.text != entry.text { utterance.changedAt = now }
+                if utterance.text != entry.text {
+                    utterance.changedAt = now
+                    // Same node, new sentence (not a live edit growing the text).
+                    if !entry.text.hasPrefix(utterance.text) && !utterance.text.hasPrefix(entry.text) {
+                        utterance.startedAt = now
+                    }
+                }
                 utterance.speaker = entry.speaker
                 utterance.text = entry.text
                 activeCaptions[entry.id] = utterance
@@ -844,7 +965,8 @@ final class Session {
             for id in captionOrder where id != newest { finalizeCaption(id, at: now) }
         }
         if let idle = meetingApp.idleFinalizeSeconds {
-            for id in captionOrder {
+            let newest = entries.last?.id
+            for id in captionOrder where id != newest {
                 guard let utterance = activeCaptions[id],
                       now.timeIntervalSince(utterance.changedAt) > idle else { continue }
                 finalizeCaption(id, at: now)
@@ -853,10 +975,20 @@ final class Session {
         guard recorder != nil || !captionOrder.isEmpty else { return }
         // Mirror every in-progress utterance; finished lines scroll above.
         let pending = captionOrder.compactMap { id -> String? in
-            guard let utterance = activeCaptions[id] else { return nil }
+            guard let utterance = activeCaptions[id],
+                  !supersededByActive(utterance, id: id) else { return nil }
             return "[\(elapsedString(from: timelineStart, to: utterance.startedAt))] \(utterance.speaker): \(utterance.text)"
         }
-        live.set(pending.enumerated().map { $0.offset == pending.count - 1 ? "\($0.element) ▍" : $0.element })
+        let shown = pending.enumerated().map { $0.offset == pending.count - 1 ? "\($0.element) ▍" : $0.element }
+        live.set(shown)
+        publishLive(shown)
+    }
+
+    /// So `--follow` can show in-progress speech. The daemon is not a tty, so
+    /// LiveView's in-place region never appears in launchd.log.
+    private func publishLive(_ pending: [String]) {
+        let url = URL(fileURLWithPath: options.stateDirectory + "/live")
+        try? pending.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
     private func pollChat(now: Date) {
@@ -919,6 +1051,8 @@ final class Session {
     func finish(at date: Date) {
         live.erase()
         for id in captionOrder { finalizeCaption(id, at: date) }
+        try? FileManager.default.removeItem(atPath: options.stateDirectory + "/live")
+        try? FileManager.default.removeItem(atPath: options.stateDirectory + "/current")
         guard let writer = recorder else { return }
         writer.writeJSON([
             "type": "metadata",
@@ -955,35 +1089,100 @@ func newestTranscript(in directory: String) -> URL? {
     return entries.filter { $0.pathExtension == "txt" }.max { modified($0) < modified($1) }
 }
 
-/// Tail the newest transcript, switching over when a new meeting starts.
+/// Tail the meeting the daemon is recording. Prefers the `current` pointer
+/// (set when the first line is written) so we never reopen last week's Zoom
+/// file. In-progress speech lives in `live` because the daemon is not a tty
+/// and Teams does not write a line until it settles.
 func followTranscripts(_ options: Options) {
     let stdout = FileHandle.standardOutput
     var current: URL?
     var offset: UInt64 = 0
+    var lastLive = ""
+    var liveRows = 0
     var lastScan = Date.distantPast
+    var logOffset: UInt64 = 0
+    let pointer = options.stateDirectory + "/current"
+    let livePath = options.stateDirectory + "/live"
+    let logURL = URL(fileURLWithPath: options.stateDirectory + "/launchd.log")
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+       let size = attrs[.size] as? UInt64 {
+        logOffset = size
+    }
     if !options.quiet { status("following \(options.directory)") }
+
+    func eraseLive() {
+        guard liveRows > 0, isatty(STDOUT_FILENO) == 1 else { liveRows = 0; return }
+        var escape = "\r\u{1B}[2K"
+        for _ in 1..<liveRows { escape += "\u{1B}[1A\u{1B}[2K" }
+        stdout.write(Data(escape.utf8))
+        liveRows = 0
+    }
 
     while !stopRequested {
         let now = Date()
-        if now.timeIntervalSince(lastScan) > 1 {
+        if now.timeIntervalSince(lastScan) > 0.4 {
             lastScan = now
-            if let newest = newestTranscript(in: options.directory), newest != current {
-                current = newest
-                offset = 0 // print the meeting so far, then keep up with it
-                if !options.quiet { status("\(newest.lastPathComponent)") }
+            if let path = try? String(contentsOfFile: pointer, encoding: .utf8) {
+                let url = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
+                if url != current {
+                    eraseLive()
+                    current = url
+                    offset = 0
+                    if !options.quiet { status(url.lastPathComponent) }
+                }
+            } else if current != nil {
+                eraseLive()
+                current = nil
+                offset = 0
+                lastLive = ""
+                if !options.quiet { status("waiting for the next meeting") }
+            }
+            if let handle = try? FileHandle(forReadingFrom: logURL) {
+                try? handle.seek(toOffset: logOffset)
+                let data = handle.readDataToEndOfFile()
+                if !data.isEmpty {
+                    eraseLive()
+                    lastLive = ""
+                    stdout.write(data)
+                    logOffset += UInt64(data.count)
+                }
+                try? handle.close()
             }
         }
         if let current, let handle = try? FileHandle(forReadingFrom: current) {
             try? handle.seek(toOffset: offset)
             let data = handle.readDataToEndOfFile()
             if !data.isEmpty {
+                eraseLive()
                 stdout.write(data)
                 offset += UInt64(data.count)
+                lastLive = "" // redraw the live region under the new permanent lines
             }
             try? handle.close()
         }
-        usleep(400_000)
+        let liveText = (try? String(contentsOfFile: livePath, encoding: .utf8)) ?? ""
+        if liveText != lastLive {
+            eraseLive()
+            lastLive = liveText
+            let width = LiveView.terminalWidth()
+            let rendered = liveText.trimmingCharacters(in: .newlines)
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map { line -> String in
+                    var body = String(line).replacingOccurrences(of: "\n", with: " ")
+                    if body.count > width - 1 {
+                        body = String(body.prefix(max(1, width - 2))) + "…"
+                    }
+                    return body
+                }
+                .filter { !$0.isEmpty }
+            if !rendered.isEmpty {
+                stdout.write(Data(rendered.joined(separator: "\n").utf8))
+                liveRows = rendered.count
+            }
+        }
+        usleep(250_000)
     }
+    eraseLive()
 }
 
 // MARK: - Main
@@ -1071,6 +1270,7 @@ if options.once {
 
 var lastMeetingCheck = Date.distantPast
 var lastUnreadableWarning = Date.distantPast
+var lastWaitingWarning = Date.distantPast
 
 while !stopRequested {
     let now = Date()
@@ -1084,12 +1284,16 @@ while !stopRequested {
             // Look for a call in any supported app, re-resolving pids as apps
             // are quit and reopened.
             var unreadable: [String] = []
+            var waiting: [String] = []
             for candidate in runningApps() {
                 guard !axChildren(candidate.element).isEmpty else {
                     unreadable.append(candidate.meetingApp.displayName)
                     continue
                 }
-                guard let anchor = candidate.meetingApp.meetingAnchor(candidate.element) else { continue }
+                guard let anchor = candidate.meetingApp.meetingAnchor(candidate.element) else {
+                    waiting.append(candidate.meetingApp.displayName)
+                    continue
+                }
                 let title = candidate.meetingApp.meetingTitle(candidate.element, anchor: anchor)
                 attachment = candidate
                 session = Session(options: options, live: live, meetingApp: candidate.meetingApp, title: title)
@@ -1103,6 +1307,12 @@ while !stopRequested {
                 lastUnreadableWarning = now
                 if !options.quiet {
                     status("cannot read the accessibility tree of \(unreadable.joined(separator: ", "))")
+                }
+            }
+            if session == nil, !waiting.isEmpty, now.timeIntervalSince(lastWaitingWarning) > 30 {
+                lastWaitingWarning = now
+                if !options.quiet {
+                    status("\(waiting.joined(separator: ", ")) is running, waiting for a meeting")
                 }
             }
         } else if let current = attachment {
