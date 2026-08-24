@@ -127,6 +127,13 @@ presses it. Teams doesn't, so its shortcut (⇧⌘A) goes straight to the proces
 with `CGEvent.postToPid`, which bypasses global event taps — a Hammerspoon or
 Karabiner remap of that shortcut won't intercept it.
 
+Zoom hides its meeting toolbar whenever the pointer leaves the window, and a
+hidden toolbar isn't in the accessibility tree at all — there's no menu item or
+preference to reach the button another way, and a synthetic mouse-move doesn't
+fool it. So for Zoom this is opportunistic: it waits, and presses the moment the
+toolbar next appears. Moving your mouse over the window once is enough. Turning
+captions on yourself works just as well; capture doesn't depend on any of this.
+
 It checks the captions panel chrome rather than whether captions are visible,
 because apps clear the text after a few seconds of silence, and it stops trying
 after two attempts. An earlier version got this wrong and toggled the panel on
