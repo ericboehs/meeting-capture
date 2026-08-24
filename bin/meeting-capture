@@ -210,7 +210,7 @@ final class LiveView {
         updatesRegion = printsLines && isatty(STDOUT_FILENO) == 1
     }
 
-    private static func terminalWidth() -> Int {
+    static func terminalWidth() -> Int {
         var size = winsize()
         if ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0, size.ws_col > 0 { return Int(size.ws_col) }
         return 100
@@ -1109,13 +1109,20 @@ func followTranscripts(_ options: Options) {
         if liveText != lastLive {
             eraseLive()
             lastLive = liveText
-            let body = liveText.trimmingCharacters(in: .newlines)
-            if !body.isEmpty {
-                // No trailing newline: cursor stays on the last live line so
-                // eraseLive's \r + up-N matches LiveView. An extra \n made
-                // erase start one row too low and stack every update.
-                stdout.write(Data(body.utf8))
-                liveRows = body.split(separator: "\n", omittingEmptySubsequences: false).count
+            let width = LiveView.terminalWidth()
+            let rendered = liveText.trimmingCharacters(in: .newlines)
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map { line -> String in
+                    var body = String(line).replacingOccurrences(of: "\n", with: " ")
+                    if body.count > width - 1 {
+                        body = String(body.prefix(max(1, width - 2))) + "…"
+                    }
+                    return body
+                }
+                .filter { !$0.isEmpty }
+            if !rendered.isEmpty {
+                stdout.write(Data(rendered.joined(separator: "\n").utf8))
+                liveRows = rendered.count
             }
         }
         usleep(250_000)
