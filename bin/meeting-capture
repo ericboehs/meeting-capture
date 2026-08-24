@@ -459,9 +459,28 @@ struct TeamsApp: MeetingApp {
         "captions-settings-menu-trigger-button-non-overflow"
     ]
 
-    /// The Leave button only exists while a call is up.
+    /// Meeting-only chrome. hangup-button is the obvious one, but Teams'
+    /// WebView can take minutes to expose the full toolbar; the call timer
+    /// often appears first and is just as reliable.
+    private let meetingAnchorIDs: Set<String> = ["hangup-button", "call-duration-custom"]
+
     func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
-        findElement(from: app) { axDomID($0) == "hangup-button" }
+        findElement(from: app) { meetingAnchorIDs.contains(axDomID($0)) }
+    }
+
+    /// Teams labels the call timer "Elapsed time 04:10" (or H:MM:SS).
+    func meetingElapsed(_ app: AXUIElement) -> TimeInterval? {
+        guard let clock = findElement(from: app, where: { axDomID($0) == "call-duration-custom" }) else {
+            return nil
+        }
+        let title = axString(clock, kAXTitleAttribute)
+        let digits = title.split(separator: " ").last ?? ""
+        let parts = digits.split(separator: ":").compactMap { Int($0) }
+        switch parts.count {
+        case 2: return TimeInterval(parts[0] * 60 + parts[1])
+        case 3: return TimeInterval(parts[0] * 3600 + parts[1] * 60 + parts[2])
+        default: return nil
+        }
     }
 
     func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String {
@@ -955,22 +974,48 @@ func newestTranscript(in directory: String) -> URL? {
     return entries.filter { $0.pathExtension == "txt" }.max { modified($0) < modified($1) }
 }
 
-/// Tail the newest transcript, switching over when a new meeting starts.
+/// Tail the newest *live* transcript, switching over when a new meeting starts.
+/// An old file sitting in the directory is not live — otherwise quitting Zoom
+/// and joining Teams would keep showing the Zoom transcript until someone
+/// speaks in Teams (files are created lazily).
 func followTranscripts(_ options: Options) {
     let stdout = FileHandle.standardOutput
+    let startedAt = Date()
     var current: URL?
     var offset: UInt64 = 0
+    var logOffset: UInt64 = 0
     var lastScan = Date.distantPast
+    let logURL = URL(fileURLWithPath: options.stateDirectory + "/launchd.log")
+    // Start at the end of the daemon log so we only print what happens now.
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+       let size = attrs[.size] as? UInt64 {
+        logOffset = size
+    }
     if !options.quiet { status("following \(options.directory)") }
+
+    func modified(_ file: URL) -> Date {
+        (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+    }
 
     while !stopRequested {
         let now = Date()
         if now.timeIntervalSince(lastScan) > 1 {
             lastScan = now
-            if let newest = newestTranscript(in: options.directory), newest != current {
+            if let newest = newestTranscript(in: options.directory),
+               newest != current,
+               modified(newest) >= startedAt.addingTimeInterval(-15) {
                 current = newest
-                offset = 0 // print the meeting so far, then keep up with it
+                offset = 0
                 if !options.quiet { status("\(newest.lastPathComponent)") }
+            }
+            if let handle = try? FileHandle(forReadingFrom: logURL) {
+                try? handle.seek(toOffset: logOffset)
+                let data = handle.readDataToEndOfFile()
+                if !data.isEmpty {
+                    stdout.write(data)
+                    logOffset += UInt64(data.count)
+                }
+                try? handle.close()
             }
         }
         if let current, let handle = try? FileHandle(forReadingFrom: current) {
@@ -1071,6 +1116,7 @@ if options.once {
 
 var lastMeetingCheck = Date.distantPast
 var lastUnreadableWarning = Date.distantPast
+var lastWaitingWarning = Date.distantPast
 
 while !stopRequested {
     let now = Date()
@@ -1084,12 +1130,16 @@ while !stopRequested {
             // Look for a call in any supported app, re-resolving pids as apps
             // are quit and reopened.
             var unreadable: [String] = []
+            var waiting: [String] = []
             for candidate in runningApps() {
                 guard !axChildren(candidate.element).isEmpty else {
                     unreadable.append(candidate.meetingApp.displayName)
                     continue
                 }
-                guard let anchor = candidate.meetingApp.meetingAnchor(candidate.element) else { continue }
+                guard let anchor = candidate.meetingApp.meetingAnchor(candidate.element) else {
+                    waiting.append(candidate.meetingApp.displayName)
+                    continue
+                }
                 let title = candidate.meetingApp.meetingTitle(candidate.element, anchor: anchor)
                 attachment = candidate
                 session = Session(options: options, live: live, meetingApp: candidate.meetingApp, title: title)
@@ -1103,6 +1153,12 @@ while !stopRequested {
                 lastUnreadableWarning = now
                 if !options.quiet {
                     status("cannot read the accessibility tree of \(unreadable.joined(separator: ", "))")
+                }
+            }
+            if session == nil, !waiting.isEmpty, now.timeIntervalSince(lastWaitingWarning) > 30 {
+                lastWaitingWarning = now
+                if !options.quiet {
+                    status("\(waiting.joined(separator: ", ")) is running, waiting for a meeting")
                 }
             }
         } else if let current = attachment {
