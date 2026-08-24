@@ -607,24 +607,29 @@ struct TeamsApp: MeetingApp {
 /// Zoom is a native app, so there are no DOM ids, but it labels its controls
 /// with AXIdentifier (`leave`, `captions`, `chat`) and its caption list with a
 /// description, which serve the same purpose.
-struct SlackApp: MeetingApp {
+final class SlackApp: MeetingApp {
     let id = "slack"
     let displayName = "Slack"
     let processPattern = "Slack.app/Contents/MacOS/Slack"
     // Slack is Electron, so its tree starts switched off.
     let rendersWebContent = true
-    // The event log appends and keeps everything, like Zoom.
-    let finalizesWhenSuperseded = true
-    // The newest line is still being spoken; write it out once it settles.
-    var idleFinalizeSeconds: TimeInterval? { 6 }
+    // Overlay events vanish when they are done, so absence means finished.
+    // They also grow while being spoken, and Slack replaces the element each
+    // time it does, so give an utterance time to settle before writing it:
+    // finalizing early emits the partial, then the full line lands as a
+    // second copy.
+    var idleFinalizeSeconds: TimeInterval? { 8 }
 
     private let leaveDescription = "Leave Huddle"
-    private let memberNameClass = "p-huddle_event_log__member_name"
-    private let eventTextClass = "p-huddle_event_log__event_text"
-    private let listClass = "c-virtual_list__scroll_container"
-    private let activePanelClass = "c-tabs__tab_panel--active"
     private let overlayClass = "p-huddle_closed_captions"
     private let overlayEventClass = "p-huddle_closed_caption_event__wrapper"
+    private let settledMarker = "fade_out"
+
+    /// Which utterance the live slot is holding, and what it last said. Slack
+    /// swaps the element on every revision, so identity has to be tracked here
+    /// rather than read off the tree.
+    private var liveSequence = 0
+    private var previousLiveText = ""
 
     /// A huddle gets its own window, and the Leave button only exists while
     /// one is up.
@@ -658,33 +663,20 @@ struct SlackApp: MeetingApp {
         }
     }
 
-    /// Captions surface in two places, and we take whichever is available:
+    /// Captions surface both in the side flexpane's captions tab and as an
+    /// overlay on the video tiles, and we deliberately read only the overlay.
     ///
-    ///   1. The captions tab of the side flexpane. A complete, appending log \u2014
-    ///      the better source, so it wins when present.
-    ///   2. The closed-caption overlay on the video tiles, which holds only the
-    ///      last few lines and fades them out.
+    /// The flexpane shows one tab at a time, so reading it would stop
+    /// capturing the moment someone opened Threads. The overlay is there
+    /// whichever tab is up, which is the whole point.
     ///
-    /// The flexpane shows one tab at a time, so reading the panel alone would
-    /// stop capturing the moment someone opens Threads. Falling back to the
-    /// overlay keeps the transcript going while they read. Duplicates across a
-    /// switch are absorbed by the recorder, which ignores a repeated
-    /// speaker+text within 30s.
+    /// Reading both is worse than reading either. Neither source has a stable
+    /// identity \u2014 panel rows are a virtual list keyed by index, and Slack
+    /// reuses an index when it merges consecutive utterances by one speaker,
+    /// while overlay events are keyed by element hash and Slack replaces the
+    /// element whenever the text grows. Two sources of unstable ids meant the
+    /// same sentence was written once from each.
     func captionsContainer(_ app: AXUIElement) -> AXUIElement? {
-        panelContainer(app) ?? overlayContainer(app)
-    }
-
-    /// Enter through the *active* tab panel so a user reading threads is never
-    /// mistaken for captions.
-    private func panelContainer(_ app: AXUIElement) -> AXUIElement? {
-        guard let tab = captionsTab(app),
-              axAttribute(tab, kAXValueAttribute) as? Int == 1,
-              let panel = findElement(from: app, where: { axClasses($0).contains(activePanelClass) })
-        else { return nil }
-        return findElement(from: panel) { axClasses($0).contains(listClass) }
-    }
-
-    private func overlayContainer(_ app: AXUIElement) -> AXUIElement? {
         guard let window = huddleWindow(app) else { return nil }
         return findElement(from: window) { axClasses($0).contains(overlayClass) }
     }
@@ -692,42 +684,61 @@ struct SlackApp: MeetingApp {
     /// Slack shows no call clock in the huddle window.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
 
-    /// Handles both sources. Panel items are virtual-list rows carrying their
-    /// index as a DOM id; the first is a notice ("Captions are being generated
-    /// in English (US).") with no speaker, which the member-name requirement
-    /// filters out. Being virtual, rows scrolled out of view leave the tree \u2014 so
-    /// identify them by index, which is stable, rather than by element hash,
-    /// which is recycled. Overlay events instead read [speaker, ":", text] and
-    /// carry no id at all, so they fall back to the hash like Zoom's rows.
+    /// Overlay events read [speaker, ":", text], the colon being its own node.
+    ///
+    /// They carry no id, and the element hash is useless as identity because
+    /// Slack replaces the element every time the text changes \u2014 which it does
+    /// constantly while speech is being recognised, revising words rather than
+    /// only appending ("Kinda hard to fill" becomes "Kind of hard to fill
+    /// her"). Keying on the hash wrote one line per revision, and prefix
+    /// matching could not collapse them because a revision is not a prefix.
+    ///
+    /// The list is ordered oldest to newest and holds about five events, and
+    /// Slack marks every settled one `fade_out`. So at most one event \u2014 the
+    /// last \u2014 is still being spoken, and it is the only one that can change.
+    /// Settled events are therefore keyed by their content, which is now
+    /// fixed, and the live one keeps a single synthetic id across all its
+    /// revisions so it lands as one utterance.
     func captionEntries(in container: AXUIElement) -> [CaptionEntry] {
-        axChildren(container).compactMap { item in
-            if axClasses(item).contains(overlayEventClass) { return overlayEntry(item) }
-            guard let speaker = text(in: item, matching: memberNameClass),
-                  let spoken = text(in: item, matching: eventTextClass)
-            else { return nil }
-            let index = axDomID(item)
-            return CaptionEntry(
-                id: index.isEmpty ? String(CFHash(item)) : index,
-                speaker: speaker,
-                text: spoken
-            )
+        var settled: [(speaker: String, text: String)] = []
+        var live: (speaker: String, text: String)?
+
+        for item in axChildren(container) {
+            let classes = axClasses(item)
+            guard classes.contains(overlayEventClass) else { continue }
+            let texts = axStaticTexts(item)
+            guard texts.count >= 3 else { continue }
+            let spoken = texts.dropFirst(2).joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces)
+            guard !spoken.isEmpty else { continue }
+            if classes.contains(where: { $0.contains(settledMarker) }) {
+                settled.append((texts[0], spoken))
+            } else {
+                live = (texts[0], spoken)
+            }
         }
+
+        // Once the sentence the live slot was holding shows up settled, the
+        // slot has moved on to a new utterance and must not keep the old id.
+        if !previousLiveText.isEmpty, settled.contains(where: { $0.text == previousLiveText }) {
+            liveSequence += 1
+            previousLiveText = ""
+        }
+
+        var entries = settled.map {
+            CaptionEntry(id: "settled:\(identity(of: $0.speaker, $0.text))", speaker: $0.speaker, text: $0.text)
+        }
+        if let live {
+            previousLiveText = live.text
+            // Last, so the recorder treats it as the line still being spoken
+            // and leaves it out of idle finalization.
+            entries.append(CaptionEntry(id: "live:\(liveSequence)", speaker: live.speaker, text: live.text))
+        }
+        return entries
     }
 
-    private func overlayEntry(_ item: AXUIElement) -> CaptionEntry? {
-        let texts = axStaticTexts(item)
-        guard texts.count >= 3 else { return nil }
-        // [speaker, ":", text...] \u2014 the colon is its own node.
-        let spoken = texts.dropFirst(2).joined(separator: " ").trimmingCharacters(in: .whitespaces)
-        guard !spoken.isEmpty else { return nil }
-        return CaptionEntry(id: String(CFHash(item)), speaker: texts[0], text: spoken)
-    }
-
-    private func text(in item: AXUIElement, matching className: String) -> String? {
-        guard let node = findElement(from: item, where: { axClasses($0).contains(className) })
-        else { return nil }
-        let value = axStaticTexts(node).joined(separator: " ").trimmingCharacters(in: .whitespaces)
-        return value.isEmpty ? nil : value
+    private func identity(of speaker: String, _ text: String) -> String {
+        String(UInt(bitPattern: "\(speaker)|\(text)".hashValue), radix: 16)
     }
 
     func captionsPanelOpen(_ app: AXUIElement) -> Bool {
