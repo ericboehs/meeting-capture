@@ -455,6 +455,9 @@ struct TeamsApp: MeetingApp {
     let displayName = "Microsoft Teams"
     let processPattern = "Microsoft Teams.app/Contents/MacOS/MSTeams"
     let captionPressToggles = true
+    // Teams keeps ~3 lines on screen; without this, --follow sees nothing
+    // until they scroll away.
+    var idleFinalizeSeconds: TimeInterval? { 6 }
 
     /// Caption entries are groups of [speaker, text] carrying this class.
     private let captionEntryClass = "fui-ChatMessageCompact__body"
@@ -786,6 +789,8 @@ final class Session {
         }
         created.writeJSON(metadata)
         recorder = created
+        let pointer = options.stateDirectory + "/current"
+        try? created.textURL.path.write(toFile: pointer, atomically: true, encoding: .utf8)
         if !options.quiet {
             status("recording \"\(title)\"\n  jsonl: \(created.jsonlURL.path)\n  text:  \(created.textURL.path)")
         }
@@ -924,7 +929,16 @@ final class Session {
             guard let utterance = activeCaptions[id] else { return nil }
             return "[\(elapsedString(from: timelineStart, to: utterance.startedAt))] \(utterance.speaker): \(utterance.text)"
         }
-        live.set(pending.enumerated().map { $0.offset == pending.count - 1 ? "\($0.element) ▍" : $0.element })
+        let shown = pending.enumerated().map { $0.offset == pending.count - 1 ? "\($0.element) ▍" : $0.element }
+        live.set(shown)
+        publishLive(shown)
+    }
+
+    /// So `--follow` can show in-progress speech. The daemon is not a tty, so
+    /// LiveView's in-place region never appears in launchd.log.
+    private func publishLive(_ pending: [String]) {
+        let url = URL(fileURLWithPath: options.stateDirectory + "/live")
+        try? pending.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
     private func pollChat(now: Date) {
@@ -987,6 +1001,8 @@ final class Session {
     func finish(at date: Date) {
         live.erase()
         for id in captionOrder { finalizeCaption(id, at: date) }
+        try? FileManager.default.removeItem(atPath: options.stateDirectory + "/live")
+        try? FileManager.default.removeItem(atPath: options.stateDirectory + "/current")
         guard let writer = recorder else { return }
         writer.writeJSON([
             "type": "metadata",
@@ -1023,61 +1039,66 @@ func newestTranscript(in directory: String) -> URL? {
     return entries.filter { $0.pathExtension == "txt" }.max { modified($0) < modified($1) }
 }
 
-/// Tail the newest *live* transcript, switching over when a new meeting starts.
-/// An old file sitting in the directory is not live — otherwise quitting Zoom
-/// and joining Teams would keep showing the Zoom transcript until someone
-/// speaks in Teams (files are created lazily).
+/// Tail the meeting the daemon is recording. Prefers the `current` pointer
+/// (set when the first line is written) so we never reopen last week's Zoom
+/// file. In-progress speech lives in `live` because the daemon is not a tty
+/// and Teams does not write a line until it settles.
 func followTranscripts(_ options: Options) {
     let stdout = FileHandle.standardOutput
-    let startedAt = Date()
     var current: URL?
     var offset: UInt64 = 0
-    var logOffset: UInt64 = 0
+    var lastLive = ""
+    var liveRows = 0
     var lastScan = Date.distantPast
-    let logURL = URL(fileURLWithPath: options.stateDirectory + "/launchd.log")
-    // Start at the end of the daemon log so we only print what happens now.
-    if let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
-       let size = attrs[.size] as? UInt64 {
-        logOffset = size
-    }
+    let pointer = options.stateDirectory + "/current"
+    let livePath = options.stateDirectory + "/live"
     if !options.quiet { status("following \(options.directory)") }
 
-    func modified(_ file: URL) -> Date {
-        (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+    func eraseLive() {
+        guard liveRows > 0, isatty(STDOUT_FILENO) == 1 else { liveRows = 0; return }
+        var escape = "\r\u{1B}[2K"
+        for _ in 1..<liveRows { escape += "\u{1B}[1A\u{1B}[2K" }
+        stdout.write(Data(escape.utf8))
+        liveRows = 0
     }
 
     while !stopRequested {
         let now = Date()
-        if now.timeIntervalSince(lastScan) > 1 {
+        if now.timeIntervalSince(lastScan) > 0.4 {
             lastScan = now
-            if let newest = newestTranscript(in: options.directory),
-               newest != current,
-               modified(newest) >= startedAt.addingTimeInterval(-15) {
-                current = newest
-                offset = 0
-                if !options.quiet { status("\(newest.lastPathComponent)") }
-            }
-            if let handle = try? FileHandle(forReadingFrom: logURL) {
-                try? handle.seek(toOffset: logOffset)
-                let data = handle.readDataToEndOfFile()
-                if !data.isEmpty {
-                    stdout.write(data)
-                    logOffset += UInt64(data.count)
+            if let path = try? String(contentsOfFile: pointer, encoding: .utf8) {
+                let url = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
+                if url != current {
+                    eraseLive()
+                    current = url
+                    offset = 0
+                    if !options.quiet { status(url.lastPathComponent) }
                 }
-                try? handle.close()
             }
         }
         if let current, let handle = try? FileHandle(forReadingFrom: current) {
             try? handle.seek(toOffset: offset)
             let data = handle.readDataToEndOfFile()
             if !data.isEmpty {
+                eraseLive()
                 stdout.write(data)
                 offset += UInt64(data.count)
             }
             try? handle.close()
         }
-        usleep(400_000)
+        let liveText = (try? String(contentsOfFile: livePath, encoding: .utf8)) ?? ""
+        if liveText != lastLive {
+            eraseLive()
+            lastLive = liveText
+            if !liveText.isEmpty {
+                let body = liveText.hasSuffix("\n") ? String(liveText.dropLast()) : liveText
+                stdout.write(Data((body + "\n").utf8))
+                liveRows = body.split(separator: "\n", omittingEmptySubsequences: false).count
+            }
+        }
+        usleep(250_000)
     }
+    eraseLive()
 }
 
 // MARK: - Main
