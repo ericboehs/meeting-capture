@@ -206,8 +206,11 @@ final class LiveView {
     private var lines: [String] = []
 
     init(options: Options) {
-        printsLines = !options.quiet && !options.jsonToStdout
-        updatesRegion = printsLines && isatty(STDOUT_FILENO) == 1
+        // Only a terminal gets the transcript on stdout. Under launchd stdout is
+        // the log, and every finished line was landing there as well as in the
+        // .txt \u2014 so --follow, which tails both, drew each line twice.
+        printsLines = !options.quiet && !options.jsonToStdout && isatty(STDOUT_FILENO) == 1
+        updatesRegion = printsLines
     }
 
     static func terminalWidth() -> Int {
@@ -969,6 +972,8 @@ final class Session {
     let startedAt = Date()
     var title: String
     private var recorder: Recorder?
+    /// Highest stamp written so far, so the transcript clock never goes back.
+    private var lastStamp: Date?
     private var captionsContainer: AXUIElement?
     private var chatContainer: AXUIElement?
     private var lastRelocate = Date.distantPast
@@ -1077,7 +1082,15 @@ final class Session {
     }
 
     private func emit(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any]) {
-        let line = recorderForWriting().record(kind: kind, speaker: speaker, body: body, at: date, extra: extra)
+        // Lines are appended as they finish but stamped with when they began,
+        // so a long sentence can land after a short one that started later and
+        // the clock appears to run backwards. Hold the stamp at the high-water
+        // mark, keeping the real start alongside it when they differ.
+        let stamp = max(date, lastStamp ?? date)
+        lastStamp = stamp
+        var extra = extra
+        if stamp != date { extra["started_at"] = Recorder.isoFormatter.string(from: date) }
+        let line = recorderForWriting().record(kind: kind, speaker: speaker, body: body, at: stamp, extra: extra)
         live.permanent(line)
     }
 
