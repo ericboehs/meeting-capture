@@ -459,6 +459,11 @@ protocol MeetingApp {
     /// apps that would otherwise leave the last line pending indefinitely.
     var idleFinalizeSeconds: TimeInterval? { get }
 
+    /// True when the caption surface is only present while someone is
+    /// speaking. Its absence then says nothing about whether captions are
+    /// switched on, so once it has been seen the app must not be asked again.
+    var captionsSurfaceIsTransient: Bool { get }
+
     /// True when the UI is a Chromium/Electron web view. Such apps keep their
     /// accessibility tree switched off until a client asks for it, and must be
     /// woken before anything can be read. Native apps must NOT be poked this
@@ -470,6 +475,8 @@ extension MeetingApp {
     // Teams-style: an utterance is done when its element disappears.
     var finalizesWhenSuperseded: Bool { false }
     var idleFinalizeSeconds: TimeInterval? { nil }
+    // Most apps leave the caption panel up between utterances.
+    var captionsSurfaceIsTransient: Bool { false }
     // Most apps don't say how long the call has been going.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
     var captionPressToggles: Bool { false }
@@ -671,6 +678,11 @@ final class SlackApp: MeetingApp {
     // finalizing early emits the partial, then the full line lands as a
     // second copy.
     var idleFinalizeSeconds: TimeInterval? { 8 }
+
+    // The overlay is drawn over the video tiles only while there is something
+    // to show, so it goes away during any pause. Absence means silence, not
+    // that captions were switched off.
+    var captionsSurfaceIsTransient: Bool { true }
 
     private let leaveDescription = "Leave Huddle"
     private let overlayClass = "p-huddle_closed_captions"
@@ -1117,10 +1129,14 @@ final class Session {
             sawCaptions = true
             return
         }
-        // Panel looks closed. If we already pressed while the tree was hollow,
+        // Panel looks closed. For an app whose captions only appear while
+        // someone is speaking, that is just silence - asking again would
+        // reopen a panel the user closed, or warn about captions that are
+        // running. Otherwise, if we already pressed while the tree was hollow,
         // do not guess again. Once the tree is readable we can see it is
         // really off and it is safe to toggle back on.
         if sawCaptions {
+            guard !meetingApp.captionsSurfaceIsTransient else { return }
             guard treePopulated else { return }
             sawCaptions = false
             captionAttempts = 0
