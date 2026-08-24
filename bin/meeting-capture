@@ -91,7 +91,7 @@ func parseOptions() -> Options {
     while !args.isEmpty {
         let flag = args.removeFirst()
         switch flag {
-        case "--watch": break // now the default; accepted so old invocations work
+        case "--watch": break // leftover; same as no args. Use --follow to only watch.
         case "--once": options.once = true
         case "--follow": options.follow = true
         case "--auto-captions": options.autoCaptions = true
@@ -465,7 +465,27 @@ struct TeamsApp: MeetingApp {
     private let meetingAnchorIDs: Set<String> = ["hangup-button", "call-duration-custom"]
 
     func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
-        findElement(from: app) { meetingAnchorIDs.contains(axDomID($0)) }
+        if let chrome = findElement(from: app, where: { meetingAnchorIDs.contains(axDomID($0)) }) {
+            return chrome
+        }
+        // Teams often takes minutes to put the WebView in the accessibility
+        // tree (229 native nodes, zero DOM ids). The window title still says
+        // "Meeting with …" for a 1:1 call, which is enough to start and to
+        // press the captions shortcut.
+        return meetingWindow(app)
+    }
+
+    /// 1:1 calls are titled "Meeting with Name (Org) | Microsoft Teams".
+    /// Chat windows use the person's name without that prefix, so this stays
+    /// off when you are just messaging.
+    private func meetingWindow(_ app: AXUIElement) -> AXUIElement? {
+        let windows = axAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        return windows.first { window in
+            let title = axString(window, kAXTitleAttribute)
+                .replacingOccurrences(of: "| Microsoft Teams", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            return title.hasPrefix("Meeting with ")
+        }
     }
 
     /// Teams labels the call timer "Elapsed time 04:10" (or H:MM:SS).
