@@ -406,6 +406,12 @@ protocol MeetingApp {
     /// Write an utterance out once its text has been unchanged this long, for
     /// apps that would otherwise leave the last line pending indefinitely.
     var idleFinalizeSeconds: TimeInterval? { get }
+
+    /// True when the UI is a Chromium/Electron web view. Such apps keep their
+    /// accessibility tree switched off until a client asks for it, and must be
+    /// woken before anything can be read. Native apps must NOT be poked this
+    /// way: AXEnhancedUserInterface triggers window-resize bugs in AppKit.
+    var rendersWebContent: Bool { get }
 }
 
 extension MeetingApp {
@@ -415,6 +421,8 @@ extension MeetingApp {
     // Most apps don't say how long the call has been going.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
     var captionPressToggles: Bool { false }
+    // Assume native AppKit; only opt in to the wake where it is needed.
+    var rendersWebContent: Bool { false }
 }
 
 func windowTitle(containing element: AXUIElement) -> String? {
@@ -455,6 +463,8 @@ struct TeamsApp: MeetingApp {
     let displayName = "Microsoft Teams"
     let processPattern = "Microsoft Teams.app/Contents/MacOS/MSTeams"
     let captionPressToggles = true
+    // Teams 2 is Edge WebView2, so its tree starts switched off.
+    let rendersWebContent = true
     // Teams keeps ~3 lines on screen; without this, --follow sees nothing
     // until they scroll away.
     var idleFinalizeSeconds: TimeInterval? { 6 }
@@ -804,28 +814,36 @@ final class Session {
         return created
     }
 
-    /// Chromium keeps its a11y tree off until it sees assistive tech. Electron's
-    /// documented opt-in is AXManualAccessibility=YES on the running process
-    /// (agent-desktop's enable-electron-a11y). The app root often reports
-    /// unsupported; the EdgeContentsContainerView accepts it. Activate is a
-    /// fallback if the attribute is not enough.
+    /// Chromium keeps its accessibility tree switched off until a client asks
+    /// for it, so a fresh Teams launch is a hollow window: ~229 nodes, no DOM
+    /// ids, no captions. Two attributes turn it on, and which one applies
+    /// depends on how the app is built:
+    ///
+    ///   AXManualAccessibility   Electron's documented opt-in (Slack, VS Code).
+    ///   AXEnhancedUserInterface Chromium's own switch, which is what Teams 2
+    ///                           needs — it is Edge WebView2, not Electron
+    ///                           (see the EdgeBrowserFrameViewMac DOM class).
+    ///
+    /// Both report failure on Teams (attributeUnsupported / notImplemented) yet
+    /// the tree still populates within a second, because Chromium activates on
+    /// the attempt rather than on a successful set. So ignore the return codes
+    /// and check whether DOM ids showed up instead.
     private func wakeTreeIfNeeded(app: AXUIElement, pid: pid_t, now: Date) {
-        let hasDOM = findElement(from: app) { !axDomID($0).isEmpty } != nil
-        if hasDOM { treePopulated = true; return }
-        guard now >= nextWake else { return }
-        nextWake = now.addingTimeInterval(8)
-        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-        if let edge = findElement(from: app, where: { element in
-            (axAttribute(element, "AXDOMClassList") as? [String] ?? []).contains("EdgeContentsContainerView")
-        }) {
-            AXUIElementSetAttributeValue(edge, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-        }
-        wakeAttempts += 1
-        if wakeAttempts <= 4 {
-            NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps])
-            if !options.quiet {
-                status("asked \(meetingApp.displayName) to expose its accessibility tree (attempt \(wakeAttempts))")
+        guard meetingApp.rendersWebContent else { treePopulated = true; return }
+        if findElement(from: app, where: { !axDomID($0).isEmpty }) != nil {
+            if !treePopulated, wakeAttempts > 0, !options.quiet {
+                status("\(meetingApp.displayName) exposed its accessibility tree")
             }
+            treePopulated = true
+            return
+        }
+        guard now >= nextWake else { return }
+        nextWake = now.addingTimeInterval(5)
+        wakeAttempts += 1
+        AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        if !options.quiet, wakeAttempts <= 3 {
+            status("asked \(meetingApp.displayName) to expose its accessibility tree (attempt \(wakeAttempts))")
         }
     }
 
