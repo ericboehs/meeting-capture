@@ -353,6 +353,16 @@ struct ChatMessage {
 
 /// What meeting-capture needs to know about a conferencing app. Everything
 /// else in this file is app-agnostic.
+/// What came of asking an app to turn captions on.
+enum CaptionRequest {
+    /// The control was pressed; captions should appear shortly.
+    case pressed
+    /// Captions were already running, so there is nothing left to do.
+    case alreadyOn
+    /// The control wasn't reachable — no attempt was spent, try again later.
+    case unreachable
+}
+
 protocol MeetingApp {
     /// Short name used for --app and in metadata.
     var id: String { get }
@@ -370,9 +380,8 @@ protocol MeetingApp {
     /// Whether the captions UI is up, regardless of whether it has any text in
     /// it right now. Used to avoid toggling captions that are already on.
     func captionsPanelOpen(_ app: AXUIElement) -> Bool
-    /// Ask the app to show captions. Returns false if the control wasn't
-    /// reachable, in which case no attempt is counted and we can try later.
-    func requestCaptions(pid: pid_t) -> Bool
+    /// Ask the app to show captions.
+    func requestCaptions(pid: pid_t) -> CaptionRequest
 
     func chatContainer(_ app: AXUIElement) -> AXUIElement?
     func chatMessages(in container: AXUIElement) -> [ChatMessage]
@@ -481,16 +490,18 @@ struct TeamsApp: MeetingApp {
 
     /// Teams' own shortcut (⇧⌘A), delivered straight to the process so it
     /// bypasses global event taps such as a Hammerspoon remap.
-    func requestCaptions(pid: pid_t) -> Bool {
+    func requestCaptions(pid: pid_t) -> CaptionRequest {
         let source = CGEventSource(stateID: .privateState)
         let keyA: CGKeyCode = 0
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyA, keyDown: true),
-              let up = CGEvent(keyboardEventSource: source, virtualKey: keyA, keyDown: false) else { return false }
+              let up = CGEvent(keyboardEventSource: source, virtualKey: keyA, keyDown: false) else {
+            return .unreachable
+        }
         down.flags = [.maskCommand, .maskShift]
         up.flags = [.maskCommand, .maskShift]
         down.postToPid(pid)
         up.postToPid(pid)
-        return true
+        return .pressed
     }
 
     /// The chat message list: the grandparent of any rendered message body.
@@ -596,18 +607,20 @@ struct ZoomApp: MeetingApp {
     /// description says which way it will toggle. Two obstacles, though: the
     /// toolbar leaves the tree entirely when the pointer isn't over the window,
     /// and unless pinned, captions live in the More overflow.
-    func requestCaptions(pid: pid_t) -> Bool {
+    func requestCaptions(pid: pid_t) -> CaptionRequest {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 5.0)
 
+        // Zoom only puts captions in the toolbar once they are running, so a
+        // pinned button that doesn't offer to show them means they are on.
         if let pinned = captionsButton(app) {
-            if axDescription(pinned).localizedCaseInsensitiveContains("show captions") {
-                return press(pinned)
+            guard axDescription(pinned).localizedCaseInsensitiveContains("show captions") else {
+                return .alreadyOn
             }
-            return true // already on
+            return press(pinned) ? .pressed : .unreachable
         }
 
-        guard let more = overflowButton(app), press(more) else { return false }
+        guard let more = overflowButton(app), press(more) else { return .unreachable }
         // The overflow is populated a moment after it opens.
         var item: AXUIElement?
         for _ in 0..<10 {
@@ -616,13 +629,13 @@ struct ZoomApp: MeetingApp {
         }
         guard let item else {
             press(more) // put the overflow back the way we found it
-            return false
+            return .unreachable
         }
         guard axDescription(item).localizedCaseInsensitiveContains("show captions") else {
             press(more)
-            return true // already on
+            return .alreadyOn
         }
-        return press(item) // pressing an item closes the overflow itself
+        return press(item) ? .pressed : .unreachable // pressing an item closes the overflow
     }
 
     // Zoom's chat panel is a separate surface that has to be open to read; not
@@ -659,7 +672,7 @@ final class Session {
     private var chatBaselineDone: Bool
     private var captionAttempts = 0
     private var warnedCaptionsUnreachable = false
-    private var lastCaptionCheck = Date.distantPast
+    private var nextCaptionCheck = Date.distantPast
     private var sawCaptions = false
     /// Recently written utterances, to catch an app re-rendering a finished one.
     private var written: [(speaker: String, text: String, at: Date)] = []
@@ -719,13 +732,19 @@ final class Session {
     private func ensureCaptionsOn(app: AXUIElement, pid: pid_t, now: Date) {
         guard !sawCaptions, captionAttempts < 2,
               now.timeIntervalSince(startedAt) > 3,
-              now.timeIntervalSince(lastCaptionCheck) > 8 else { return }
-        lastCaptionCheck = now
+              now >= nextCaptionCheck else { return }
+        nextCaptionCheck = now.addingTimeInterval(8)
         guard !meetingApp.captionsPanelOpen(app) else {
             sawCaptions = true // panel is up, just idle — never press again
             return
         }
-        guard meetingApp.requestCaptions(pid: pid) else {
+        switch meetingApp.requestCaptions(pid: pid) {
+        case .alreadyOn:
+            // Captions are running but their panel isn't readable yet; pressing
+            // again would only turn them back off.
+            sawCaptions = true
+            return
+        case .unreachable:
             // Out of reach for now (Zoom hides its toolbar until the pointer is
             // over the window), so keep looking rather than spending a try.
             if !warnedCaptionsUnreachable, !options.quiet {
@@ -733,6 +752,10 @@ final class Session {
                 status("\(meetingApp.displayName) is hiding its captions control; will turn captions on when it reappears")
             }
             return
+        case .pressed:
+            // Captions take a few seconds to start, and Zoom's panel doesn't
+            // exist until they do, so don't judge the result too soon.
+            nextCaptionCheck = now.addingTimeInterval(20)
         }
         captionAttempts += 1
         if !options.quiet { status("asked \(meetingApp.displayName) to show live captions (attempt \(captionAttempts))") }
@@ -976,6 +999,7 @@ func runningApps() -> [Attachment] {
 var attachment: Attachment?
 var session: Session?
 var leaveMissingSince: Date?
+var treeUnreadableSince: Date?
 
 if options.once {
     guard let found = runningApps().first(where: { !axChildren($0.element).isEmpty }) else {
@@ -1030,10 +1054,29 @@ while !stopRequested {
                 }
             }
         } else if let current = attachment {
-            if axChildren(current.element).isEmpty {
-                // Unreadable tree tells us nothing: a failed read is not
-                // evidence that the call ended.
-                if now.timeIntervalSince(lastUnreadableWarning) > 60 {
+            func endSession(_ reason: String) {
+                if !options.quiet { status("\(reason), ending session") }
+                session?.finish(at: now)
+                session = nil
+                attachment = nil
+                leaveMissingSince = nil
+                treeUnreadableSince = nil
+            }
+
+            let livePID = options.pid ?? processID(matching: current.meetingApp.processPattern)
+            if livePID != current.pid {
+                // Quitting the app ends the meeting as surely as leaving does,
+                // and a new pid means a different instance entirely.
+                endSession("\(current.meetingApp.displayName) \(livePID == nil ? "quit" : "restarted")")
+            } else if axChildren(current.element).isEmpty {
+                // A failed read is not evidence that the call ended — but if it
+                // never recovers we are stuck watching a tree that will never
+                // answer, and would miss every later meeting.
+                let since = treeUnreadableSince ?? now
+                treeUnreadableSince = since
+                if now.timeIntervalSince(since) > 30 {
+                    endSession("lost the \(current.meetingApp.displayName) accessibility tree")
+                } else if now.timeIntervalSince(lastUnreadableWarning) > 60 {
                     lastUnreadableWarning = now
                     if !options.quiet {
                         status("cannot read the \(current.meetingApp.displayName) accessibility tree")
@@ -1041,16 +1084,14 @@ while !stopRequested {
                 }
             } else if current.meetingApp.meetingAnchor(current.element) != nil {
                 leaveMissingSince = nil
+                treeUnreadableSince = nil
             } else {
+                treeUnreadableSince = nil
                 // Debounce: the Leave button vanishes during UI transitions.
                 let missingSince = leaveMissingSince ?? now
                 leaveMissingSince = missingSince
                 if now.timeIntervalSince(missingSince) > 10 {
-                    if !options.quiet { status("left \"\(session?.title ?? "")\", ending session") }
-                    session?.finish(at: now)
-                    session = nil
-                    attachment = nil
-                    leaveMissingSince = nil
+                    endSession("left \"\(session?.title ?? "")\"")
                 }
             }
         }
