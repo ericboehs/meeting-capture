@@ -216,6 +216,60 @@ final class LiveView {
         return 100
     }
 
+    static func terminalHeight() -> Int {
+        var size = winsize()
+        if ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0, size.ws_row > 0 { return Int(size.ws_row) }
+        return 24
+    }
+
+    /// Break a line into rows that fit the terminal.
+    ///
+    /// The live region is erased by moving up one row per line we drew, so the
+    /// count has to match what the terminal actually used. Letting a line
+    /// soft-wrap would make it occupy several rows, and the region would stack
+    /// up instead of being replaced. Truncating kept the count honest but hid
+    /// the end of every sentence, which is exactly the part being spoken, so
+    /// wrap here and report the real number of rows instead. Stay a column
+    /// short of the width: filling the last one makes some terminals wrap by
+    /// themselves.
+    static func wrap(_ text: String, width: Int) -> [String] {
+        let limit = max(8, width - 1)
+        guard text.count > limit else { return [text] }
+        var rows: [String] = []
+        var line = ""
+        for word in text.split(separator: " ") {
+            var word = String(word)
+            // A word too long to ever fit has to be broken somewhere.
+            while word.count > limit {
+                if !line.isEmpty { rows.append(line); line = "" }
+                rows.append(String(word.prefix(limit)))
+                word = String(word.dropFirst(limit))
+            }
+            if line.isEmpty {
+                line = word
+            } else if line.count + 1 + word.count <= limit {
+                line += " " + word
+            } else {
+                rows.append(line)
+                line = word
+            }
+        }
+        if !line.isEmpty { rows.append(line) }
+        return rows
+    }
+
+    /// Wrap every pending line, keeping the most recent rows if the result is
+    /// taller than the terminal: the newest words matter most, and erasing more
+    /// rows than the screen has would eat the transcript above.
+    static func layout(_ pending: [String]) -> [String] {
+        let width = terminalWidth()
+        let rows = pending
+            .flatMap { wrap($0.replacingOccurrences(of: "\n", with: " "), width: width) }
+            .filter { !$0.isEmpty }
+        let ceiling = max(1, terminalHeight() - 1)
+        return rows.count > ceiling ? Array(rows.suffix(ceiling)) : rows
+    }
+
     /// Erase the region, leaving the cursor at the start of its first line.
     func erase() {
         guard updatesRegion, !lines.isEmpty else { lines = []; return }
@@ -233,12 +287,7 @@ final class LiveView {
 
     func set(_ pending: [String]) {
         guard updatesRegion else { return }
-        let width = LiveView.terminalWidth()
-        let rendered = pending.map { line -> String in
-            var body = line.replacingOccurrences(of: "\n", with: " ")
-            if body.count > width - 1 { body = String(body.prefix(max(1, width - 2))) + "…" }
-            return body
-        }
+        let rendered = LiveView.layout(pending)
         guard rendered != lines else { return } // avoid redrawing unchanged text
         erase()
         draw(rendered)
@@ -630,6 +679,10 @@ final class SlackApp: MeetingApp {
     /// rather than read off the tree.
     private var liveSequence = 0
     private var previousLiveText = ""
+    /// Text already surfaced through the live slot. An utterance is written
+    /// when its live entry goes away, so re-reporting it once Slack marks it
+    /// settled would file the same sentence twice.
+    private var surfacedLive: [String] = []
 
     /// A huddle gets its own window, and the Leave button only exists while
     /// one is up.
@@ -720,21 +773,38 @@ final class SlackApp: MeetingApp {
 
         // Once the sentence the live slot was holding shows up settled, the
         // slot has moved on to a new utterance and must not keep the old id.
+        // Checked against every settled event, including ones filtered out of
+        // the result below.
         if !previousLiveText.isEmpty, settled.contains(where: { $0.text == previousLiveText }) {
             liveSequence += 1
             previousLiveText = ""
         }
 
-        var entries = settled.map {
-            CaptionEntry(id: "settled:\(identity(of: $0.speaker, $0.text))", speaker: $0.speaker, text: $0.text)
-        }
+        // Anything that came through the live slot is already accounted for:
+        // it is written when that entry disappears. Reporting the settled copy
+        // as well wrote every sentence twice, and the recorder's guard against
+        // repeats only reaches back 30s \u2014 far less than an event lingers here.
+        // What survives the filter is backlog that was already on screen when
+        // we joined, which has no live entry to be written by.
+        var entries = settled
+            .filter { !surfacedLive.contains($0.text) }
+            .map {
+                CaptionEntry(id: "settled:\(identity(of: $0.speaker, $0.text))", speaker: $0.speaker, text: $0.text)
+            }
         if let live {
             previousLiveText = live.text
+            remember(live.text)
             // Last, so the recorder treats it as the line still being spoken
             // and leaves it out of idle finalization.
             entries.append(CaptionEntry(id: "live:\(liveSequence)", speaker: live.speaker, text: live.text))
         }
         return entries
+    }
+
+    private func remember(_ text: String) {
+        guard !surfacedLive.contains(text) else { return }
+        surfacedLive.append(text)
+        if surfacedLive.count > 80 { surfacedLive.removeFirst(surfacedLive.count - 80) }
     }
 
     private func identity(of speaker: String, _ text: String) -> String {
@@ -1321,17 +1391,11 @@ func followTranscripts(_ options: Options) {
         if liveText != lastLive {
             eraseLive()
             lastLive = liveText
-            let width = LiveView.terminalWidth()
-            let rendered = liveText.trimmingCharacters(in: .newlines)
-                .split(separator: "\n", omittingEmptySubsequences: false)
-                .map { line -> String in
-                    var body = String(line).replacingOccurrences(of: "\n", with: " ")
-                    if body.count > width - 1 {
-                        body = String(body.prefix(max(1, width - 2))) + "…"
-                    }
-                    return body
-                }
-                .filter { !$0.isEmpty }
+            let rendered = LiveView.layout(
+                liveText.trimmingCharacters(in: .newlines)
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .map(String.init)
+            )
             if !rendered.isEmpty {
                 stdout.write(Data(rendered.joined(separator: "\n").utf8))
                 liveRows = rendered.count
