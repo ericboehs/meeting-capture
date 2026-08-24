@@ -391,6 +391,9 @@ protocol MeetingApp {
     func captionsPanelOpen(_ app: AXUIElement) -> Bool
     /// Ask the app to show captions.
     func requestCaptions(pid: pid_t) -> CaptionRequest
+    /// True when the captions control is a toggle (Teams' ⇧⌘A). A second
+    /// press would turn them back off, so we must not retry blindly.
+    var captionPressToggles: Bool { get }
 
     func chatContainer(_ app: AXUIElement) -> AXUIElement?
     func chatMessages(in container: AXUIElement) -> [ChatMessage]
@@ -410,6 +413,7 @@ extension MeetingApp {
     var idleFinalizeSeconds: TimeInterval? { nil }
     // Most apps don't say how long the call has been going.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
+    var captionPressToggles: Bool { false }
 }
 
 func windowTitle(containing element: AXUIElement) -> String? {
@@ -449,6 +453,7 @@ struct TeamsApp: MeetingApp {
     let id = "teams"
     let displayName = "Microsoft Teams"
     let processPattern = "Microsoft Teams.app/Contents/MacOS/MSTeams"
+    let captionPressToggles = true
 
     /// Caption entries are groups of [speaker, text] carrying this class.
     private let captionEntryClass = "fui-ChatMessageCompact__body"
@@ -844,12 +849,19 @@ final class Session {
             }
             return
         case .pressed:
-            // Captions take a few seconds to start, and Zoom's panel doesn't
-            // exist until they do, so don't judge the result too soon.
-            nextCaptionCheck = now.addingTimeInterval(20)
+            captionAttempts += 1
+            if !options.quiet {
+                status("asked \(meetingApp.displayName) to show live captions (attempt \(captionAttempts))")
+            }
+            if meetingApp.captionPressToggles {
+                // ⇧⌘A is a toggle and we often cannot see the panel, so a
+                // second press would just close it.
+                sawCaptions = true
+            } else {
+                // Zoom's panel doesn't exist until captions have started.
+                nextCaptionCheck = now.addingTimeInterval(20)
+            }
         }
-        captionAttempts += 1
-        if !options.quiet { status("asked \(meetingApp.displayName) to show live captions (attempt \(captionAttempts))") }
     }
 
     private func pollCaptions(now: Date) {
