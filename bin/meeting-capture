@@ -18,6 +18,7 @@
 // compiled binary when run from launchd).
 
 import ApplicationServices
+import AppKit
 import CoreGraphics
 import Foundation
 
@@ -749,6 +750,7 @@ final class Session {
     private var written: [(speaker: String, text: String, at: Date)] = []
     /// Ids already written but still on screen.
     private var finalized = Set<String>()
+    private var didWakeTree = false
     /// What `[HH:MM:SS]` counts from: the start of the meeting once the app
     /// tells us, otherwise the moment we attached.
     private var timelineStart: Date
@@ -790,6 +792,20 @@ final class Session {
         return created
     }
 
+    /// Chromium does not build its accessibility tree until the app has been
+    /// frontmost at least once. Without that, Teams is a hollow window (no DOM
+    /// ids, no caption text) and we have nothing to parse.
+    private func wakeTreeIfNeeded(app: AXUIElement, pid: pid_t) {
+        guard !didWakeTree else { return }
+        didWakeTree = true
+        let hasDOM = findElement(from: app) { !axDomID($0).isEmpty } != nil
+        guard !hasDOM else { return }
+        NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps])
+        if !options.quiet {
+            status("brought \(meetingApp.displayName) forward so its accessibility tree would populate")
+        }
+    }
+
     /// Ask the app how long the call has been running, so lines are numbered
     /// from the start of the meeting even if we joined it late. The clock is
     /// part of the window chrome, which Zoom hides along with its toolbar, so
@@ -809,6 +825,7 @@ final class Session {
     }
 
     func tick(app: AXUIElement, pid: pid_t, now: Date) {
+        wakeTreeIfNeeded(app: app, pid: pid)
         resolveTimeline(app: app, now: now)
         let needsCaptions = options.captureCaptions && captionsContainer == nil
         let needsChat = options.captureChat && chatContainer == nil
