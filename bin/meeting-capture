@@ -760,6 +760,7 @@ final class Session {
     private var finalized = Set<String>()
     private var wakeAttempts = 0
     private var nextWake = Date.distantPast
+    private var treePopulated = false
     /// What `[HH:MM:SS]` counts from: the start of the meeting once the app
     /// tells us, otherwise the moment we attached.
     private var timelineStart: Date
@@ -809,7 +810,7 @@ final class Session {
     /// focus snaps back to the terminal.
     private func wakeTreeIfNeeded(app: AXUIElement, pid: pid_t, now: Date) {
         let hasDOM = findElement(from: app) { !axDomID($0).isEmpty } != nil
-        if hasDOM { wakeAttempts = 99; return } // tree is up, never steal focus again
+        if hasDOM { treePopulated = true; wakeAttempts = 99; return }
         guard wakeAttempts < 4, now >= nextWake else { return }
         wakeAttempts += 1
         nextWake = now.addingTimeInterval(8)
@@ -856,23 +857,27 @@ final class Session {
     /// Turn captions on if the panel isn't up. Gives up quickly: toggling a
     /// shortcut we can't verify is worse than missing a transcript.
     private func ensureCaptionsOn(app: AXUIElement, pid: pid_t, now: Date) {
-        guard !sawCaptions, captionAttempts < 2,
+        if meetingApp.captionsPanelOpen(app) {
+            sawCaptions = true
+            return
+        }
+        // Panel looks closed. If we already pressed while the tree was hollow,
+        // do not guess again. Once the tree is readable we can see it is
+        // really off and it is safe to toggle back on.
+        if sawCaptions {
+            guard treePopulated else { return }
+            sawCaptions = false
+            captionAttempts = 0
+        }
+        guard captionAttempts < 2,
               now.timeIntervalSince(startedAt) > 3,
               now >= nextCaptionCheck else { return }
         nextCaptionCheck = now.addingTimeInterval(8)
-        guard !meetingApp.captionsPanelOpen(app) else {
-            sawCaptions = true // panel is up, just idle — never press again
-            return
-        }
         switch meetingApp.requestCaptions(pid: pid) {
         case .alreadyOn:
-            // Captions are running but their panel isn't readable yet; pressing
-            // again would only turn them back off.
             sawCaptions = true
             return
         case .unreachable:
-            // Out of reach for now (Zoom hides its toolbar until the pointer is
-            // over the window), so keep looking rather than spending a try.
             if !warnedCaptionsUnreachable, !options.quiet {
                 warnedCaptionsUnreachable = true
                 status("\(meetingApp.displayName) is hiding its captions control; will turn captions on when it reappears")
@@ -883,12 +888,9 @@ final class Session {
             if !options.quiet {
                 status("asked \(meetingApp.displayName) to show live captions (attempt \(captionAttempts))")
             }
-            if meetingApp.captionPressToggles {
-                // ⇧⌘A is a toggle and we often cannot see the panel, so a
-                // second press would just close it.
+            if meetingApp.captionPressToggles && !treePopulated {
                 sawCaptions = true
             } else {
-                // Zoom's panel doesn't exist until captions have started.
                 nextCaptionCheck = now.addingTimeInterval(20)
             }
         }
