@@ -804,19 +804,28 @@ final class Session {
         return created
     }
 
-    /// Chromium does not build its accessibility tree until the app has been
-    /// frontmost. Without that, Teams is a hollow window (no DOM ids, no
-    /// caption text). Retry a few times — one activate is often not enough if
-    /// focus snaps back to the terminal.
+    /// Chromium keeps its a11y tree off until it sees assistive tech. Electron's
+    /// documented opt-in is AXManualAccessibility=YES on the running process
+    /// (agent-desktop's enable-electron-a11y). The app root often reports
+    /// unsupported; the EdgeContentsContainerView accepts it. Activate is a
+    /// fallback if the attribute is not enough.
     private func wakeTreeIfNeeded(app: AXUIElement, pid: pid_t, now: Date) {
         let hasDOM = findElement(from: app) { !axDomID($0).isEmpty } != nil
-        if hasDOM { treePopulated = true; wakeAttempts = 99; return }
-        guard wakeAttempts < 4, now >= nextWake else { return }
-        wakeAttempts += 1
+        if hasDOM { treePopulated = true; return }
+        guard now >= nextWake else { return }
         nextWake = now.addingTimeInterval(8)
-        NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps])
-        if !options.quiet {
-            status("brought \(meetingApp.displayName) forward so its accessibility tree would populate (attempt \(wakeAttempts))")
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        if let edge = findElement(from: app, where: { element in
+            (axAttribute(element, "AXDOMClassList") as? [String] ?? []).contains("EdgeContentsContainerView")
+        }) {
+            AXUIElementSetAttributeValue(edge, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        }
+        wakeAttempts += 1
+        if wakeAttempts <= 4 {
+            NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps])
+            if !options.quiet {
+                status("asked \(meetingApp.displayName) to expose its accessibility tree (attempt \(wakeAttempts))")
+            }
         }
     }
 
