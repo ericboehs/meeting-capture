@@ -167,6 +167,12 @@ Files are created on the first line written, so a meeting nobody speaks in
 leaves nothing behind. Ctrl-C or leaving the meeting flushes whatever was
 mid-sentence.
 
+`elapsed` counts from the start of the meeting, not from when recording began,
+where the app will say how long the call has been running — Zoom keeps a clock
+in its title bar. Attach to a meeting already in progress and the first line
+reads `[00:36:41]` rather than `[00:00:00]`, and `meeting_started_at` records
+what it was measured against.
+
 Wall-clock `ts` and `ended_at` on every caption make this useful beyond reading:
 align the timestamps against a Whisper transcript of the same meeting and you
 can attribute diarised audio to real names.
