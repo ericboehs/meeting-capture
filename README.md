@@ -149,7 +149,16 @@ and off every eight seconds.
 
 ## Output
 
-Transcripts land in `~/.local/share/meeting-capture`, one pair per meeting.
+Transcripts land in `~/.local/share/meeting-capture`, one pair per meeting,
+named for when it started, where it happened, and what it was called:
+
+```
+20260824_140510-teams-weekly-sync.txt
+20260824_140510-teams-weekly-sync.jsonl
+20260824_185316-zoom-personal-meeting-room.jsonl
+20260824_185849-slack-eng-standup.txt
+```
+
 The text file opens with what the bracketed times mean, so a transcript is
 still readable years later on its own:
 

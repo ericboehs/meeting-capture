@@ -329,7 +329,7 @@ struct Recorder {
     private let stdout = FileHandle.standardOutput
     let options: Options
 
-    init(options: Options, meeting: String, startedAt: Date) {
+    init(options: Options, app: String, meeting: String, startedAt: Date) {
         self.options = options
         self.startedAt = startedAt
         self.timelineStart = startedAt
@@ -338,7 +338,9 @@ struct Recorder {
 
         let stamp = DateFormatter()
         stamp.dateFormat = "yyyyMMdd_HHmmss"
-        let base = "\(stamp.string(from: startedAt))-\(Recorder.slugify(meeting))"
+        // The app is in the name because meeting titles don't say where they
+        // happened, and the same people meet in different places.
+        let base = "\(stamp.string(from: startedAt))-\(app)-\(Recorder.slugify(meeting))"
         jsonlURL = directory.appendingPathComponent(base + ".jsonl")
         textURL = directory.appendingPathComponent(base + ".txt")
 
@@ -1059,7 +1061,7 @@ final class Session {
     /// Files are created on first write, so a silent meeting leaves no litter.
     private func recorderForWriting() -> Recorder {
         if let recorder { return recorder }
-        var created = Recorder(options: options, meeting: title, startedAt: startedAt)
+        var created = Recorder(options: options, app: meetingApp.id, meeting: title, startedAt: startedAt)
         created.timelineStart = timelineStart
         created.countsFromMeetingStart = meetingApp.reportsMeetingClock
         var metadata: [String: Any] = [
