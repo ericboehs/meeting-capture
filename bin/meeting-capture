@@ -392,6 +392,14 @@ struct Recorder {
         if options.jsonToStdout && !options.quiet { stdout.write(Data(line.utf8)) }
     }
 
+    /// Head the transcript with what the bracketed times mean. Without it a
+    /// file of relative stamps can't be placed in time at all, and one of
+    /// wall-clock stamps doesn't say which day.
+    func writeHeader(_ lines: [String]) {
+        let block = lines.map { "# \($0)\n" }.joined() + "\n"
+        text.write(Data(block.utf8))
+    }
+
     /// Append to both files; returns the transcript line for display.
     func record(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any] = [:]) -> String {
         var payload: [String: Any] = [
@@ -1059,12 +1067,25 @@ final class Session {
             "source": "\(meetingApp.id)-ax",
             "app": meetingApp.displayName,
             "meeting": title,
-            "recorded_at": Recorder.isoFormatter.string(from: startedAt)
+            "recorded_at": Recorder.isoFormatter.string(from: startedAt),
+            "timestamps": created.countsFromMeetingStart ? "elapsed" : "time-of-day"
         ]
         if timelineResolved {
             metadata["meeting_started_at"] = Recorder.isoFormatter.string(from: timelineStart)
         }
         created.writeJSON(metadata)
+
+        var header = ["\(title) (\(meetingApp.displayName))",
+                      "recording started \(Recorder.isoFormatter.string(from: startedAt))"]
+        if timelineResolved {
+            header.append("meeting started   \(Recorder.isoFormatter.string(from: timelineStart))")
+            header.append("[hh:mm:ss] counts from the start of the meeting")
+        } else if created.countsFromMeetingStart {
+            header.append("[hh:mm:ss] counts from when recording started")
+        } else {
+            header.append("[hh:mm:ss] is the time of day")
+        }
+        created.writeHeader(header)
         recorder = created
         let pointer = options.stateDirectory + "/current"
         try? created.textURL.path.write(toFile: pointer, atomically: true, encoding: .utf8)

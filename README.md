@@ -149,15 +149,25 @@ and off every eight seconds.
 
 ## Output
 
-Transcripts land in `~/.local/share/meeting-capture`, one pair per meeting:
+Transcripts land in `~/.local/share/meeting-capture`, one pair per meeting.
+The text file opens with what the bracketed times mean, so a transcript is
+still readable years later on its own:
 
 ```
-20260824_140510-weekly-sync.txt     [00:00:38] Grace Hopper: Mic check 1-2.
-20260824_140510-weekly-sync.jsonl
+# Weekly Sync (Microsoft Teams)
+# recording started 2026-08-24T14:05:10-05:00
+# meeting started   2026-08-24T13:28:15-05:00
+# [hh:mm:ss] counts from the start of the meeting
+
+[00:37:33] Grace Hopper: Mic check 1-2.
 ```
+
+Join an hour into a call and the first line reads `[01:02:11]`; the header is
+what turns that back into a time of day. Where the app publishes no clock the
+lines are stamped with the time of day already, and the header says so.
 
 ```json
-{"type":"metadata","app":"Microsoft Teams","meeting":"Weekly Sync","source":"teams-ax","recorded_at":"2026-08-24T14:05:10-05:00"}
+{"type":"metadata","app":"Microsoft Teams","meeting":"Weekly Sync","source":"teams-ax","recorded_at":"2026-08-24T14:05:10-05:00","meeting_started_at":"2026-08-24T13:28:15-05:00","timestamps":"elapsed"}
 {"type":"caption","speaker":"Grace Hopper","text":"Mic check 1-2.","ts":"2026-08-24T14:05:48-05:00","ended_at":"2026-08-24T14:05:53-05:00","elapsed":"00:00:38","node_id":"8046"}
 {"type":"chat","speaker":"Ada Lovelace","text":"here's the dashboard","ts":"2026-08-24T14:06:02-05:00","elapsed":"00:00:52","message_id":"1756061162000"}
 {"type":"metadata","event":"stopped","stopped_at":"2026-08-24T14:05:53-05:00","duration":"00:00:42"}
