@@ -902,8 +902,13 @@ final class Session {
         for id in captionOrder where !visible.contains(id) { finalizeCaption(id, at: now) }
         finalized.formIntersection(visible) // let ids be reused once they are gone
         for entry in entries {
-            // Written already, but still on screen: leave it alone.
-            guard !finalized.contains(entry.id) else { continue }
+            if finalized.contains(entry.id) {
+                // Same row kept growing after we idle-finalized it (Zoom).
+                let grew = written.contains {
+                    $0.speaker == entry.speaker && entry.text.hasPrefix($0.text) && entry.text != $0.text
+                }
+                if grew { finalized.remove(entry.id) } else { continue }
+            }
             if var utterance = activeCaptions[entry.id] {
                 if utterance.text != entry.text {
                     utterance.changedAt = now
@@ -928,7 +933,8 @@ final class Session {
             for id in captionOrder where id != newest { finalizeCaption(id, at: now) }
         }
         if let idle = meetingApp.idleFinalizeSeconds {
-            for id in captionOrder {
+            let newest = entries.last?.id
+            for id in captionOrder where id != newest {
                 guard let utterance = activeCaptions[id],
                       now.timeIntervalSince(utterance.changedAt) > idle else { continue }
                 finalizeCaption(id, at: now)
