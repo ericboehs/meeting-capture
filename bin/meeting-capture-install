@@ -19,11 +19,21 @@ plist="$HOME/Library/LaunchAgents/$label.plist"
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/meeting-capture"
 stamp="$state_dir/source.sha256"
 log="$state_dir/launchd.log"
+cert_name="meeting-capture-signing"
 # macOS ties an Accessibility grant to the binary's code signature. Ad-hoc
-# signing re-hashes on every build, so each rebuild drops the permission. Set
-# MEETING_CAPTURE_SIGN_ID to a Developer ID to keep it across rebuilds; without
-# one, `reauthorize` below makes re-granting a two-step affair.
-sign_id="${MEETING_CAPTURE_SIGN_ID:--}"
+# signing re-hashes on every build, so each rebuild drops the permission. A
+# stable identity keeps the grant: `signing-cert` below makes a self-signed one,
+# and MEETING_CAPTURE_SIGN_ID overrides it (e.g. with a Developer ID).
+find_sign_id() {
+  if [[ -n ${MEETING_CAPTURE_SIGN_ID:-} ]]; then
+    printf '%s' "$MEETING_CAPTURE_SIGN_ID"
+  elif security find-identity -v -p codesigning 2>/dev/null | grep -q "$cert_name"; then
+    printf '%s' "$cert_name"
+  else
+    printf '%s' '-' # ad-hoc
+  fi
+}
+sign_id=$(find_sign_id)
 
 settings_pane="x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
@@ -43,17 +53,51 @@ case "${1:-install}" in
     echo "  launchctl bootstrap gui/$UID $plist"
     exit 0
     ;;
+  signing-cert)
+    if security find-identity -v -p codesigning 2>/dev/null | grep -q "$cert_name"; then
+      echo "$cert_name already exists"
+      exit 0
+    fi
+    # A self-signed code signing certificate, trusted for code signing only.
+    # The point is a signature that stays the same across rebuilds, so the
+    # Accessibility grant survives; it proves nothing to anyone else.
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout "$tmp/key.pem" -out "$tmp/cert.pem" \
+      -subj "/CN=$cert_name" \
+      -addext "basicConstraints=critical,CA:false" \
+      -addext "extendedKeyUsage=critical,codeSigning" \
+      -addext "keyUsage=critical,digitalSignature" 2>/dev/null
+    # Security.framework can't read OpenSSL 3's default PKCS#12 encryption, so
+    # ask for the old algorithms. The passphrase only has to survive the import
+    # on the next line.
+    pass=$(openssl rand -hex 16)
+    openssl pkcs12 -export -out "$tmp/id.p12" \
+      -inkey "$tmp/key.pem" -in "$tmp/cert.pem" -passout "pass:$pass" \
+      -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 2>/dev/null
+
+    keychain="$HOME/Library/Keychains/login.keychain-db"
+    # -A/-T let codesign use the key without a prompt on every build.
+    security import "$tmp/id.p12" -k "$keychain" -P "$pass" -A -T /usr/bin/codesign >/dev/null
+    echo "macOS will ask for your login password to trust the certificate."
+    security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$tmp/cert.pem"
+
+    echo "created $cert_name; rebuild to start using it:"
+    echo "  ${BASH_SOURCE[0]}"
+    exit 0
+    ;;
   install) ;;
   *)
-    echo "usage: ${0##*/} [install|reauthorize|uninstall]" >&2
+    echo "usage: ${0##*/} [install|reauthorize|signing-cert|uninstall]" >&2
     exit 1
     ;;
 esac
 
 mkdir -p "${binary%/*}" "$state_dir"
 
-# Only rebuild when the source changed: every rebuild costs the Accessibility
-# grant unless a stable signing identity is in play.
+# Only rebuild when the source changed: with ad-hoc signing every rebuild costs
+# the Accessibility grant.
 source_hash=$(shasum -a 256 "$source_script" | cut -d' ' -f1)
 rebuilt=false
 if [[ ! -x $binary || ! -f $stamp || $(cat "$stamp") != "$source_hash" ]]; then
@@ -125,5 +169,11 @@ if [[ $rebuilt == true && $sign_id == "-" ]]; then
 
 Ad-hoc signed, so macOS sees a new binary and drops any previous grant:
   ${BASH_SOURCE[0]} reauthorize
+
+To stop re-granting after every rebuild, make a stable signing identity once:
+  ${BASH_SOURCE[0]} signing-cert
 INFO
+elif [[ $rebuilt == true ]]; then
+  echo
+  echo "signed with $sign_id, so the Accessibility grant carries over"
 fi

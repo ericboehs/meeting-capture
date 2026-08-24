@@ -71,27 +71,33 @@ tail -f ~/.local/state/meeting-capture/launchd.log
 
 Uninstall with `./bin/meeting-capture-install uninstall`.
 
-### Re-granting after an upgrade
+### Granting once instead of after every build
 
-macOS ties an Accessibility grant to the binary's code signature, and ad-hoc
-signing produces a new hash on every build. So after changing the source, the
-permission silently stops working — the daemon logs `no Accessibility
-permission` and exits.
+macOS ties an Accessibility grant to the binary's code signature. Ad-hoc signing
+produces a new signature on every build, so each rebuild silently revokes the
+permission and the daemon exits with `no Accessibility permission`.
 
-```sh
-./bin/meeting-capture-install            # only rebuilds if the source changed
-./bin/meeting-capture-install reauthorize # opens the settings pane for you
-```
-
-Remove the stale `meeting-capture-daemon` row before adding the new one;
-re-adding on top of it just re-registers the dead requirement.
-
-If you have a Developer ID, sign with it instead and the grant survives
-rebuilds entirely:
+Making a signing identity once fixes that for good:
 
 ```sh
-MEETING_CAPTURE_SIGN_ID="Developer ID Application: You (TEAMID)" ./bin/meeting-capture-install
+./bin/meeting-capture-install signing-cert   # asks for your login password
+./bin/meeting-capture-install                # rebuild, signed with it
 ```
+
+It creates a self-signed certificate trusted for code signing only, which turns
+the requirement macOS remembers into something stable:
+
+```
+designated => identifier "meeting-capture-daemon" and certificate leaf = H"bbab…"
+```
+
+The same binary keeps satisfying that no matter how often you rebuild. A
+Developer ID does the job too, via `MEETING_CAPTURE_SIGN_ID`.
+
+You still have to grant permission once after switching (the stored requirement
+changed): run `./bin/meeting-capture-install reauthorize`, **remove** the
+existing `meeting-capture-daemon` row, then drag the revealed binary in.
+Re-adding on top of the old row just re-registers the dead requirement.
 
 ## Usage
 
