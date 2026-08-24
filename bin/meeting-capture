@@ -497,13 +497,18 @@ struct TeamsApp: MeetingApp {
         }
     }
 
-    /// Teams labels the call timer "Elapsed time 04:10" (or H:MM:SS).
+    /// Teams paints the ticking clock as a child AXStaticText ("31:01").
+    /// The group's title ("Elapsed time 21:54") is frozen at first render.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? {
         guard let clock = findElement(from: app, where: { axDomID($0) == "call-duration-custom" }) else {
             return nil
         }
-        let title = axString(clock, kAXTitleAttribute)
-        let digits = title.split(separator: " ").last ?? ""
+        if let elapsed = Self.parseClock(axStaticTexts(clock).joined(separator: " ")) { return elapsed }
+        return Self.parseClock(axString(clock, kAXTitleAttribute))
+    }
+
+    private static func parseClock(_ raw: String) -> TimeInterval? {
+        let digits = raw.split(whereSeparator: { !$0.isNumber && $0 != ":" }).first { $0.contains(":") } ?? ""
         let parts = digits.split(separator: ":").compactMap { Int($0) }
         switch parts.count {
         case 2: return TimeInterval(parts[0] * 60 + parts[1])
@@ -816,7 +821,7 @@ final class Session {
     /// part of the window chrome, which Zoom hides along with its toolbar, so
     /// keep asking until it answers.
     private func resolveTimeline(app: AXUIElement, now: Date) {
-        guard !timelineResolved, now >= nextTimelineCheck else { return }
+        guard now >= nextTimelineCheck else { return }
         nextTimelineCheck = now.addingTimeInterval(5)
         guard let elapsed = meetingApp.meetingElapsed(app), elapsed > 0 else { return }
         timelineResolved = true
@@ -900,7 +905,13 @@ final class Session {
             // Written already, but still on screen: leave it alone.
             guard !finalized.contains(entry.id) else { continue }
             if var utterance = activeCaptions[entry.id] {
-                if utterance.text != entry.text { utterance.changedAt = now }
+                if utterance.text != entry.text {
+                    utterance.changedAt = now
+                    // Same node, new sentence (not a live edit growing the text).
+                    if !entry.text.hasPrefix(utterance.text) && !utterance.text.hasPrefix(entry.text) {
+                        utterance.startedAt = now
+                    }
+                }
                 utterance.speaker = entry.speaker
                 utterance.text = entry.text
                 activeCaptions[entry.id] = utterance
@@ -926,7 +937,8 @@ final class Session {
         guard recorder != nil || !captionOrder.isEmpty else { return }
         // Mirror every in-progress utterance; finished lines scroll above.
         let pending = captionOrder.compactMap { id -> String? in
-            guard let utterance = activeCaptions[id] else { return nil }
+            guard let utterance = activeCaptions[id],
+                  !supersededByActive(utterance, id: id) else { return nil }
             return "[\(elapsedString(from: timelineStart, to: utterance.startedAt))] \(utterance.speaker): \(utterance.text)"
         }
         let shown = pending.enumerated().map { $0.offset == pending.count - 1 ? "\($0.element) ▍" : $0.element }
