@@ -566,6 +566,25 @@ struct ZoomApp: MeetingApp {
         findElement(from: app) { axIdentifier($0) == "captions" }
     }
 
+    private func overflowButton(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) { axIdentifier($0) == "more" }
+    }
+
+    /// In the overflow the control is an unidentified button described as e.g.
+    /// "Show captions, 7 of 13, not pinned".
+    private func overflowCaptionsItem(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) {
+            axString($0, kAXRoleAttribute) == kAXButtonRole
+                && axDescription($0).localizedCaseInsensitiveContains("captions")
+                && axIdentifier($0) != "captions"
+        }
+    }
+
+    @discardableResult
+    private func press(_ element: AXUIElement) -> Bool {
+        AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+    }
+
     /// Zoom's caption list only exists while captions are on, which makes it a
     /// reliable signal — unlike the toolbar button, which vanishes with the
     /// toolbar whenever the pointer leaves the window.
@@ -573,17 +592,37 @@ struct ZoomApp: MeetingApp {
         captionsContainer(app) != nil
     }
 
-    /// No synthetic keystroke needed: the toolbar button is pressable, and its
-    /// description says which way it will toggle. It is only in the tree while
-    /// the toolbar is showing, so this often has to wait for the pointer.
+    /// No synthetic keystroke needed: the button is pressable, and its
+    /// description says which way it will toggle. Two obstacles, though: the
+    /// toolbar leaves the tree entirely when the pointer isn't over the window,
+    /// and unless pinned, captions live in the More overflow.
     func requestCaptions(pid: pid_t) -> Bool {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 5.0)
-        guard let button = captionsButton(app) else { return false }
-        guard axDescription(button).localizedCaseInsensitiveContains("show captions") else {
-            return true // already on, or about to be hidden — leave it alone
+
+        if let pinned = captionsButton(app) {
+            if axDescription(pinned).localizedCaseInsensitiveContains("show captions") {
+                return press(pinned)
+            }
+            return true // already on
         }
-        return AXUIElementPerformAction(button, kAXPressAction as CFString) == .success
+
+        guard let more = overflowButton(app), press(more) else { return false }
+        // The overflow is populated a moment after it opens.
+        var item: AXUIElement?
+        for _ in 0..<10 {
+            usleep(100_000)
+            if let found = overflowCaptionsItem(app) { item = found; break }
+        }
+        guard let item else {
+            press(more) // put the overflow back the way we found it
+            return false
+        }
+        guard axDescription(item).localizedCaseInsensitiveContains("show captions") else {
+            press(more)
+            return true // already on
+        }
+        return press(item) // pressing an item closes the overflow itself
     }
 
     // Zoom's chat panel is a separate surface that has to be open to read; not
