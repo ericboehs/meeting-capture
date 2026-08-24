@@ -607,6 +607,152 @@ struct TeamsApp: MeetingApp {
 /// Zoom is a native app, so there are no DOM ids, but it labels its controls
 /// with AXIdentifier (`leave`, `captions`, `chat`) and its caption list with a
 /// description, which serve the same purpose.
+struct SlackApp: MeetingApp {
+    let id = "slack"
+    let displayName = "Slack"
+    let processPattern = "Slack.app/Contents/MacOS/Slack"
+    // Slack is Electron, so its tree starts switched off.
+    let rendersWebContent = true
+    // The event log appends and keeps everything, like Zoom.
+    let finalizesWhenSuperseded = true
+    // The newest line is still being spoken; write it out once it settles.
+    var idleFinalizeSeconds: TimeInterval? { 6 }
+
+    private let leaveDescription = "Leave Huddle"
+    private let memberNameClass = "p-huddle_event_log__member_name"
+    private let eventTextClass = "p-huddle_event_log__event_text"
+    private let listClass = "c-virtual_list__scroll_container"
+    private let activePanelClass = "c-tabs__tab_panel--active"
+    private let overlayClass = "p-huddle_closed_captions"
+    private let overlayEventClass = "p-huddle_closed_caption_event__wrapper"
+
+    /// A huddle gets its own window, and the Leave button only exists while
+    /// one is up.
+    func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) {
+            axString($0, kAXRoleAttribute) == kAXButtonRole
+                && axDescription($0) == leaveDescription
+        }
+    }
+
+    /// The window is titled "Huddle: #channel - Workspace - Slack \u{1F3A4}". Keep the
+    /// channel, drop the decoration.
+    func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String {
+        guard let window = huddleWindow(app) else { return "Slack huddle" }
+        var title = axString(window, kAXTitleAttribute)
+        if let range = title.range(of: "Huddle: ") { title = String(title[range.upperBound...]) }
+        // Trailing " - Workspace - Slack \u{1F3A4}" is chrome, not part of the name.
+        if let dash = title.range(of: " - ", options: .backwards) { title = String(title[..<dash.lowerBound]) }
+        title = title.trimmingCharacters(in: .whitespaces)
+        return title.isEmpty ? "Slack huddle" : title
+    }
+
+    private func huddleWindow(_ app: AXUIElement) -> AXUIElement? {
+        let windows = axAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        return windows.first { axString($0, kAXTitleAttribute).hasPrefix("Huddle:") }
+    }
+
+    private func captionsTab(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) {
+            axDomID($0) == "captions" && axString($0, kAXRoleAttribute) == "AXRadioButton"
+        }
+    }
+
+    /// Captions surface in two places, and we take whichever is available:
+    ///
+    ///   1. The captions tab of the side flexpane. A complete, appending log \u2014
+    ///      the better source, so it wins when present.
+    ///   2. The closed-caption overlay on the video tiles, which holds only the
+    ///      last few lines and fades them out.
+    ///
+    /// The flexpane shows one tab at a time, so reading the panel alone would
+    /// stop capturing the moment someone opens Threads. Falling back to the
+    /// overlay keeps the transcript going while they read. Duplicates across a
+    /// switch are absorbed by the recorder, which ignores a repeated
+    /// speaker+text within 30s.
+    func captionsContainer(_ app: AXUIElement) -> AXUIElement? {
+        panelContainer(app) ?? overlayContainer(app)
+    }
+
+    /// Enter through the *active* tab panel so a user reading threads is never
+    /// mistaken for captions.
+    private func panelContainer(_ app: AXUIElement) -> AXUIElement? {
+        guard let tab = captionsTab(app),
+              axAttribute(tab, kAXValueAttribute) as? Int == 1,
+              let panel = findElement(from: app, where: { axClasses($0).contains(activePanelClass) })
+        else { return nil }
+        return findElement(from: panel) { axClasses($0).contains(listClass) }
+    }
+
+    private func overlayContainer(_ app: AXUIElement) -> AXUIElement? {
+        guard let window = huddleWindow(app) else { return nil }
+        return findElement(from: window) { axClasses($0).contains(overlayClass) }
+    }
+
+    /// Slack shows no call clock in the huddle window.
+    func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
+
+    /// Handles both sources. Panel items are virtual-list rows carrying their
+    /// index as a DOM id; the first is a notice ("Captions are being generated
+    /// in English (US).") with no speaker, which the member-name requirement
+    /// filters out. Being virtual, rows scrolled out of view leave the tree \u2014 so
+    /// identify them by index, which is stable, rather than by element hash,
+    /// which is recycled. Overlay events instead read [speaker, ":", text] and
+    /// carry no id at all, so they fall back to the hash like Zoom's rows.
+    func captionEntries(in container: AXUIElement) -> [CaptionEntry] {
+        axChildren(container).compactMap { item in
+            if axClasses(item).contains(overlayEventClass) { return overlayEntry(item) }
+            guard let speaker = text(in: item, matching: memberNameClass),
+                  let spoken = text(in: item, matching: eventTextClass)
+            else { return nil }
+            let index = axDomID(item)
+            return CaptionEntry(
+                id: index.isEmpty ? String(CFHash(item)) : index,
+                speaker: speaker,
+                text: spoken
+            )
+        }
+    }
+
+    private func overlayEntry(_ item: AXUIElement) -> CaptionEntry? {
+        let texts = axStaticTexts(item)
+        guard texts.count >= 3 else { return nil }
+        // [speaker, ":", text...] \u2014 the colon is its own node.
+        let spoken = texts.dropFirst(2).joined(separator: " ").trimmingCharacters(in: .whitespaces)
+        guard !spoken.isEmpty else { return nil }
+        return CaptionEntry(id: String(CFHash(item)), speaker: texts[0], text: spoken)
+    }
+
+    private func text(in item: AXUIElement, matching className: String) -> String? {
+        guard let node = findElement(from: item, where: { axClasses($0).contains(className) })
+        else { return nil }
+        let value = axStaticTexts(node).joined(separator: " ").trimmingCharacters(in: .whitespaces)
+        return value.isEmpty ? nil : value
+    }
+
+    func captionsPanelOpen(_ app: AXUIElement) -> Bool {
+        captionsContainer(app) != nil
+    }
+
+    /// The control is a tab, not a toggle: selecting it starts captions and
+    /// selecting it again is a no-op. But switching tabs is the user's
+    /// business, so only reach for it when captions are nowhere to be found.
+    /// If the overlay is up, captions are already running and whatever tab
+    /// they are reading is left alone.
+    func requestCaptions(pid: pid_t) -> CaptionRequest {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 5.0)
+        if captionsContainer(app) != nil { return .alreadyOn }
+        guard let tab = captionsTab(app) else { return .unreachable }
+        guard AXUIElementPerformAction(tab, kAXPressAction as CFString) == .success
+        else { return .unreachable }
+        return .pressed
+    }
+
+    func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
+    func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
+}
+
 struct ZoomApp: MeetingApp {
     let id = "zoom"
     let displayName = "Zoom"
@@ -739,7 +885,7 @@ struct ZoomApp: MeetingApp {
     var idleFinalizeSeconds: TimeInterval? { 6 }
 }
 
-let supportedApps: [MeetingApp] = [TeamsApp(), ZoomApp()]
+let supportedApps: [MeetingApp] = [TeamsApp(), ZoomApp(), SlackApp()]
 
 
 // MARK: - Session
