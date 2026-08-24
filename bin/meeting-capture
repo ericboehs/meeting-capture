@@ -758,7 +758,8 @@ final class Session {
     private var written: [(speaker: String, text: String, at: Date)] = []
     /// Ids already written but still on screen.
     private var finalized = Set<String>()
-    private var didWakeTree = false
+    private var wakeAttempts = 0
+    private var nextWake = Date.distantPast
     /// What `[HH:MM:SS]` counts from: the start of the meeting once the app
     /// tells us, otherwise the moment we attached.
     private var timelineStart: Date
@@ -803,16 +804,18 @@ final class Session {
     }
 
     /// Chromium does not build its accessibility tree until the app has been
-    /// frontmost at least once. Without that, Teams is a hollow window (no DOM
-    /// ids, no caption text) and we have nothing to parse.
-    private func wakeTreeIfNeeded(app: AXUIElement, pid: pid_t) {
-        guard !didWakeTree else { return }
-        didWakeTree = true
+    /// frontmost. Without that, Teams is a hollow window (no DOM ids, no
+    /// caption text). Retry a few times — one activate is often not enough if
+    /// focus snaps back to the terminal.
+    private func wakeTreeIfNeeded(app: AXUIElement, pid: pid_t, now: Date) {
         let hasDOM = findElement(from: app) { !axDomID($0).isEmpty } != nil
-        guard !hasDOM else { return }
+        if hasDOM { wakeAttempts = 99; return } // tree is up, never steal focus again
+        guard wakeAttempts < 4, now >= nextWake else { return }
+        wakeAttempts += 1
+        nextWake = now.addingTimeInterval(8)
         NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps])
         if !options.quiet {
-            status("brought \(meetingApp.displayName) forward so its accessibility tree would populate")
+            status("brought \(meetingApp.displayName) forward so its accessibility tree would populate (attempt \(wakeAttempts))")
         }
     }
 
@@ -835,7 +838,7 @@ final class Session {
     }
 
     func tick(app: AXUIElement, pid: pid_t, now: Date) {
-        wakeTreeIfNeeded(app: app, pid: pid)
+        wakeTreeIfNeeded(app: app, pid: pid, now: now)
         resolveTimeline(app: app, now: now)
         let needsCaptions = options.captureCaptions && captionsContainer == nil
         let needsChat = options.captureChat && chatContainer == nil
@@ -1068,8 +1071,14 @@ func followTranscripts(_ options: Options) {
     var lastLive = ""
     var liveRows = 0
     var lastScan = Date.distantPast
+    var logOffset: UInt64 = 0
     let pointer = options.stateDirectory + "/current"
     let livePath = options.stateDirectory + "/live"
+    let logURL = URL(fileURLWithPath: options.stateDirectory + "/launchd.log")
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+       let size = attrs[.size] as? UInt64 {
+        logOffset = size
+    }
     if !options.quiet { status("following \(options.directory)") }
 
     func eraseLive() {
@@ -1092,6 +1101,23 @@ func followTranscripts(_ options: Options) {
                     offset = 0
                     if !options.quiet { status(url.lastPathComponent) }
                 }
+            } else if current != nil {
+                eraseLive()
+                current = nil
+                offset = 0
+                lastLive = ""
+                if !options.quiet { status("waiting for the next meeting") }
+            }
+            if let handle = try? FileHandle(forReadingFrom: logURL) {
+                try? handle.seek(toOffset: logOffset)
+                let data = handle.readDataToEndOfFile()
+                if !data.isEmpty {
+                    eraseLive()
+                    lastLive = ""
+                    stdout.write(data)
+                    logOffset += UInt64(data.count)
+                }
+                try? handle.close()
             }
         }
         if let current, let handle = try? FileHandle(forReadingFrom: current) {
