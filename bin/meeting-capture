@@ -370,7 +370,9 @@ protocol MeetingApp {
     /// Whether the captions UI is up, regardless of whether it has any text in
     /// it right now. Used to avoid toggling captions that are already on.
     func captionsPanelOpen(_ app: AXUIElement) -> Bool
-    func requestCaptions(pid: pid_t)
+    /// Ask the app to show captions. Returns false if the control wasn't
+    /// reachable, in which case no attempt is counted and we can try later.
+    func requestCaptions(pid: pid_t) -> Bool
 
     func chatContainer(_ app: AXUIElement) -> AXUIElement?
     func chatMessages(in container: AXUIElement) -> [ChatMessage]
@@ -479,15 +481,16 @@ struct TeamsApp: MeetingApp {
 
     /// Teams' own shortcut (⇧⌘A), delivered straight to the process so it
     /// bypasses global event taps such as a Hammerspoon remap.
-    func requestCaptions(pid: pid_t) {
+    func requestCaptions(pid: pid_t) -> Bool {
         let source = CGEventSource(stateID: .privateState)
         let keyA: CGKeyCode = 0
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyA, keyDown: true),
-              let up = CGEvent(keyboardEventSource: source, virtualKey: keyA, keyDown: false) else { return }
+              let up = CGEvent(keyboardEventSource: source, virtualKey: keyA, keyDown: false) else { return false }
         down.flags = [.maskCommand, .maskShift]
         up.flags = [.maskCommand, .maskShift]
         down.postToPid(pid)
         up.postToPid(pid)
+        return true
     }
 
     /// The chat message list: the grandparent of any rendered message body.
@@ -563,21 +566,24 @@ struct ZoomApp: MeetingApp {
         findElement(from: app) { axIdentifier($0) == "captions" }
     }
 
+    /// Zoom's caption list only exists while captions are on, which makes it a
+    /// reliable signal — unlike the toolbar button, which vanishes with the
+    /// toolbar whenever the pointer leaves the window.
     func captionsPanelOpen(_ app: AXUIElement) -> Bool {
-        if captionsContainer(app) != nil { return true }
-        // "Hide captions" means they are already showing.
-        guard let button = captionsButton(app) else { return false }
-        return axDescription(button).localizedCaseInsensitiveContains("hide captions")
+        captionsContainer(app) != nil
     }
 
     /// No synthetic keystroke needed: the toolbar button is pressable, and its
-    /// description says which way it will toggle.
-    func requestCaptions(pid: pid_t) {
+    /// description says which way it will toggle. It is only in the tree while
+    /// the toolbar is showing, so this often has to wait for the pointer.
+    func requestCaptions(pid: pid_t) -> Bool {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 5.0)
-        guard let button = captionsButton(app),
-              axDescription(button).localizedCaseInsensitiveContains("show captions") else { return }
-        AXUIElementPerformAction(button, kAXPressAction as CFString)
+        guard let button = captionsButton(app) else { return false }
+        guard axDescription(button).localizedCaseInsensitiveContains("show captions") else {
+            return true // already on, or about to be hidden — leave it alone
+        }
+        return AXUIElementPerformAction(button, kAXPressAction as CFString) == .success
     }
 
     // Zoom's chat panel is a separate surface that has to be open to read; not
@@ -613,6 +619,7 @@ final class Session {
     private var seenChatIDs = Set<String>()
     private var chatBaselineDone: Bool
     private var captionAttempts = 0
+    private var warnedCaptionsUnreachable = false
     private var lastCaptionCheck = Date.distantPast
     private var sawCaptions = false
     /// Recently written utterances, to catch an app re-rendering a finished one.
@@ -679,8 +686,16 @@ final class Session {
             sawCaptions = true // panel is up, just idle — never press again
             return
         }
+        guard meetingApp.requestCaptions(pid: pid) else {
+            // Out of reach for now (Zoom hides its toolbar until the pointer is
+            // over the window), so keep looking rather than spending a try.
+            if !warnedCaptionsUnreachable, !options.quiet {
+                warnedCaptionsUnreachable = true
+                status("\(meetingApp.displayName) is hiding its captions control; will turn captions on when it reappears")
+            }
+            return
+        }
         captionAttempts += 1
-        meetingApp.requestCaptions(pid: pid)
         if !options.quiet { status("asked \(meetingApp.displayName) to show live captions (attempt \(captionAttempts))") }
     }
 
