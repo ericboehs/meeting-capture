@@ -679,10 +679,6 @@ final class SlackApp: MeetingApp {
     /// rather than read off the tree.
     private var liveSequence = 0
     private var previousLiveText = ""
-    /// Text already surfaced through the live slot. An utterance is written
-    /// when its live entry goes away, so re-reporting it once Slack marks it
-    /// settled would file the same sentence twice.
-    private var surfacedLive: [String] = []
 
     /// A huddle gets its own window, and the Leave button only exists while
     /// one is up.
@@ -780,31 +776,24 @@ final class SlackApp: MeetingApp {
             previousLiveText = ""
         }
 
-        // Anything that came through the live slot is already accounted for:
-        // it is written when that entry disappears. Reporting the settled copy
-        // as well wrote every sentence twice, and the recorder's guard against
-        // repeats only reaches back 30s \u2014 far less than an event lingers here.
-        // What survives the filter is backlog that was already on screen when
-        // we joined, which has no live entry to be written by.
-        var entries = settled
-            .filter { !surfacedLive.contains($0.text) }
-            .map {
-                CaptionEntry(id: "settled:\(identity(of: $0.speaker, $0.text))", speaker: $0.speaker, text: $0.text)
-            }
+        // Every settled event is reported, including one whose text also sits
+        // in the live slot. Suppressing those looked like the way to avoid
+        // writing a sentence twice, but the live slot is not a safe place to
+        // have left it: if Slack settles an utterance with any edit at all,
+        // the turnover above is missed, the live id is reused for the next
+        // sentence, and the previous one is overwritten before it was ever
+        // written out. Reporting both and letting the recorder collapse them
+        // loses nothing when that happens.
+        var entries = settled.map {
+            CaptionEntry(id: "settled:\(identity(of: $0.speaker, $0.text))", speaker: $0.speaker, text: $0.text)
+        }
         if let live {
             previousLiveText = live.text
-            remember(live.text)
             // Last, so the recorder treats it as the line still being spoken
             // and leaves it out of idle finalization.
             entries.append(CaptionEntry(id: "live:\(liveSequence)", speaker: live.speaker, text: live.text))
         }
         return entries
-    }
-
-    private func remember(_ text: String) {
-        guard !surfacedLive.contains(text) else { return }
-        surfacedLive.append(text)
-        if surfacedLive.count > 80 { surfacedLive.removeFirst(surfacedLive.count - 80) }
     }
 
     private func identity(of speaker: String, _ text: String) -> String {
@@ -1158,7 +1147,6 @@ final class Session {
             captionsContainer = nil // panel closed or re-rendered
         }
         let visible = Set(entries.map(\.id))
-        for id in captionOrder where !visible.contains(id) { finalizeCaption(id, at: now) }
         finalized.formIntersection(visible) // let ids be reused once they are gone
         for entry in entries {
             if finalized.contains(entry.id) {
@@ -1185,6 +1173,13 @@ final class Session {
                 captionOrder.append(entry.id)
             }
         }
+
+        // Finalize what left the screen only after taking in what is on it.
+        // An app can retire one element and put the same sentence up under
+        // another in a single refresh, and finalizing first meant the
+        // replacement was not there yet to be recognised as the same
+        // utterance, so it was written twice.
+        for id in captionOrder where !visible.contains(id) { finalizeCaption(id, at: now) }
 
         // Apps that keep finished utterances on screen need another way to tell
         // that one is done.
