@@ -1699,9 +1699,13 @@ final class Session {
     /// Drain the backlog, strictly oldest-first, stopping at the first item
     /// whose write fails so nothing overtakes it. A .event that lands as
     /// jsonOnly is REPLACED in place by its text debt rather than dropped, so
-    /// later items can never pass it. Returns the items still pending and, on
-    /// failure, the most recent failure's cause for callers' warnings.
-    private func drainPendingWrites(until deadline: Date?) -> (remaining: Int, note: String?) {
+    /// later items can never pass it.
+    ///
+    /// Returns the BLOCKING failure's cause for callers' aggregate warning,
+    /// or nil when everything drained — or when the deadline expired first
+    /// with items still queued (read pendingWrites.count to tell those apart).
+    @discardableResult
+    private func drainPendingWrites(until deadline: Date?) -> String? {
         while !pendingWrites.isEmpty {
             if let deadline, Date() >= deadline { break }
             let result: AttemptResult
@@ -1711,7 +1715,8 @@ final class Session {
                                            body: body, at: at, extra: extra)
             case .text(let line):
                 guard let writer = recorder else {
-                    return (pendingWrites.count, "transcript is not initialized")
+                    result = .failed("transcript is not initialized")
+                    break
                 }
                 do {
                     try writer.appendText(line)
@@ -1726,10 +1731,10 @@ final class Session {
             case .needsText(let line):
                 pendingWrites[0] = .text(line)
             case .failed(let why):
-                return (pendingWrites.count, why)
+                return why
             }
         }
-        return (0, nil)
+        return nil
     }
 
     /// Retry queued output on a bounded exponential backoff (capped at 30s).
@@ -1739,13 +1744,10 @@ final class Session {
         guard !finished else { return }
         guard !pendingWrites.isEmpty else { return }
         guard now >= nextRetry else { return }
-        let drained = drainPendingWrites(until: nil)
-        if drained.remaining > 0 {
+        if let why = drainPendingWrites(until: nil) {
             retryDelay = min(retryDelay * 2, 30)
             nextRetry = now.addingTimeInterval(retryDelay)
-            var message = "\(drained.remaining) item(s) awaiting writable storage; retrying every \(Int(retryDelay))s"
-            if let note = drained.note { message += "\n  last failure: \(note)" }
-            status(message)
+            status("\(pendingWrites.count) item(s) awaiting writable storage; retrying every \(Int(retryDelay))s\n  blocked by: \(why)")
         } else {
             retryDelay = 1
         }
@@ -1962,8 +1964,9 @@ final class Session {
         var drainNote: String?
         repeat {
             for id in captionOrder { finalizeCaption(id, at: date) }
-            let drained = drainPendingWrites(until: deadline)
-            drainNote = drained.note
+            // Keep the last non-nil cause: a nil here means the deadline cut
+            // the drain off, not that nothing failed.
+            if let note = drainPendingWrites(until: deadline) { drainNote = note }
             if !captionOrder.isEmpty || !pendingWrites.isEmpty {
                 usleep(250_000)
             }
@@ -1979,7 +1982,7 @@ final class Session {
             if let note = drainNote {
                 message += "\n  last failure: \(note)"
             } else {
-                message += "\n  retry deadline expired before all remaining writes completed; earlier jsonl errors are logged above"
+                message += "\n  retry deadline expired before all remaining writes completed; earlier errors are logged above"
             }
             message += "\n  check free space and permissions for \(options.directory)"
             status(message)
