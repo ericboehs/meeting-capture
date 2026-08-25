@@ -807,15 +807,17 @@ struct TreeWaker {
     /// captions need the full tree. Native apps are never poked.
     mutating func ensureReadable(_ attachment: Attachment, now: Date) -> Bool {
         let app = attachment.element
+        // Native apps never need waking; answer without touching their tree
+        // (a DOM-id probe is a full recursive traversal, too costly per poll).
+        guard attachment.meetingApp.rendersWebContent else {
+            return attachment.meetingApp.treeIsReadable(app)
+        }
         // Rate-limit state is cleared only when the WebView is genuinely awake:
         // clearing it for merely title-readable apps (Teams) would reset the
         // deadline every scan and turn the rate limit into a poke storm.
         if webTreeAwake(app) {
             nextAttempt.removeValue(forKey: attachment.pid)
             attempts.removeValue(forKey: attachment.pid)
-            return attachment.meetingApp.treeIsReadable(app)
-        }
-        guard attachment.meetingApp.rendersWebContent else {
             return attachment.meetingApp.treeIsReadable(app)
         }
         // WebView still hollow: poke on the cooldown, and keep counting even
@@ -1457,7 +1459,9 @@ final class Session {
     private var lastPublishWarning = Date.distantPast
     private var lastInitWarning = Date.distantPast
     /// Transcript lines whose jsonl event persisted but whose text half could
-    /// not be written; retried text-only so the pair eventually agrees.
+    /// not be written; retried text-only (FIFO, bounded cadence — see
+    /// retryPendingWrites) until the deadline in finish(), after which they
+    /// count as lost.
     private var unsavedTextLines: [String] = []
     /// Events that failed to persist at all, retried with backoff.
     private struct PendingEvent {
@@ -1470,6 +1474,7 @@ final class Session {
     private var pendingEvents: [PendingEvent] = []
     private var nextEventRetry = Date.distantPast
     private var eventRetryDelay: TimeInterval = 1
+    private var nextTextRetry = Date.distantPast
     private var nextCaptionCheck = Date.distantPast
     private var sawCaptions = false
     /// Recently written utterances, to catch an app re-rendering a finished one.
@@ -1500,10 +1505,10 @@ final class Session {
     var files: (jsonl: URL, text: URL)? { recorder.map { ($0.jsonlURL, $0.textURL) } }
 
     /// Files are created on first write, so a silent meeting leaves no litter.
-    /// Returns nil until initialization succeeds (metadata event written), in
-    /// which case callers must skip the event entirely: a recorder without its
-    /// metadata/header would produce events invisible to --follow and poison
-    /// dedup state with lines that never landed.
+    /// Returns nil until the METADATA event is written successfully — the one
+    /// hard requirement. Header writing and pointer publication are best-effort
+    /// follow-ups, not part of the success condition. Callers whose event fails
+    /// while this returns nil queue it for replay rather than dropping it.
     private func recorderForWriting() -> Recorder? {
         if let recorder { return recorder }
         // Whatever the timeline looks like now is what the file gets: the header
@@ -1604,16 +1609,26 @@ final class Session {
     }
 
     /// Records an event and draws it. Returns true when the event persisted
-    /// somewhere (jsonl at least); false when neither file has it, so callers
-    /// can leave dedup state untouched and retry later.
+    /// somewhere or was accepted onto the ordered retry queue; false when it
+    /// failed outright (callers roll their dedup state back).
+    ///
+    /// Order discipline: while any earlier output is still queued, new events
+    /// are queued behind it rather than written, so post-recovery transcripts
+    /// never reorder. Queued == committed for dedup purposes, same as jsonOnly.
     @discardableResult
     private func emit(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any]) -> Bool {
-        // Lines are appended as they finish but stamped with when they began,
-        // so a long sentence can land after a short one that started later and
-        // the clock appears to run backwards. Hold the stamp at the high-water
-        // mark, keeping the real start alongside it when they differ. The mark
-        // only moves once the line persisted — a failed write must not clamp
-        // later lines against an event that exists in neither file.
+        guard pendingEvents.isEmpty, unsavedTextLines.isEmpty else {
+            pendingEvents.append(PendingEvent(
+                kind: kind, speaker: speaker, body: body, at: date, extra: extra))
+            return true
+        }
+        return writeEvent(kind: kind, speaker: speaker, body: body, at: date, extra: extra)
+    }
+
+    /// The actual write path. The high-water stamp only moves once the line
+    /// persisted — a failed write must not clamp later lines against an event
+    /// that exists in neither file.
+    private func writeEvent(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any]) -> Bool {
         let stamp = max(date, lastStamp ?? date)
         var extra = extra
         if stamp != date { extra["started_at"] = Recorder.isoFormatter.string(from: date) }
@@ -1664,29 +1679,41 @@ final class Session {
     /// the transcript; whole-event retries replay through emit with bounded
     /// exponential backoff so a persistently broken disk doesn't get hammered
     /// every 250ms.
+    /// Drain queued output before fresh events are accepted, so transcript
+    /// order survives a write outage. Whole events replay first (oldest
+    /// first), then text-only lines — each strictly FIFO, stopping at the
+    /// first failure so later lines can't overtake an earlier stuck one.
     private func retryPendingWrites(now: Date) {
-        guard let writer = recorder, !finished else { return }
-        if !unsavedTextLines.isEmpty {
-            unsavedTextLines.removeAll { line in
-                if writer.appendText(line) { return true } // saved
-                if Date().timeIntervalSince(lastPublishWarning) > 30 {
-                    lastPublishWarning = Date()
-                    status("\(unsavedTextLines.count) transcript line(s) await a working write")
-                }
-                return false // keep for the next tick
+        guard !finished else { return }
+        // Whole events: emit re-initializes the recorder itself when metadata
+        // recovery lands, so this is deliberately NOT gated on `recorder`.
+        if !pendingEvents.isEmpty, now >= nextEventRetry {
+            while let event = pendingEvents.first {
+                guard writeEvent(kind: event.kind, speaker: event.speaker,
+                                 body: event.body, at: event.at, extra: event.extra)
+                else { break }
+                pendingEvents.removeFirst()
+            }
+            if !pendingEvents.isEmpty {
+                eventRetryDelay = min(eventRetryDelay * 2, 8)
+                nextEventRetry = now.addingTimeInterval(eventRetryDelay)
+                status("\(pendingEvents.count) event(s) could not be written; retrying every \(Int(eventRetryDelay))s")
+            } else {
+                eventRetryDelay = 1
             }
         }
-        guard !pendingEvents.isEmpty, now >= nextEventRetry else { return }
-        pendingEvents.removeAll { event in
-            emit(kind: event.kind, speaker: event.speaker, body: event.body,
-                 at: event.at, extra: event.extra)
-        }
-        if !pendingEvents.isEmpty {
-            eventRetryDelay = min(eventRetryDelay * 2, 8)
-            nextEventRetry = now.addingTimeInterval(eventRetryDelay)
-            status("\(pendingEvents.count) event(s) could not be written; retrying every \(Int(eventRetryDelay))s")
-        } else {
-            eventRetryDelay = 1
+        // Text-only retries get their own 1s cadence: a persistently broken
+        // disk must not be hammered at poll rate with per-line logging.
+        if !unsavedTextLines.isEmpty, now >= nextTextRetry {
+            nextTextRetry = now.addingTimeInterval(1)
+            guard let writer = recorder else { return }
+            while let line = unsavedTextLines.first {
+                guard writer.appendText(line) else { break }
+                unsavedTextLines.removeFirst()
+            }
+            if !unsavedTextLines.isEmpty {
+                status("\(unsavedTextLines.count) transcript line(s) await a working write")
+            }
         }
     }
 
@@ -1907,17 +1934,23 @@ final class Session {
         // whose writes fail — normally so a later poll retries, but no poll
         // follows a finish — so retry here on a short bounded deadline before
         // giving up on them.
-        let deadline = date.addingTimeInterval(5)
+        // The deadline is wall-clock NOW, not the caller's meeting timestamp:
+        // endSession captures that date before multi-second AX round-trips,
+        // and an already-expired deadline would mean zero retries.
+        let deadline = Date().addingTimeInterval(5)
         repeat {
             for id in captionOrder { finalizeCaption(id, at: date) }
-            if !pendingEvents.isEmpty {
-                pendingEvents.removeAll { event in
-                    emit(kind: event.kind, speaker: event.speaker, body: event.body,
-                         at: event.at, extra: event.extra)
-                }
+            while let event = pendingEvents.first {
+                guard writeEvent(kind: event.kind, speaker: event.speaker,
+                                 body: event.body, at: event.at, extra: event.extra)
+                else { break }
+                pendingEvents.removeFirst()
             }
             if let writer = recorder {
-                unsavedTextLines.removeAll { writer.appendText($0) }
+                while let line = unsavedTextLines.first {
+                    guard writer.appendText(line) else { break }
+                    unsavedTextLines.removeFirst()
+                }
             }
             if !captionOrder.isEmpty || !pendingEvents.isEmpty || !unsavedTextLines.isEmpty {
                 usleep(250_000)
@@ -1925,13 +1958,19 @@ final class Session {
         } while (!captionOrder.isEmpty || !pendingEvents.isEmpty || !unsavedTextLines.isEmpty) && Date() < deadline
         removeStateFile(options.stateDirectory + "/live")
         removeStateFile(options.stateDirectory + "/current")
+        // Known data loss is always reported — even with no recorder at all
+        // (nothing ever initialized), even under --quiet, even if the stopped
+        // event itself fails to write.
+        let lost = captionOrder.count + pendingEvents.count + unsavedTextLines.count
+        if lost > 0 {
+            status("\(lost) item(s) of \"\(title)\" could not be written and are lost")
+        }
         guard let writer = recorder else { return }
         // A duration is time spent recording — not whatever the transcript
         // stamps happen to count from (Slack/Meet stamps are the time of day).
         let duration = elapsedString(from: startedAt, to: date)
-        let lost = captionOrder.count + pendingEvents.count + unsavedTextLines.count
         // Only claim "finished" if the stopped event landed; writeJSON has
-        // already logged the failure otherwise.
+        // already logged the failure otherwise. Loss (if any) was reported above.
         if writer.writeJSON([
             "type": "metadata",
             "event": "stopped",
@@ -1939,11 +1978,7 @@ final class Session {
             "duration": duration,
             "lost_events": lost
         ]), !options.quiet {
-            if lost > 0 {
-                status("finished \"\(title)\" after \(duration), but \(lost) item(s) could not be written")
-            } else {
-                status("finished \"\(title)\" after \(duration)")
-            }
+            status("finished \"\(title)\" after \(duration)")
         }
     }
 }
@@ -1983,15 +2018,24 @@ enum FileRead {
 }
 
 /// Only genuine "the file is not there" counts as absent; everything else is
-/// a real failure that callers must surface.
+/// a real failure that callers must surface. NSFileReadUnknownError (260) is a
+/// GENERIC read failure — EIO, ESTALE, etc. all surface as 260 — so it only
+/// counts as missing when the wrapped POSIX error is specifically ENOENT.
 func isMissingFileError(_ error: NSError) -> Bool {
-    if error.domain == NSCocoaErrorDomain,
-       [NSFileNoSuchFileError, NSFileReadNoSuchFileError, NSFileReadUnknownError].contains(error.code) {
+    guard error.domain == NSCocoaErrorDomain else { return posixENOENT(error) }
+    switch error.code {
+    case NSFileNoSuchFileError, NSFileReadNoSuchFileError:
         return true
+    case NSFileReadUnknownError:
+        return posixENOENT(error)
+    default:
+        return false
     }
-    // Some APIs wrap a generic read error around a POSIX ENOENT.
+}
+
+private func posixENOENT(_ error: NSError) -> Bool {
     let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError ?? error
-    return underlying.domain == NSPOSIXErrorDomain && underlying.code == ENOENT
+    return underlying.domain == NSPOSIXErrorDomain && underlying.code == Int(ENOENT)
 }
 
 func readFile(_ path: String) -> FileRead {

@@ -1,7 +1,9 @@
-// Unit tests for meeting-capture's pure logic. Run with tests/run.sh.
+// Unit tests for meeting-capture. Run with tests/run.sh.
 //
 // This is the only file in the test build with top-level code; everything below
 // "// MARK: - Main" in bin/meeting-capture is stripped by tests/run.sh.
+// Covers pure logic plus filesystem helpers (state-file reads/removals,
+// transcript tailing) via temp files; AX/processes/real time are not exercised.
 import Foundation
 
 var count = 0
@@ -169,7 +171,7 @@ try drainFileTail(tailPath, from: 0, into: orderedSink,
     warn: { _ in warnedCount += 1 })
 try orderedSink.close()
 let sunk = (try String(contentsOfFile: sinkPath, encoding: .utf8))
-expectTrue(sunk.hasPrefix("[erase]first\n"), "live-region erase lands BEFORE the printed bytes")
+expectEqual(sunk, "[erase]first\n", "live-region erase lands BEFORE the printed bytes — and only once")
 
 // Remaining drains use /dev/null.
 let nullSink = FileHandle(forWritingAtPath: "/dev/null")!
@@ -191,6 +193,26 @@ expectEqual(warnedCount, 0, "healthy drains never warn")
 off = try drainFileTail(dir + "/missing", from: off, into: nullSink,
     beforeWrite: {}, warn: { _ in warnedCount += 1 })
 expectEqual(warnedCount, 0, "missing files are absent, not failures")
+
+// --- isMissingFileError classification ----------------------------------
+
+func cocoaError(_ code: Int, underlyingPOSIX: Int32? = nil) -> NSError {
+    var userInfo: [String: Any] = [:]
+    if let posix = underlyingPOSIX {
+        userInfo[NSUnderlyingErrorKey] = NSError(
+            domain: NSPOSIXErrorDomain, code: Int(posix), userInfo: nil)
+    }
+    return NSError(domain: NSCocoaErrorDomain, code: code, userInfo: userInfo)
+}
+expectTrue(isMissingFileError(cocoaError(NSFileNoSuchFileError)), "code 4 is missing")
+expectTrue(isMissingFileError(cocoaError(NSFileReadNoSuchFileError)), "code 256 is missing")
+expectTrue(isMissingFileError(cocoaError(NSFileReadUnknownError, underlyingPOSIX: ENOENT)),
+           "generic 260 wrapped around ENOENT is missing")
+expectTrue(!isMissingFileError(cocoaError(NSFileReadUnknownError)),
+           "generic 260 WITHOUT ENOENT underneath is a real failure (EIO/ESTALE surface as 260)")
+expectTrue(!isMissingFileError(cocoaError(NSFileReadNoPermissionError)), "EACCES is a failure, not idle")
+expectTrue(!isMissingFileError(NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: nil)),
+           "raw POSIX EACCES is a failure, not idle")
 
 // --- Summary ------------------------------------------------------------
 

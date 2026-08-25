@@ -25,8 +25,6 @@ cert_name="meeting-capture-signing"
 # stable identity keeps the grant: `signing-cert` below makes a self-signed one,
 # and MEETING_CAPTURE_SIGN_ID overrides it (e.g. with a Developer ID).
 #
-# Tri-state: 0 = cert exists, 1 = lookup succeeded and it doesn't, 2 = the
-# keychain could not be consulted at all (never treated as "absent").
 # Prints every valid code-signing identity; returns nonzero when the keychain
 # cannot be consulted at all (never treated as "no identities").
 list_signing_identities() {
@@ -39,6 +37,9 @@ list_signing_identities() {
   fi
   printf '%s' "$out"
 }
+# Tri-state contract: 0 = certificate exists, 1 = lookup succeeded and the
+# certificate is absent, 2 = the keychain could not be consulted at all (never
+# treated as "absent").
 signing_cert_exists() {
   local identities rc=0
   identities=$(list_signing_identities) || rc=$?
