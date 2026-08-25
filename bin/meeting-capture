@@ -1492,13 +1492,27 @@ let supportedApps: [MeetingApp] = [TeamsApp(), ZoomApp(), SlackApp(), MeetApp()]
 
 /// One meeting: holds the caption/chat state and creates files lazily, so a
 /// meeting that never produces a line leaves nothing behind.
+/// Injectable time. Tests drive deadlines, backoff, and the finish drain
+/// loop deterministically; production always gets wall-clock.
+protocol TimeSource {
+    func now() -> Date
+}
+
+struct WallClock: TimeSource {
+    func now() -> Date { Date() }
+}
+
 final class Session {
     let options: Options
     let live: LiveView
     let meetingApp: MeetingApp
+    /// Sleep primitive for the finish drain loop's inter-attempt pause —
+    /// injectable so tests don't actually sleep while the fake clock advances.
+    var sleepFn: (UInt32) -> Void = { usleep($0) }
+    let clock: any TimeSource
     let startedAt = Date()
     var title: String
-    private var recorder: Recorder?
+    var recorder: Recorder?
     /// Highest stamp written so far, so the transcript clock never goes back.
     private var lastStamp: Date?
     private var captionsContainer: AXUIElement?
@@ -1506,13 +1520,14 @@ final class Session {
     private var lastRelocate = Date.distantPast
     private var activeCaptions: [String: Utterance] = [:]
     private var captionOrder: [String] = []
+    // ^ internal so fault tests can count lost items without stderr capture
     private var seenChatIDs = Set<String>()
     private var chatBaselineDone: Bool
     private var captionAttempts = 0
     private var warnedCaptionsUnreachable = false
     /// finish() must be idempotent: it runs both on leave detection and on exit,
     /// and running twice would double-flush and double-report.
-    private var finished = false
+    var finished = false
     private var lastPublishWarning = Date.distantPast
     private var lastInitWarning = Date.distantPast
     /// The ordered write backlog: everything that failed to persist, oldest
@@ -1520,13 +1535,13 @@ final class Session {
     /// whose text half is still owed (.text); a single FIFO is what keeps both
     /// transcript files in the same order across write outages. Entries are
     /// drained by drainPendingWrites and count as lost in finish().
-    private enum PendingWrite {
+    enum PendingWrite {
         case event(kind: String, speaker: String, body: String, at: Date, extra: [String: Any])
         case text(String)
     }
-    private var pendingWrites: [PendingWrite] = []
-    private var nextRetry = Date.distantPast
-    private var retryDelay: TimeInterval = 1
+    var pendingWrites: [PendingWrite] = []
+    var nextRetry = Date.distantPast
+    var retryDelay: TimeInterval = 1
     private var nextCaptionCheck = Date.distantPast
     private var sawCaptions = false
     /// Recently written utterances, to catch an app re-rendering a finished one.
@@ -1542,12 +1557,14 @@ final class Session {
     private var timelineResolved = false
     private var nextTimelineCheck = Date.distantPast
 
-    init(options: Options, live: LiveView, meetingApp: MeetingApp, title: String) {
+    init(options: Options, live: LiveView, meetingApp: MeetingApp, title: String,
+         clock: any TimeSource = WallClock()) {
         self.options = options
         self.live = live
         self.meetingApp = meetingApp
         self.title = title
-        self.timelineStart = Date()
+        self.clock = clock
+        self.timelineStart = clock.now()
         chatBaselineDone = options.includeChatBacklog
         // Apps are singletons; drop any caption bookkeeping a previous meeting left.
         meetingApp.resetCaptureState()
@@ -1755,9 +1772,11 @@ final class Session {
     /// or nil when everything drained — or when the deadline expired first
     /// with items still queued (read pendingWrites.count to tell those apart).
     @discardableResult
-    private func drainPendingWrites(until deadline: Date?) -> String? {
+    func drainPendingWrites(until deadline: Date?) -> String? {
         while !pendingWrites.isEmpty {
-            if let deadline, Date() >= deadline { break }
+            // Same injected source as finish()'s deadline — a fake clock that
+            // advances per now() call is what makes the loop terminate in tests.
+            if let deadline, clock.now() >= deadline { break }
             let result: AttemptResult
             switch pendingWrites[0] {
             case .event(let kind, let speaker, let body, let at, let extra):
@@ -1790,7 +1809,7 @@ final class Session {
     /// Retry queued output on a bounded exponential backoff (capped at 30s).
     /// Runs before fresh polls each tick; combined with emit's order guard,
     /// this means recovered output always precedes anything newer.
-    private func retryPendingWrites(now: Date) {
+    func retryPendingWrites(now: Date) {
         guard !finished else { return }
         guard !pendingWrites.isEmpty else { return }
         guard now >= nextRetry else { return }
@@ -2007,10 +2026,11 @@ final class Session {
         // Finalize every pending utterance. finalizeCaption hands failures to
         // the ordered backlog, and no poll follows a finish — so drain that
         // backlog here on a short bounded deadline before declaring loss.
-        // The deadline is wall-clock NOW, not the caller's meeting timestamp:
-        // endSession captures that date before multi-second AX round-trips,
-        // and an already-expired deadline would mean zero retries.
-        let deadline = Date().addingTimeInterval(5)
+        // The deadline is wall-clock NOW (or the injected test clock), not the
+        // caller's meeting timestamp: endSession captures that date before
+        // multi-second AX round-trips, and an already-expired deadline would
+        // mean zero retries.
+        let deadline = clock.now().addingTimeInterval(5)
         var drainNote: String?
         repeat {
             for id in captionOrder { finalizeCaption(id, at: date) }
@@ -2018,9 +2038,9 @@ final class Session {
             // the drain off, not that nothing failed.
             if let note = drainPendingWrites(until: deadline) { drainNote = note }
             if !captionOrder.isEmpty || !pendingWrites.isEmpty {
-                usleep(250_000)
+                sleepFn(250_000)
             }
-        } while (!captionOrder.isEmpty || !pendingWrites.isEmpty) && Date() < deadline
+        } while (!captionOrder.isEmpty || !pendingWrites.isEmpty) && clock.now() < deadline
         removeStateFile(options.stateDirectory + "/live")
         removeStateFile(options.stateDirectory + "/current")
         // Known data loss is always reported — even with no recorder at all
