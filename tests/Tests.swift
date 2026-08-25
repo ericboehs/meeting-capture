@@ -5,6 +5,7 @@
 // Covers pure logic plus filesystem helpers (state-file reads/removals,
 // transcript tailing) via temp files; AX/processes/real time are not exercised.
 import Foundation
+import ApplicationServices // AXUIElement appears in the StubMeetingApp signature
 
 var count = 0
 var failures = 0
@@ -341,6 +342,122 @@ do {
     let contents = try? String(contentsOf: url, encoding: .utf8)
     expectEqual(contents, "first\nsecond\n", "reopened FileSink appends at EOF without clobbering")
     try? FileManager.default.removeItem(at: url)
+}
+
+// --- Clock seam: finish-time recovery + backoff (issue #14 case 1) ------
+
+final class FakeClock: TimeSource {
+    private(set) var fakeNow: Date
+    /// Advance per now() call — the finish drain loop terminates once its
+    /// deadline check sees time pass, without any real sleeping.
+    let step: TimeInterval
+    init(start: Date, step: TimeInterval) { fakeNow = start; self.step = step }
+    func now() -> Date { defer { fakeNow = fakeNow.addingTimeInterval(step) }; return fakeNow }
+}
+
+final class StubMeetingApp: MeetingApp {
+    let id = "stub"
+    let displayName = "Stub"
+    let processPattern = "stub"
+    let captionPressToggles = false
+    let finalizesWhenSuperseded = false
+    let idleFinalizeSeconds: TimeInterval? = nil
+    let reportsMeetingClock = false
+    let captionsSurfaceIsTransient = false
+    let rendersWebContent = false
+    func meetingAnchor(_ app: AXUIElement) -> AXUIElement? { nil }
+    func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String { "" }
+    func captionsContainer(_ app: AXUIElement) -> AXUIElement? { nil }
+    func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
+    func captionEntries(in container: AXUIElement) -> [CaptionEntry] { [] }
+    func captionsPanelOpen(_ app: AXUIElement) -> Bool { false }
+    func requestCaptions(pid: pid_t) -> CaptionRequest { .unreachable }
+    func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
+    func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
+    func resetCaptureState() {}
+    func hasStableIdentity(_ id: String) -> Bool { false }
+    func treeIsReadable(_ app: AXUIElement) -> Bool { true }
+}
+
+func injectedSession(clock: FakeClock) -> Session {
+    var opts = Options()
+    opts.quiet = true // LiveView goes non-interactive; status() still stderr
+    // Never touch the real user state directory from tests.
+    opts.stateDirectory = NSTemporaryDirectory() + "/mc-state-\(UUID().uuidString)"
+    return Session(options: opts, live: LiveView(options: opts),
+                   meetingApp: StubMeetingApp(), title: "Test Meeting", clock: clock)
+}
+
+// Persistent failure: both sinks reject everything. finish() must burn
+// through its deadline via the injected clock (no real sleeping), keep every
+// item queued as lost, and stay silent about success.
+do {
+    let clock = FakeClock(start: epoch, step: 0.5)
+    let s = injectedSession(clock: clock)
+    // A pre-injected recorder with dead sinks = "metadata era is over, nothing
+    // gets through" — and crucially, recorderForWriting() never tries to open
+    // REAL files under the user's data directory mid-test.
+    let dead = ClosedSink(path: "/tmp/dead")
+    s.recorder = Recorder(options: Options(), startedAt: epoch, mode: .elapsed(from: epoch),
+                          jsonlURL: URL(fileURLWithPath: dead.path),
+                          textURL: URL(fileURLWithPath: dead.path),
+                          jsonl: dead, text: dead)
+    s.pendingWrites = [
+        .event(kind: "caption", speaker: "A", body: "lost", at: epoch, extra: [:]),
+        .text("[00:00:00] B: also lost")
+    ]
+    var slept: [UInt32] = []
+    s.sleepFn = { slept.append($0) } // count pauses instead of taking them
+    s.finish(at: epoch)
+    expectTrue(s.finished, "finish marks the session finished even on total failure")
+    expectEqual(s.pendingWrites.count, 2, "persistent failure leaves all queued items lost")
+    expectTrue(!slept.isEmpty, "drain loop paused between attempts")
+    expectTrue(clock.fakeNow > epoch.addingTimeInterval(5), "fake clock advanced past the finish deadline")
+}
+
+// Transient failure then recovery: a text-debt retry succeeds on a later
+// attempt, the stopped event lands, and loss is zero.
+do {
+    let clock = FakeClock(start: epoch, step: 0.25)
+    let s = injectedSession(clock: clock)
+    let jsonl = MemorySink(path: "/tmp/recovery.jsonl")
+    let text = FailOnceSink(path: "/tmp/recovery.txt", failAt: 1)
+    s.recorder = Recorder(options: Options(), startedAt: epoch, mode: .elapsed(from: epoch),
+                          jsonlURL: URL(fileURLWithPath: jsonl.path),
+                          textURL: URL(fileURLWithPath: text.path),
+                          jsonl: jsonl, text: text)
+    s.pendingWrites = [.text("[00:00:00] C: recovered line")]
+    s.sleepFn = { _ in } // no real pause; the fake clock drives termination
+    s.finish(at: epoch)
+    expectEqual(s.pendingWrites.count, 0, "transient text failure recovers on retry within the deadline")
+    expectTrue(text.appends >= 2, "failed write was actually retried, not dropped")
+    expectTrue(jsonl.string.contains("\"event\":\"stopped\""), "stopped event lands after recovery")
+    expectTrue(jsonl.string.contains("\"lost_events\":0"), "recovery means zero events reported lost")
+}
+
+// Retry backoff is deterministic under the injected clock: doubles from 1s,
+// capped at 30s, and won't fire before nextRetry.
+do {
+    let clock = FakeClock(start: epoch, step: 0)
+    let s = injectedSession(clock: clock)
+    // Dead sinks keep drainPendingWrites failing deterministically AND keep
+    // recorderForWriting() from ever opening real files under the user's data
+    // directory mid-test.
+    let dead = ClosedSink(path: "/tmp/dead")
+    s.recorder = Recorder(options: Options(), startedAt: epoch, mode: .elapsed(from: epoch),
+                          jsonlURL: URL(fileURLWithPath: dead.path),
+                          textURL: URL(fileURLWithPath: dead.path),
+                          jsonl: dead, text: dead)
+    s.pendingWrites = [.event(kind: "caption", speaker: "A", body: "x", at: epoch, extra: [:])]
+    s.retryPendingWrites(now: clock.now())
+    expectEqual(s.retryDelay, TimeInterval(2), "first failed retry backs off to 2s")
+    expectTrue(s.nextRetry > epoch, "nextRetry scheduled in the future")
+    s.retryPendingWrites(now: s.nextRetry.addingTimeInterval(-1))
+    expectEqual(s.retryDelay, TimeInterval(2), "retry before nextRetry is a no-op")
+    for want in [4.0, 8.0, 16.0, 30.0, 30.0] {
+        s.retryPendingWrites(now: s.nextRetry)
+        expectEqual(s.retryDelay, TimeInterval(want), "backoff progression hits cap at 30s (")
+    }
 }
 
 // --- Summary ------------------------------------------------------------
