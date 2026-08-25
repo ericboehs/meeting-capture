@@ -1476,7 +1476,8 @@ final class Session {
     private var pendingWrites: [PendingWrite] = []
     private var nextRetry = Date.distantPast
     private var retryDelay: TimeInterval = 1
-    /// Cause of the most recent failed write attempt, for callers' warnings.
+    /// Cause of the most recent failed TEXT write (whole-event failures leave
+    /// it nil — Recorder logs its own jsonl failures), for callers' warnings.
     private var lastWriteFailureNote: String?
     private var nextCaptionCheck = Date.distantPast
     private var sawCaptions = false
@@ -1699,7 +1700,7 @@ final class Session {
     /// whose write fails so nothing overtakes it. A .event that lands as
     /// jsonOnly is REPLACED in place by its text debt rather than dropped, so
     /// later items can never pass it. On failure, lastWriteFailureNote carries
-    /// the cause for callers' (single, throttled) warning.
+    /// the text-failure cause (when known) for callers' warnings.
     private func drainPendingWrites(until deadline: Date?) {
         lastWriteFailureNote = nil
         while !pendingWrites.isEmpty {
@@ -1719,7 +1720,8 @@ final class Session {
                     try writer.appendText(line)
                     result = .done
                 } catch {
-                    // Surface cause + path once per drain; appendText stays silent.
+                    // Captured for retryPendingWrites'/finish()'s aggregate warning;
+                    // appendText itself stays silent.
                     lastWriteFailureNote = "\(writer.textURL.path): \(error.localizedDescription)"
                     result = .failed
                 }
@@ -1976,7 +1978,14 @@ final class Session {
         // event itself fails to write.
         let lost = captionOrder.count + pendingWrites.count
         if lost > 0 {
-            status("\(lost) item(s) of \"\(title)\" could not be written and are lost")
+            var message = "\(lost) item(s) of \"\(title)\" could not be written and are lost"
+            if let note = lastWriteFailureNote {
+                message += "\n  last failure: \(note)"
+            } else {
+                message += "\n  (retry deadline expired before a write succeeded)"
+            }
+            message += "\n  check free space and permissions for \(options.directory)"
+            status(message)
         }
         guard let writer = recorder else { return }
         // A duration is time spent recording — not whatever the transcript
