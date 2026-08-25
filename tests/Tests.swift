@@ -519,6 +519,43 @@ do {
     expectTrue(d.poke && d.attempt == 1, "native path left no rate-limit state behind")
 }
 
+// --- WakeLedger unification + pruning (issue #18) -----------------------
+
+// Pruning drops only dead pids; counts for live ones survive so the
+// "hollow for Ns" attempt math is never reset mid-period.
+do {
+    var ledger = WakeLedger()
+    let d1 = ledger.pokeDecision(pid: 100, awake: false, now: epoch)
+    expectTrue(d1.poke && d1.attempt == 1, "first decision pokes as attempt 1")
+    let _ = ledger.pokeDecision(pid: 100, awake: false, now: epoch.addingTimeInterval(5))
+
+    ledger.prune(alive: [100, 200])
+    let d2 = ledger.pokeDecision(pid: 100, awake: false, now: epoch.addingTimeInterval(10))
+    expectTrue(d2.poke && d2.attempt == 3, "live pid keeps its attempt count across prunes")
+
+    ledger.prune(alive: [100])
+    let d3 = ledger.pokeDecision(pid: 100, awake: false, now: epoch.addingTimeInterval(15))
+    expectTrue(d3.poke && d3.attempt == 4, "surviving pid still accumulates")
+}
+
+do {
+    var ledger = WakeLedger()
+    let _ = ledger.pokeDecision(pid: 300, awake: false, now: epoch)
+    ledger.prune(alive: []) // pid gone: everything resets
+    let d = ledger.pokeDecision(pid: 300, awake: false, now: epoch.addingTimeInterval(5))
+    expectTrue(d.poke && d.attempt == 1, "dead pid's restart starts from attempt 1 with no cooldown debt")
+}
+
+// populated membership: marks are per-pid and survive prunes of OTHER pids.
+do {
+    var ledger = WakeLedger()
+    ledger.markPopulated(pid: 10)
+    ledger.markPopulated(pid: 20)
+    ledger.prune(alive: [10])
+    expectTrue(ledger.isPopulated(pid: 10), "populated survives when its pid stays alive")
+    expectEqual(ledger.isPopulated(pid: 20), false, "populated drops with its dead pid")
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")
