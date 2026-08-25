@@ -258,9 +258,11 @@ func injectedRecorder(jsonl: TranscriptSink, text: TranscriptSink) -> Recorder {
     var opts = Options()
     opts.quiet = true
     // .elapsed makes stamps deterministic ([00:00:00] from the epoch start).
+    // URLs are unique per call so a future real-sink test can't collide.
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
     return Recorder(options: opts, startedAt: epoch, mode: .elapsed(from: epoch),
-                    jsonlURL: URL(fileURLWithPath: "/tmp/injected.jsonl"),
-                    textURL: URL(fileURLWithPath: "/tmp/injected.txt"),
+                    jsonlURL: dir.appendingPathComponent("mc-injected-\(UUID().uuidString).jsonl"),
+                    textURL: dir.appendingPathComponent("mc-injected-\(UUID().uuidString).txt"),
                     jsonl: jsonl, text: text)
 }
 
