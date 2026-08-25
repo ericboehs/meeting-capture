@@ -23,7 +23,8 @@ $ meeting-capture
 The last line updates in place as the sentence is spoken, then scrolls up when
 it's final.
 
-**Supported:** Microsoft Teams, Zoom, Slack huddles.
+**Supported:** Microsoft Teams, Zoom, Slack huddles, and Google Meet installed
+as a Safari web app (alpha — tried only in a one-person call).
 
 ## Install
 
@@ -94,7 +95,7 @@ write a second transcript of the same meeting.
 
 | Flag | Effect |
 | --- | --- |
-| `--app <name>` | Only watch one app (`teams`, `zoom`, `slack`) |
+| `--app <name>` | Only watch one app (`teams`, `zoom`, `slack`, `meet`) |
 | `--auto-captions` | Turn live captions on when a meeting starts |
 | `--dir <path>` | Output directory |
 | `--follow`, `--watch` | Watch the newest transcript, never record |
@@ -112,7 +113,8 @@ presses it. Teams doesn't, so its shortcut (⇧⌘A) goes straight to the proces
 with `CGEvent.postToPid`, which bypasses global event taps — a Hammerspoon or
 Karabiner remap of that shortcut won't intercept it. Slack has a captions tab
 in the huddle's side panel, pressed only if no captions are running at all, so
-a panel you chose to close stays closed.
+a panel you chose to close stays closed. Meet's button says which way it goes
+("Turn on captions" against "Turn off captions"), so it is never a guess.
 
 Zoom takes two extra steps. Unless you've pinned it, its captions control lives
 in the **More** overflow, so the button gets opened first and put back if the
@@ -190,7 +192,8 @@ The daemon polls the accessibility tree of each supported app:
 
 1. **Is there a meeting?** Each app shows a leave control only during a call
    (`hangup-button` in Teams, `AXIdentifier=leave` in Zoom, a `Leave Huddle`
-   button in Slack). Its absence for ten consecutive seconds ends the session —
+   button in Slack, a `Leave call` button in Meet). Its absence for ten
+   consecutive seconds ends the session —
    the control also disappears briefly during UI transitions, hence the
    debounce.
 2. **Read the captions**, and decide when an utterance is finished. The apps
@@ -207,9 +210,20 @@ The daemon polls the accessibility tree of each supported app:
      content; the one still being spoken is tracked through its revisions.
      The overlay is also absent whenever nobody is talking, which says nothing
      about whether captions are on.
+   - **Google Meet** keeps one block per speaker holding a list of sentences,
+     appending as each finishes and revising only the last. Nothing carries a
+     DOM id, so a sentence is identified by its position in that list rather
+     than by its text — people say "Yeah." twice, and hashing would file that
+     as one.
 3. **Read the chat.** In Teams, message ids are epoch milliseconds, which double
    as timestamps; anything already on screen when you join is treated as seen.
-   Zoom and Slack chat are not wired up yet.
+   Zoom, Slack and Meet chat are not wired up yet.
+
+Google Meet has no desktop app, so the target here is the Safari web app — Meet
+added to the Dock from Safari, which macOS runs as its own process. A Meet tab
+in an ordinary browser window is not supported: the browser would be the
+process, every other tab would share its tree, and finding the call would mean
+searching all of them.
 
 A finished utterance is often re-rendered under a fresh id, so identical text
 from the same speaker is dropped if an active entry already carries it as a
