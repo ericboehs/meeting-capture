@@ -507,8 +507,9 @@ enum AttemptResult {
     case done
     /// jsonl persisted; replace the unit with this remaining text debt.
     case needsText(String)
-    /// Nothing persisted; keep the unit for retry.
-    case failed
+    /// Nothing persisted; keep the unit for retry. Carries the cause for
+    /// callers' aggregate warnings.
+    case failed(String)
 }
 
 // MARK: - Meeting apps
@@ -1476,9 +1477,6 @@ final class Session {
     private var pendingWrites: [PendingWrite] = []
     private var nextRetry = Date.distantPast
     private var retryDelay: TimeInterval = 1
-    /// Cause of the most recent failed TEXT write (whole-event failures leave
-    /// it nil — Recorder logs its own jsonl failures), for callers' warnings.
-    private var lastWriteFailureNote: String?
     private var nextCaptionCheck = Date.distantPast
     private var sawCaptions = false
     /// Recently written utterances, to catch an app re-rendering a finished one.
@@ -1649,7 +1647,9 @@ final class Session {
         let stamp = max(date, lastStamp ?? date)
         var extra = extra
         if stamp != date { extra["started_at"] = Recorder.isoFormatter.string(from: date) }
-        guard let writer = recorderForWriting() else { return .failed }
+        guard let writer = recorderForWriting() else {
+            return .failed("transcript metadata could not be written; details logged above")
+        }
         switch writer.record(kind: kind, speaker: speaker, body: body, at: stamp, extra: extra) {
         case .written(let line):
             lastStamp = stamp
@@ -1660,7 +1660,7 @@ final class Session {
             live.permanent(line) // display it even though the text file owes it
             return .needsText(line)
         case .failed:
-            return .failed
+            return .failed("event write failed; details logged above")
         }
     }
 
@@ -1699,10 +1699,9 @@ final class Session {
     /// Drain the backlog, strictly oldest-first, stopping at the first item
     /// whose write fails so nothing overtakes it. A .event that lands as
     /// jsonOnly is REPLACED in place by its text debt rather than dropped, so
-    /// later items can never pass it. On failure, lastWriteFailureNote carries
-    /// the text-failure cause (when known) for callers' warnings.
-    private func drainPendingWrites(until deadline: Date?) {
-        lastWriteFailureNote = nil
+    /// later items can never pass it. Returns the items still pending and, on
+    /// failure, the most recent failure's cause for callers' warnings.
+    private func drainPendingWrites(until deadline: Date?) -> (remaining: Int, note: String?) {
         while !pendingWrites.isEmpty {
             if let deadline, Date() >= deadline { break }
             let result: AttemptResult
@@ -1712,18 +1711,13 @@ final class Session {
                                            body: body, at: at, extra: extra)
             case .text(let line):
                 guard let writer = recorder else {
-                    lastWriteFailureNote = "transcript is not initialized"
-                    result = .failed
-                    break
+                    return (pendingWrites.count, "transcript is not initialized")
                 }
                 do {
                     try writer.appendText(line)
                     result = .done
                 } catch {
-                    // Captured for retryPendingWrites'/finish()'s aggregate warning;
-                    // appendText itself stays silent.
-                    lastWriteFailureNote = "\(writer.textURL.path): \(error.localizedDescription)"
-                    result = .failed
+                    result = .failed("\(writer.textURL.path): \(error.localizedDescription)")
                 }
             }
             switch result {
@@ -1731,10 +1725,11 @@ final class Session {
                 pendingWrites.removeFirst()
             case .needsText(let line):
                 pendingWrites[0] = .text(line)
-            case .failed:
-                return
+            case .failed(let why):
+                return (pendingWrites.count, why)
             }
         }
+        return (0, nil)
     }
 
     /// Retry queued output on a bounded exponential backoff (capped at 30s).
@@ -1744,12 +1739,12 @@ final class Session {
         guard !finished else { return }
         guard !pendingWrites.isEmpty else { return }
         guard now >= nextRetry else { return }
-        drainPendingWrites(until: nil)
-        if !pendingWrites.isEmpty {
+        let drained = drainPendingWrites(until: nil)
+        if drained.remaining > 0 {
             retryDelay = min(retryDelay * 2, 30)
             nextRetry = now.addingTimeInterval(retryDelay)
-            var message = "\(pendingWrites.count) item(s) awaiting writable storage; retrying every \(Int(retryDelay))s"
-            if let note = lastWriteFailureNote { message += "\n  last failure: \(note)" }
+            var message = "\(drained.remaining) item(s) awaiting writable storage; retrying every \(Int(retryDelay))s"
+            if let note = drained.note { message += "\n  last failure: \(note)" }
             status(message)
         } else {
             retryDelay = 1
@@ -1964,9 +1959,11 @@ final class Session {
         // endSession captures that date before multi-second AX round-trips,
         // and an already-expired deadline would mean zero retries.
         let deadline = Date().addingTimeInterval(5)
+        var drainNote: String?
         repeat {
             for id in captionOrder { finalizeCaption(id, at: date) }
-            drainPendingWrites(until: deadline)
+            let drained = drainPendingWrites(until: deadline)
+            drainNote = drained.note
             if !captionOrder.isEmpty || !pendingWrites.isEmpty {
                 usleep(250_000)
             }
@@ -1979,10 +1976,10 @@ final class Session {
         let lost = captionOrder.count + pendingWrites.count
         if lost > 0 {
             var message = "\(lost) item(s) of \"\(title)\" could not be written and are lost"
-            if let note = lastWriteFailureNote {
+            if let note = drainNote {
                 message += "\n  last failure: \(note)"
             } else {
-                message += "\n  (retry deadline expired before a write succeeded)"
+                message += "\n  retry deadline expired before all remaining writes completed; earlier jsonl errors are logged above"
             }
             message += "\n  check free space and permissions for \(options.directory)"
             status(message)
