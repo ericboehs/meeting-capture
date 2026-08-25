@@ -27,15 +27,23 @@ cert_name="meeting-capture-signing"
 #
 # Tri-state: 0 = cert exists, 1 = lookup succeeded and it doesn't, 2 = the
 # keychain could not be consulted at all (never treated as "absent").
-signing_cert_exists() {
+# Prints every valid code-signing identity; returns nonzero when the keychain
+# cannot be consulted at all (never treated as "no identities").
+list_signing_identities() {
   local out rc=0
   out=$(security find-identity -v -p codesigning 2>&1) || rc=$?
   if [[ $rc -ne 0 ]]; then
     echo "error: cannot list code-signing identities (locked keychain?):" >&2
     echo "$out" >&2
-    return 2
+    return "$rc"
   fi
-  grep -q "$cert_name" <<<"$out"
+  printf '%s' "$out"
+}
+signing_cert_exists() {
+  local identities rc=0
+  identities=$(list_signing_identities) || rc=$?
+  [[ $rc -ne 0 ]] && return 2
+  grep -q "$cert_name" <<<"$identities"
 }
 find_sign_id() {
   if [[ -n ${MEETING_CAPTURE_SIGN_ID:-} ]]; then
@@ -46,9 +54,7 @@ find_sign_id() {
   # A keychain that cannot be read is not the same as "no certificate".
   # Falling back to ad-hoc here would rebuild an already cert-signed binary
   # unsigned and silently drop the Accessibility grant — worse than stopping.
-  if ! identities=$(security find-identity -v -p codesigning 2>&1); then
-    echo "error: cannot list code-signing identities (locked keychain?):" >&2
-    echo "$identities" >&2
+  if ! identities=$(list_signing_identities); then
     echo "fix keychain access or set MEETING_CAPTURE_SIGN_ID, then retry" >&2
     exit 1
   fi

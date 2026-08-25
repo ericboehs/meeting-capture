@@ -3,9 +3,9 @@
 #
 # Compiles the daemon as a plain module — everything from "// MARK: - Main" down
 # is entry point and gets stripped, leaving only declarations — and runs
-# tests/Tests.swift against it. The accessibility API, processes, and real time
-# are not exercised here; these cover the pure logic: clock parsing,
-# timestamps, slugs, wrapping, and caption-segment identity.
+# tests/Tests.swift against it. Covers pure logic plus the filesystem helpers
+# (state-file reads/removals, transcript tailing) using temp files. The
+# accessibility API, processes, and real time are not exercised here.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

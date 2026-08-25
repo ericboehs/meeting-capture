@@ -155,26 +155,40 @@ expectTrue(isAbsent(statePath), "removeStateFile removes the file")
 
 let tailPath = dir + "/transcript.txt"
 try "first\n".write(toFile: tailPath, atomically: true, encoding: .utf8)
-let nullSink = FileHandle(forWritingAtPath: "/dev/null")!
-var eraseCalled = false
 var warnedCount = 0
-var off = drainFileTail(tailPath, from: 0, into: nullSink,
-    beforeWrite: { eraseCalled = true },
+
+// A real sink lets us verify ORDERING, not just that beforeWrite ran: the
+// erase marker must precede the tailed bytes in the same stream.
+let sinkPath = dir + "/sink.txt"
+FileManager.default.createFile(atPath: sinkPath, contents: nil)
+let orderedSink = FileHandle(forWritingAtPath: sinkPath)!
+try drainFileTail(tailPath, from: 0, into: orderedSink,
+    beforeWrite: {
+        try? orderedSink.write(contentsOf: Data("[erase]".utf8))
+    },
+    warn: { _ in warnedCount += 1 })
+try orderedSink.close()
+let sunk = (try String(contentsOfFile: sinkPath, encoding: .utf8))
+expectTrue(sunk.hasPrefix("[erase]first\n"), "live-region erase lands BEFORE the printed bytes")
+
+// Remaining drains use /dev/null.
+let nullSink = FileHandle(forWritingAtPath: "/dev/null")!
+var off = try drainFileTail(tailPath, from: 0, into: nullSink,
+    beforeWrite: {},
     warn: { _ in warnedCount += 1 })
 expectEqual(off, UInt64("first\n".utf8.count), "drain consumes new bytes and advances offset")
-expectTrue(eraseCalled, "drain erases the live region before printing")
 
 let appendHandle = FileHandle(forWritingAtPath: tailPath)!
 try appendHandle.seekToEnd()
 try appendHandle.write(contentsOf: Data("second\n".utf8))
 try appendHandle.close()
-off = drainFileTail(tailPath, from: off, into: nullSink,
+off = try drainFileTail(tailPath, from: off, into: nullSink,
     beforeWrite: {}, warn: { _ in warnedCount += 1 })
 expectEqual(off, UInt64("first\nsecond\n".utf8.count), "drain resumes from its previous offset")
 expectEqual(warnedCount, 0, "healthy drains never warn")
 
 // A missing file is absence, not a failure — no warning, offset untouched.
-off = drainFileTail(dir + "/missing", from: off, into: nullSink,
+off = try drainFileTail(dir + "/missing", from: off, into: nullSink,
     beforeWrite: {}, warn: { _ in warnedCount += 1 })
 expectEqual(warnedCount, 0, "missing files are absent, not failures")
 

@@ -234,7 +234,8 @@ final class LiveView {
     /// wrap here and report the real number of rows instead. Stay a column
     /// short of the width: filling the last one makes some terminals wrap by
     /// themselves. (Counting is by String.count, which approximates display
-    /// columns; wide glyphs can still overflow a row on exotic terminals.)
+    /// columns; CJK text and emoji wrap at display width everywhere, so a
+    /// row's String.count can understate the columns it really occupies.)
     static func wrap(_ text: String, width: Int) -> [String] {
         let limit = max(8, width - 1)
         guard text.count > limit else { return [text] }
@@ -456,7 +457,7 @@ final class Recorder {
     /// Append to both files and report what persisted. A failed jsonl write
     /// holds the transcript line back, so the pair never disagrees about what
     /// happened; a text write that fails after jsonl succeeded cannot be
-    /// undone, so the caller is told the jsonl half alone has the event.
+    /// undone, so the caller gets .jsonOnly(line) to retry text-only.
     func record(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any] = [:]) -> WriteOutcome {
         let stamped = elapsed(date)
         var payload: [String: Any] = [
@@ -474,9 +475,21 @@ final class Recorder {
             try text.write(contentsOf: Data((line + "\n").utf8))
         } catch {
             status("cannot write to \(textURL.path): \(error.localizedDescription); the transcript is missing this line")
-            return .jsonOnly
+            return .jsonOnly(line)
         }
         return .written(line)
+    }
+
+    /// Append an already-rendered transcript line (text half only), used when
+    /// replaying .jsonOnly outcomes.
+    func appendText(_ line: String) -> Bool {
+        do {
+            try text.write(contentsOf: Data((line + "\n").utf8))
+            return true
+        } catch {
+            status("cannot write to \(textURL.path): \(error.localizedDescription); the transcript is missing this line")
+            return false
+        }
     }
 }
 
@@ -486,8 +499,8 @@ final class Recorder {
 enum WriteOutcome {
     /// Both files have it; carries the transcript line for display.
     case written(String)
-    /// The jsonl file has it; the text transcript does not.
-    case jsonOnly
+    /// The jsonl file has it; carries the transcript line for a text-only retry.
+    case jsonOnly(String)
     /// Neither file has it.
     case failed
 }
@@ -593,10 +606,10 @@ protocol MeetingApp {
 
     /// The element whose children are caption entries, if captions are showing.
     func captionsContainer(_ app: AXUIElement) -> AXUIElement?
-    /// How long the call has been running, if the app displays it. Lets lines be
-    /// numbered from that reference (the moment this participant connected)
-    /// rather than from when we attached, which matters when the daemon is
-    /// restarted mid-meeting.
+    /// How long this participant has been connected, if the app displays it.
+    /// Lets lines be numbered from that reference rather than from when we
+    /// attached, which matters when the daemon is restarted mid-meeting. (Not
+    /// necessarily how long the MEETING has run — apps report connection time.)
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval?
     func captionEntries(in container: AXUIElement) -> [CaptionEntry]
     /// Whether the captions UI is up, regardless of whether it has any text in
@@ -624,16 +637,18 @@ protocol MeetingApp {
     /// utterance gets twice this long — it may simply be paused mid-speech.
     var idleFinalizeSeconds: TimeInterval? { get }
 
-    /// True when the app shows how long the call has been running, so lines
-    /// can be numbered from a shared reference. An app without one can only
-    /// count from when we joined, which says nothing useful about a meeting
-    /// already in progress - those transcripts get the time of day.
+    /// True when the app displays how long this participant has been
+    /// connected, so lines can be numbered from that reference. An app without
+    /// one can only count from when we joined, which says nothing useful about
+    /// a meeting already in progress - those transcripts get the time of day.
     var reportsMeetingClock: Bool { get }
 
-    /// Whether one specific caption id names an immutable utterance — one
-    /// that can only ever be that sentence, spoken once. Stable ids bypass
-    /// the content-based deduplication, which exists precisely because some
-    /// apps re-render finished lines under fresh ids. Default: none are.
+    /// Whether one specific caption id names one logical utterance: stable
+    /// across revisions while it is being spoken, never reused for a different
+    /// sentence. (Not "immutable text" — Meet revises its newest segment in
+    /// place under the same id.) Stable ids bypass the content-based
+    /// deduplication, which exists precisely because some apps re-render
+    /// finished lines under fresh ids. Default: none are.
     func hasStableIdentity(_ id: String) -> Bool
 
     /// True when the caption surface is only present while someone is
@@ -647,10 +662,10 @@ protocol MeetingApp {
     /// way: AXEnhancedUserInterface triggers window-resize bugs in AppKit.
     var rendersWebContent: Bool { get }
 
-    /// Whether the tree can be searched at all right now. Web views ship a
-    /// hollow shell that wakes into DOM ids; native apps are readable as soon
-    /// as they answer with children. Kept app-specific because "readable"
-    /// means something different per renderer.
+    /// Whether the tree is readable enough to DETECT A MEETING. Deliberately
+    /// weaker than "captions can be read": Teams counts via window title while
+    /// its WebView is still hollow. Apps whose captions need more than
+    /// detection uses should keep waking until both hold.
     func treeIsReadable(_ app: AXUIElement) -> Bool
 }
 
@@ -792,23 +807,32 @@ struct TreeWaker {
     /// captions need the full tree. Native apps are never poked.
     mutating func ensureReadable(_ attachment: Attachment, now: Date) -> Bool {
         let app = attachment.element
-        let readable = attachment.meetingApp.treeIsReadable(app)
-        if readable {
-            // Drop rate-limit/attempt state so a reused pid starts fresh.
+        // Rate-limit state is cleared only when the WebView is genuinely awake:
+        // clearing it for merely title-readable apps (Teams) would reset the
+        // deadline every scan and turn the rate limit into a poke storm.
+        if webTreeAwake(app) {
             nextAttempt.removeValue(forKey: attachment.pid)
             attempts.removeValue(forKey: attachment.pid)
+            return attachment.meetingApp.treeIsReadable(app)
         }
-        if attachment.meetingApp.rendersWebContent, !webTreeAwake(app) {
-            guard now >= (nextAttempt[attachment.pid] ?? .distantPast) else { return readable }
-            nextAttempt[attachment.pid] = now.addingTimeInterval(5)
-            let attempt = (attempts[attachment.pid] ?? 0) + 1
-            attempts[attachment.pid] = attempt
-            pokeWebTree(app)
-            if !quiet, attempt <= 3 {
-                status("asked \(attachment.meetingApp.displayName) to expose its accessibility tree (attempt \(attempt))")
-            }
+        guard attachment.meetingApp.rendersWebContent else {
+            return attachment.meetingApp.treeIsReadable(app)
         }
-        return readable
+        // WebView still hollow: poke on the cooldown, and keep counting even
+        // past the chatty first attempts so silence never becomes permanent.
+        guard now >= (nextAttempt[attachment.pid] ?? .distantPast) else {
+            return attachment.meetingApp.treeIsReadable(app)
+        }
+        nextAttempt[attachment.pid] = now.addingTimeInterval(5)
+        let attempt = (attempts[attachment.pid] ?? 0) + 1
+        attempts[attachment.pid] = attempt
+        pokeWebTree(app)
+        if !quiet, attempt <= 3 {
+            status("asked \(attachment.meetingApp.displayName) to expose its accessibility tree (attempt \(attempt))")
+        } else if attempt == 4 || attempt % 12 == 0, !quiet {
+            status("\(attachment.meetingApp.displayName)'s accessibility tree has stayed hollow for \(attempt * 5)s; captions cannot be read. Check Accessibility permission for meeting-capture-daemon, or restart \(attachment.meetingApp.displayName)")
+        }
+        return attachment.meetingApp.treeIsReadable(app)
     }
 }
 
@@ -1182,13 +1206,12 @@ struct ZoomApp: MeetingApp {
     }
 
     /// Zoom keeps a clock in the title bar, described as "My connected time is
-    /// 34:50" (or "1:34:50"). It measures how long THIS PARTICIPANT has been
-    /// connected — not when the call was convened — but it is the only anchor
-    /// that survives us being started late.
+    /// 34:50" (or "1:34:50"). See meetingElapsed for what it does and doesn't
+    /// measure; this flag tells the recorder lines may count from it.
     let reportsMeetingClock = true
 
-    /// 34:50" (or "1:34:50"). It's how long this participant has been
-    /// connected — not necessarily how long the meeting has run.
+    /// Returns seconds of participant-connection time shown in Zoom's title
+    /// bar, or nil when the toolbar (and its clock) is hidden.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? {
         guard let clock = findElement(from: app, where: {
             axDescription($0).hasPrefix("My connected time is")
@@ -1432,6 +1455,21 @@ final class Session {
     /// and running twice would double-flush and double-report.
     private var finished = false
     private var lastPublishWarning = Date.distantPast
+    private var lastInitWarning = Date.distantPast
+    /// Transcript lines whose jsonl event persisted but whose text half could
+    /// not be written; retried text-only so the pair eventually agrees.
+    private var unsavedTextLines: [String] = []
+    /// Events that failed to persist at all, retried with backoff.
+    private struct PendingEvent {
+        let kind: String
+        let speaker: String
+        let body: String
+        let at: Date
+        let extra: [String: Any]
+    }
+    private var pendingEvents: [PendingEvent] = []
+    private var nextEventRetry = Date.distantPast
+    private var eventRetryDelay: TimeInterval = 1
     private var nextCaptionCheck = Date.distantPast
     private var sawCaptions = false
     /// Recently written utterances, to catch an app re-rendering a finished one.
@@ -1462,7 +1500,11 @@ final class Session {
     var files: (jsonl: URL, text: URL)? { recorder.map { ($0.jsonlURL, $0.textURL) } }
 
     /// Files are created on first write, so a silent meeting leaves no litter.
-    private func recorderForWriting() -> Recorder {
+    /// Returns nil until initialization succeeds (metadata event written), in
+    /// which case callers must skip the event entirely: a recorder without its
+    /// metadata/header would produce events invisible to --follow and poison
+    /// dedup state with lines that never landed.
+    private func recorderForWriting() -> Recorder? {
         if let recorder { return recorder }
         // Whatever the timeline looks like now is what the file gets: the header
         // documents it, and changing it later would rewrite history (see resolveTimeline).
@@ -1488,12 +1530,15 @@ final class Session {
         if timelineResolved {
             metadata["meeting_started_at"] = Recorder.isoFormatter.string(from: timelineStart)
         }
-        // Announce (and publish the pointer for --follow) only if the metadata
-        // actually persisted — otherwise we would claim a recording that no
-        // file backs up. writeJSON has already logged the failure.
+        // The metadata event must persist before anything else is recorded;
+        // writeJSON has already logged the failure. Throttled because this
+        // fires once per skipped event while writes are broken.
         guard created.writeJSON(metadata) else {
-            status("no transcript will be recorded for \"\(title)\" until writes succeed")
-            return created
+            if Date().timeIntervalSince(lastInitWarning) > 30 {
+                lastInitWarning = Date()
+                status("cannot start recording \"\(title)\"; captions will be retried")
+            }
+            return nil
         }
 
         var header = ["\(title) (\(meetingApp.displayName))",
@@ -1537,12 +1582,13 @@ final class Session {
         pokeWebTree(app)
         if !options.quiet, wakeAttempts <= 3 {
             status("asked \(meetingApp.displayName) to expose its accessibility tree (attempt \(wakeAttempts))")
+        } else if !options.quiet, wakeAttempts == 4 || wakeAttempts % 12 == 0 {
+            status("\(meetingApp.displayName)'s accessibility tree has stayed hollow for \(wakeAttempts * 5)s; captions cannot be read. Check Accessibility permission for meeting-capture-daemon, or restart \(meetingApp.displayName)")
         }
     }
 
-    /// Ask the app how long the call has been running, so lines are numbered
-    /// from its clock rather than from when we joined, even mid-meeting. The
-    /// clock is
+    /// Ask the app how long its participant has been connected, so lines are
+    /// numbered from that clock rather than from when we joined. The clock is
     /// part of the window chrome, which Zoom hides along with its toolbar, so
     /// keep asking until it answers — but only until the first line is written.
     /// Past that the header already declares what the stamps mean, and moving
@@ -1571,13 +1617,17 @@ final class Session {
         let stamp = max(date, lastStamp ?? date)
         var extra = extra
         if stamp != date { extra["started_at"] = Recorder.isoFormatter.string(from: date) }
-        switch recorderForWriting().record(kind: kind, speaker: speaker, body: body, at: stamp, extra: extra) {
+        guard let writer = recorderForWriting() else { return false }
+        switch writer.record(kind: kind, speaker: speaker, body: body, at: stamp, extra: extra) {
         case .written(let line):
             lastStamp = stamp
             live.permanent(line)
             return true
-        case .jsonOnly:
+        case .jsonOnly(let line):
+            // The jsonl half persisted; queue the text half for a text-only
+            // retry instead of abandoning it (or duplicating the jsonl event).
             lastStamp = stamp
+            unsavedTextLines.append(line)
             return true
         case .failed:
             return false
@@ -1607,6 +1657,37 @@ final class Session {
         if options.autoCaptions { ensureCaptionsOn(app: app, pid: pid, now: now) }
         if options.captureCaptions { pollCaptions(now: now) }
         if options.captureChat { pollChat(now: now) }
+        retryPendingWrites(now: now)
+    }
+
+    /// Retry events whose writes failed earlier. Text-only retries append to
+    /// the transcript; whole-event retries replay through emit with bounded
+    /// exponential backoff so a persistently broken disk doesn't get hammered
+    /// every 250ms.
+    private func retryPendingWrites(now: Date) {
+        guard let writer = recorder, !finished else { return }
+        if !unsavedTextLines.isEmpty {
+            unsavedTextLines.removeAll { line in
+                if writer.appendText(line) { return true } // saved
+                if Date().timeIntervalSince(lastPublishWarning) > 30 {
+                    lastPublishWarning = Date()
+                    status("\(unsavedTextLines.count) transcript line(s) await a working write")
+                }
+                return false // keep for the next tick
+            }
+        }
+        guard !pendingEvents.isEmpty, now >= nextEventRetry else { return }
+        pendingEvents.removeAll { event in
+            emit(kind: event.kind, speaker: event.speaker, body: event.body,
+                 at: event.at, extra: event.extra)
+        }
+        if !pendingEvents.isEmpty {
+            eventRetryDelay = min(eventRetryDelay * 2, 8)
+            nextEventRetry = now.addingTimeInterval(eventRetryDelay)
+            status("\(pendingEvents.count) event(s) could not be written; retrying every \(Int(eventRetryDelay))s")
+        } else {
+            eventRetryDelay = 1
+        }
     }
 
     /// Turn captions on if the panel isn't up. Gives up quickly: toggling a
@@ -1751,6 +1832,10 @@ final class Session {
             }
             guard !seenChatIDs.contains(message.id) else { continue }
             let sent = Double(message.id).map { Date(timeIntervalSince1970: $0 / 1000) } ?? now
+            // Identity commits immediately: the AX list is virtualized and the
+            // message can vanish at any moment, so delivery must not depend on
+            // it. Failed writes are queued in memory instead.
+            seenChatIDs.insert(message.id)
             let persisted = emit(
                 kind: "chat",
                 speaker: message.author,
@@ -1758,9 +1843,12 @@ final class Session {
                 at: sent > startedAt ? sent : now,
                 extra: ["message_id": message.id]
             )
-            // Mark seen only once the event persisted somewhere; on failure it
-            // stays unseen so the next poll retries instead of losing it.
-            if persisted { seenChatIDs.insert(message.id) }
+            if !persisted {
+                pendingEvents.append(PendingEvent(
+                    kind: "chat", speaker: message.author, body: message.text,
+                    at: sent > startedAt ? sent : now,
+                    extra: ["message_id": message.id]))
+            }
         }
         if !messages.isEmpty { chatBaselineDone = true }
     }
@@ -1797,7 +1885,8 @@ final class Session {
             extra: ["node_id": id, "ended_at": Recorder.isoFormatter.string(from: date)]
         )
         // A total write failure must not consume the utterance: put it back so
-        // a later poll retries once writes work again.
+        // a later poll retries — and if no poll comes (we're inside finish()),
+        // finish() itself retries on a bounded deadline before reporting.
         guard persisted else {
             activeCaptions[id] = utterance
             captionOrder.append(id)
@@ -1814,22 +1903,47 @@ final class Session {
         guard !finished else { return }
         finished = true
         live.erase()
-        for id in captionOrder { finalizeCaption(id, at: date) }
+        // Finalize every pending utterance. finalizeCaption restores entries
+        // whose writes fail — normally so a later poll retries, but no poll
+        // follows a finish — so retry here on a short bounded deadline before
+        // giving up on them.
+        let deadline = date.addingTimeInterval(5)
+        repeat {
+            for id in captionOrder { finalizeCaption(id, at: date) }
+            if !pendingEvents.isEmpty {
+                pendingEvents.removeAll { event in
+                    emit(kind: event.kind, speaker: event.speaker, body: event.body,
+                         at: event.at, extra: event.extra)
+                }
+            }
+            if let writer = recorder {
+                unsavedTextLines.removeAll { writer.appendText($0) }
+            }
+            if !captionOrder.isEmpty || !pendingEvents.isEmpty || !unsavedTextLines.isEmpty {
+                usleep(250_000)
+            }
+        } while (!captionOrder.isEmpty || !pendingEvents.isEmpty || !unsavedTextLines.isEmpty) && Date() < deadline
         removeStateFile(options.stateDirectory + "/live")
         removeStateFile(options.stateDirectory + "/current")
         guard let writer = recorder else { return }
         // A duration is time spent recording — not whatever the transcript
         // stamps happen to count from (Slack/Meet stamps are the time of day).
         let duration = elapsedString(from: startedAt, to: date)
+        let lost = captionOrder.count + pendingEvents.count + unsavedTextLines.count
         // Only claim "finished" if the stopped event landed; writeJSON has
         // already logged the failure otherwise.
         if writer.writeJSON([
             "type": "metadata",
             "event": "stopped",
             "stopped_at": Recorder.isoFormatter.string(from: date),
-            "duration": duration
+            "duration": duration,
+            "lost_events": lost
         ]), !options.quiet {
-            status("finished \"\(title)\" after \(duration)")
+            if lost > 0 {
+                status("finished \"\(title)\" after \(duration), but \(lost) item(s) could not be written")
+            } else {
+                status("finished \"\(title)\" after \(duration)")
+            }
         }
     }
 }
@@ -1868,11 +1982,16 @@ enum FileRead {
     case failed(Error)
 }
 
-/// Only these two codes mean "the file is not there"; everything else is a
-/// real failure that callers must surface.
+/// Only genuine "the file is not there" counts as absent; everything else is
+/// a real failure that callers must surface.
 func isMissingFileError(_ error: NSError) -> Bool {
-    error.domain == NSCocoaErrorDomain
-        && [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code)
+    if error.domain == NSCocoaErrorDomain,
+       [NSFileNoSuchFileError, NSFileReadNoSuchFileError, NSFileReadUnknownError].contains(error.code) {
+        return true
+    }
+    // Some APIs wrap a generic read error around a POSIX ENOENT.
+    let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError ?? error
+    return underlying.domain == NSPOSIXErrorDomain && underlying.code == ENOENT
 }
 
 func readFile(_ path: String) -> FileRead {
@@ -1897,16 +2016,17 @@ func removeStateFile(_ path: String) {
 /// throwing FileHandle APIs so real I/O failures reach `warn`. `beforeWrite`
 /// runs after bytes are in hand but before they are printed, so callers can
 /// erase their live region first — permanent lines must not land under an
-/// unterminated caption. The offset advances only once the bytes printed.
+/// unterminated caption. Source failures leave the offset untouched (bytes
+/// will be re-read next poll); SINK failures throw, because retrying a broken
+/// output would either spin forever or duplicate the already-printed bytes.
 func drainFileTail(_ path: String, from offset: UInt64, into sink: FileHandle,
-                   beforeWrite: () -> Void, warn: (String) -> Void) -> UInt64 {
+                   beforeWrite: () -> Void, warn: (String) -> Void) throws -> UInt64 {
     do {
         _ = try FileManager.default.attributesOfItem(atPath: path)
+    } catch let error as NSError where !isMissingFileError(error) {
+        warn("cannot stat \(path): \(error.localizedDescription)")
+        return offset
     } catch {
-        guard let nsError = error as NSError?, isMissingFileError(nsError) else {
-            warn("cannot stat \(path): \(error.localizedDescription)")
-            return offset
-        }
         return offset // absent: normal while idle
     }
     guard let handle = FileHandle(forReadingAtPath: path) else {
@@ -1914,21 +2034,22 @@ func drainFileTail(_ path: String, from offset: UInt64, into sink: FileHandle,
         return offset
     }
     defer { try? handle.close() } // closing is inconsequential; reading is not
+    // Source reads: failures are retryable, so warn and leave the offset put.
+    let data: Data
     do {
         try handle.seek(toOffset: offset)
-        guard let data = try handle.readToEnd(), !data.isEmpty else { return offset }
-        beforeWrite()
-        do {
-            try sink.write(contentsOf: data)
-        } catch {
-            warn("cannot write to output: \(error.localizedDescription)")
-            return offset // unprinted bytes must be re-read next poll
-        }
-        return offset + UInt64(data.count)
+        guard let read = try handle.readToEnd(), !read.isEmpty else { return offset }
+        data = read
     } catch {
         warn("cannot tail \(path): \(error.localizedDescription)")
         return offset
     }
+    beforeWrite()
+    // The sink write happens outside the catch above on purpose: a broken
+    // output would either spin forever or duplicate the printed bytes, so its
+    // error propagates to the caller instead of being retried here.
+    try sink.write(contentsOf: data)
+    return offset + UInt64(data.count)
 }
 
 /// Tail the meeting the daemon is recording. Prefers the `current` pointer
@@ -1993,19 +2114,33 @@ func followTranscripts(_ options: Options) {
             case .failed(let error):
                 warnThrottled("cannot read active-transcript pointer \(pointer): \(error.localizedDescription)")
             }
-            logOffset = drainFileTail(logURL.path, from: logOffset, into: stdout,
-                beforeWrite: { eraseLive(); lastLive = "" },
-                warn: warnThrottled)
+            do {
+                logOffset = try drainFileTail(logURL.path, from: logOffset, into: stdout,
+                    beforeWrite: { eraseLive(); lastLive = "" },
+                    warn: warnThrottled)
+            } catch {
+                // The output stream itself broke (pipe closed, disk full);
+                // retrying would spin forever or duplicate printed bytes.
+                eraseLive()
+                status("output failed; --follow cannot continue: \(error.localizedDescription)")
+                exit(1)
+            }
         }
         if let current {
             if FileManager.default.fileExists(atPath: current.path) {
-                offset = drainFileTail(current.path, from: offset, into: stdout,
-                    beforeWrite: {
-                        eraseLive()
-                        // redraw the live region under the new permanent lines
-                        lastLive = ""
-                    },
-                    warn: warnThrottled)
+                do {
+                    offset = try drainFileTail(current.path, from: offset, into: stdout,
+                        beforeWrite: {
+                            eraseLive()
+                            // redraw the live region under the new permanent lines
+                            lastLive = ""
+                        },
+                        warn: warnThrottled)
+                } catch {
+                    eraseLive()
+                    status("output failed; --follow cannot continue: \(error.localizedDescription)")
+                    exit(1)
+                }
             } else {
                 warnThrottled("transcript \(current.path) has vanished")
             }
