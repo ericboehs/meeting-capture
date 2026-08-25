@@ -1,0 +1,14 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, type-check entry point, run test suite
+        run: ./tests/run.sh
