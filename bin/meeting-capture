@@ -481,21 +481,17 @@ final class Recorder {
     }
 
     /// Append an already-rendered transcript line (text half only), used when
-    /// replaying .jsonOnly outcomes. Silent by design — the retry loop owns
-    /// the (throttled) logging so persistent failures don't log per line.
-    func appendText(_ line: String) -> Bool {
-        do {
-            try text.write(contentsOf: Data((line + "\n").utf8))
-            return true
-        } catch {
-            return false
-        }
+    /// replaying .jsonOnly outcomes. Throws so callers can surface cause and
+    /// path in their own (throttled, aggregate) warnings.
+    func appendText(_ line: String) throws {
+        try text.write(contentsOf: Data((line + "\n").utf8))
     }
 }
 
-/// What persisted when an event was recorded. Callers commit dedup state only
-/// for the first two: retrying a .failed event must not collide with
-/// bookkeeping that claims it was already written.
+/// What persisted when an event was recorded. With the ordered backlog in
+/// place, callers commit dedup state for ALL outcomes — a .failed event is
+/// queued, not dropped — but the outcome still decides whether the transcript
+/// line is drawn now or owed as text debt.
 enum WriteOutcome {
     /// Both files have it; carries the transcript line for display.
     case written(String)
@@ -1480,6 +1476,8 @@ final class Session {
     private var pendingWrites: [PendingWrite] = []
     private var nextRetry = Date.distantPast
     private var retryDelay: TimeInterval = 1
+    /// Cause of the most recent failed write attempt, for callers' warnings.
+    private var lastWriteFailureNote: String?
     private var nextCaptionCheck = Date.distantPast
     private var sawCaptions = false
     /// Recently written utterances, to catch an app re-rendering a finished one.
@@ -1700,9 +1698,10 @@ final class Session {
     /// Drain the backlog, strictly oldest-first, stopping at the first item
     /// whose write fails so nothing overtakes it. A .event that lands as
     /// jsonOnly is REPLACED in place by its text debt rather than dropped, so
-    /// later items can never pass it. Returns the number still pending.
-    @discardableResult
-    private func drainPendingWrites(until deadline: Date?) -> Int {
+    /// later items can never pass it. On failure, lastWriteFailureNote carries
+    /// the cause for callers' (single, throttled) warning.
+    private func drainPendingWrites(until deadline: Date?) {
+        lastWriteFailureNote = nil
         while !pendingWrites.isEmpty {
             if let deadline, Date() >= deadline { break }
             let result: AttemptResult
@@ -1711,9 +1710,19 @@ final class Session {
                 result = attemptEventWrite(kind: kind, speaker: speaker,
                                            body: body, at: at, extra: extra)
             case .text(let line):
-                // appendText is silent; this loop owns the aggregate warning.
-                guard let writer = recorder else { return pendingWrites.count }
-                result = writer.appendText(line) ? .done : .failed
+                guard let writer = recorder else {
+                    lastWriteFailureNote = "transcript is not initialized"
+                    result = .failed
+                    break
+                }
+                do {
+                    try writer.appendText(line)
+                    result = .done
+                } catch {
+                    // Surface cause + path once per drain; appendText stays silent.
+                    lastWriteFailureNote = "\(writer.textURL.path): \(error.localizedDescription)"
+                    result = .failed
+                }
             }
             switch result {
             case .done:
@@ -1721,11 +1730,9 @@ final class Session {
             case .needsText(let line):
                 pendingWrites[0] = .text(line)
             case .failed:
-                break
+                return
             }
-            if case .failed = result { return pendingWrites.count }
         }
-        return pendingWrites.count
     }
 
     /// Retry queued output on a bounded exponential backoff (capped at 30s).
@@ -1735,11 +1742,13 @@ final class Session {
         guard !finished else { return }
         guard !pendingWrites.isEmpty else { return }
         guard now >= nextRetry else { return }
-        let remaining = drainPendingWrites(until: nil)
-        if remaining > 0 {
+        drainPendingWrites(until: nil)
+        if !pendingWrites.isEmpty {
             retryDelay = min(retryDelay * 2, 30)
             nextRetry = now.addingTimeInterval(retryDelay)
-            status("\(remaining) item(s) awaiting writable storage; retrying every \(Int(retryDelay))s")
+            var message = "\(pendingWrites.count) item(s) awaiting writable storage; retrying every \(Int(retryDelay))s"
+            if let note = lastWriteFailureNote { message += "\n  last failure: \(note)" }
+            status(message)
         } else {
             retryDelay = 1
         }
@@ -1946,17 +1955,16 @@ final class Session {
         guard !finished else { return }
         finished = true
         live.erase()
-        // Finalize every pending utterance. finalizeCaption restores entries
-        // whose writes fail — normally so a later poll retries, but no poll
-        // follows a finish — so retry here on a short bounded deadline before
-        // giving up on them.
+        // Finalize every pending utterance. finalizeCaption hands failures to
+        // the ordered backlog, and no poll follows a finish — so drain that
+        // backlog here on a short bounded deadline before declaring loss.
         // The deadline is wall-clock NOW, not the caller's meeting timestamp:
         // endSession captures that date before multi-second AX round-trips,
         // and an already-expired deadline would mean zero retries.
         let deadline = Date().addingTimeInterval(5)
         repeat {
             for id in captionOrder { finalizeCaption(id, at: date) }
-            drainPendingWrites(until: Date())
+            drainPendingWrites(until: deadline)
             if !captionOrder.isEmpty || !pendingWrites.isEmpty {
                 usleep(250_000)
             }
