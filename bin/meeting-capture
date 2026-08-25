@@ -2356,7 +2356,9 @@ if options.once {
 
 var lastMeetingCheck = Date.distantPast
 var lastUnreadableWarning = Date.distantPast
-var lastWaitingWarning = Date.distantPast
+/// Apps last reported as "running, waiting for a meeting" — idle logs only
+/// fire when this set changes, so an app sitting open all day stays silent.
+var lastWaitingApps: [String] = []
 var lastProcessWarning = Date.distantPast
 
 while !stopRequested {
@@ -2396,11 +2398,15 @@ while !stopRequested {
                     status("cannot read the accessibility tree of \(unreadable.joined(separator: ", "))")
                 }
             }
-            if session == nil, !waiting.isEmpty, now.timeIntervalSince(lastWaitingWarning) > 30 {
-                lastWaitingWarning = now
+            if session == nil, !waiting.isEmpty, waiting != lastWaitingApps {
+                // Transition log (app opened/quit/reopened), not a heartbeat:
+                // a Slack idling all day would otherwise spam every 30s.
+                lastWaitingApps = waiting
                 if !options.quiet {
                     status("\(waiting.joined(separator: ", ")) is running, waiting for a meeting")
                 }
+            } else if session != nil || waiting.isEmpty {
+                lastWaitingApps = []
             }
         } else if let current = attachment {
             func endSession(_ reason: String) {
