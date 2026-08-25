@@ -461,6 +461,64 @@ do {
     }
 }
 
+// --- TreeWaker rate-limiter (issue #17a) --------------------------------
+
+// pokeDecision is pure: synthetic dates drive cooldown and attempt behavior,
+// no AX element involved.
+do {
+    var waker = TreeWaker(quiet: true)
+    let t0 = epoch
+    let d1 = waker.pokeDecision(pid: 100, awake: false, now: t0)
+    expectTrue(d1.poke && d1.attempt == 1, "hollow tree pokes immediately, attempt 1")
+
+    let d2 = waker.pokeDecision(pid: 100, awake: false, now: t0.addingTimeInterval(4))
+    expectTrue(!d2.poke && d2.attempt == 1, "within the 5s cooldown: passthrough count, no second poke")
+
+    let d3 = waker.pokeDecision(pid: 100, awake: false, now: t0.addingTimeInterval(5))
+    expectTrue(d3.poke && d3.attempt == 2, "cooldown elapsed: pokes again, attempt increments")
+
+    // Genuine wake clears state — the next hollow period starts over at 1.
+    let clear = waker.pokeDecision(pid: 100, awake: true, now: t0.addingTimeInterval(6))
+    expectEqual(clear.poke, false, "awake never pokes")
+    let afterWake = waker.pokeDecision(pid: 100, awake: false, now: t0.addingTimeInterval(7))
+    expectTrue(afterWake.poke && afterWake.attempt == 1, "wake reset re-arms the limiter to attempt 1")
+
+    // Pids are independent.
+    let other = waker.pokeDecision(pid: 200, awake: false, now: t0)
+    expectTrue(other.poke && other.attempt == 1, "a different pid has its own cooldown and count")
+}
+
+// Native apps short-circuit before any AX work: ensureReadable answers from
+// the app's own readability, never poking (AXEnhancedUserInterface would
+// trigger AppKit resize bugs).
+do {
+    struct NonWebStub: MeetingApp {
+        let id = "stub-native"
+        var displayName = "Stub"
+        let processPattern = "stub"
+        func meetingAnchor(_ app: AXUIElement) -> AXUIElement? { nil }
+        func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String { "" }
+        func captionsContainer(_ app: AXUIElement) -> AXUIElement? { nil }
+        func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
+        func captionEntries(in container: AXUIElement) -> [CaptionEntry] { [] }
+        func captionsPanelOpen(_ app: AXUIElement) -> Bool { false }
+        func requestCaptions(pid: pid_t) -> CaptionRequest { .unreachable }
+        func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
+        func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
+        func resetCaptureState() {}
+        func hasStableIdentity(_ id: String) -> Bool { false }
+        func treeIsReadable(_ app: AXUIElement) -> Bool { true }
+    }
+    var waker = TreeWaker(quiet: true)
+    let attachment = Attachment(meetingApp: NonWebStub(), pid: 42,
+                                element: AXUIElementCreateSystemWide())
+    expectTrue(waker.ensureReadable(attachment, now: epoch),
+               "native readable app reads as readable without any wake attempt")
+    // No poke state should have been created for the native pid.
+    let d = waker.pokeDecision(pid: 42, awake: false, now: epoch)
+    expectTrue(d.poke && d.attempt == 1, "native path left no rate-limit state behind")
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")

@@ -24,4 +24,9 @@ swiftc -o "$out/tests" "$out/library.swift" "$out/main.swift"
 cp bin/meeting-capture "$out/entry.swift"
 swiftc -o "$out/entry-check" "$out/entry.swift"
 
+# Installer logic: signing tri-state contract with a stubbed security binary.
+# Runs AFTER the unit binary so a failure here can't mask Swift results.
 "$out/tests"
+
+chmod +x tests/installer.sh 2>/dev/null || true
+tests/installer.sh

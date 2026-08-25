@@ -869,29 +869,37 @@ struct TreeWaker {
         guard attachment.meetingApp.rendersWebContent else {
             return attachment.meetingApp.treeIsReadable(app)
         }
-        // Rate-limit state is cleared only when the WebView is genuinely awake:
-        // clearing it for merely title-readable apps (Teams) would reset the
-        // deadline every scan and turn the rate limit into a poke storm.
-        if webTreeAwake(app) {
-            nextAttempt.removeValue(forKey: attachment.pid)
-            attempts.removeValue(forKey: attachment.pid)
-            return attachment.meetingApp.treeIsReadable(app)
-        }
-        // WebView still hollow: poke on the cooldown, and keep counting even
-        // past the chatty first attempts so silence never becomes permanent.
-        guard now >= (nextAttempt[attachment.pid] ?? .distantPast) else {
-            return attachment.meetingApp.treeIsReadable(app)
-        }
-        nextAttempt[attachment.pid] = now.addingTimeInterval(5)
-        let attempt = (attempts[attachment.pid] ?? 0) + 1
-        attempts[attachment.pid] = attempt
-        pokeWebTree(app)
-        if !quiet, attempt <= 3 {
-            status("asked \(attachment.meetingApp.displayName) to expose its accessibility tree (attempt \(attempt))")
-        } else if attempt == 4 || attempt % 12 == 0, !quiet {
-            status("\(attachment.meetingApp.displayName)'s accessibility tree has stayed hollow for \(attempt * 5)s; captions cannot be read. Check Accessibility permission for meeting-capture-daemon, or restart \(attachment.meetingApp.displayName)")
+        let awake = webTreeAwake(app)
+        let (poke, attempt) = pokeDecision(pid: attachment.pid, awake: awake, now: now)
+        if poke {
+            pokeWebTree(app)
+            if !quiet, attempt <= 3 {
+                status("asked \(attachment.meetingApp.displayName) to expose its accessibility tree (attempt \(attempt))")
+            } else if attempt == 4 || attempt % 12 == 0, !quiet {
+                status("\(attachment.meetingApp.displayName)'s accessibility tree has stayed hollow for \(attempt * 5)s; captions cannot be read. Check Accessibility permission for meeting-capture-daemon, or restart \(attachment.meetingApp.displayName)")
+            }
         }
         return attachment.meetingApp.treeIsReadable(app)
+    }
+
+    /// Pure rate-limiter behind ensureReadable: should this pid be poked right
+    /// now, and at what attempt count? Separate so tests can drive cooldown
+    /// and attempt behavior with synthetic dates — no AX element involved.
+    /// Clearing state only on genuine wake (not mere title-readability) keeps
+    /// Teams' deadline from resetting every scan into a poke storm.
+    mutating func pokeDecision(pid: pid_t, awake: Bool, now: Date) -> (poke: Bool, attempt: Int) {
+        if awake {
+            nextAttempt.removeValue(forKey: pid)
+            attempts.removeValue(forKey: pid)
+            return (false, 0)
+        }
+        guard now >= (nextAttempt[pid] ?? .distantPast) else {
+            return (false, attempts[pid] ?? 0)
+        }
+        nextAttempt[pid] = now.addingTimeInterval(5)
+        let attempt = (attempts[pid] ?? 0) + 1
+        attempts[pid] = attempt
+        return (true, attempt)
     }
 }
 
