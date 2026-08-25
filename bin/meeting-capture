@@ -792,8 +792,8 @@ func queryProcess(matching pattern: String) -> ProcessQuery {
     // handles have been accessed — without these closes every pgrep call
     // leaks a pair, and ~2,500 leaked fds broke all lookups live on 2026-08-25.
     defer {
-        try? pipe.fileHandleForReading.closeFile()
-        try? pipe.fileHandleForWriting.closeFile()
+        try? pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
     }
     do {
         try process.run()
