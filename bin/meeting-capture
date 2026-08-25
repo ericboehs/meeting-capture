@@ -847,14 +847,56 @@ struct Attachment {
     let element: AXUIElement
 }
 
+/// Unified per-pid wake bookkeeping: poke cooldowns, attempt counts, and
+/// which pids' trees have filled in. One type serves both the detection loop
+/// (TreeWaker) and an attached session's wake path.
+struct WakeLedger {
+    var attempts: [pid_t: Int] = [:]
+    var nextAttempt: [pid_t: Date] = [:]
+    private(set) var populated: Set<pid_t> = []
+
+    /// Pure rate-limiter decision: should this pid be poked right now, and at
+    /// what attempt count? Separate so tests can drive cooldown and attempt
+    /// behavior with synthetic dates — no AX element involved. Clearing state
+    /// only on genuine wake (not mere title-readability) keeps Teams'
+    /// deadline from resetting every scan into a poke storm.
+    mutating func pokeDecision(pid: pid_t, awake: Bool, now: Date) -> (poke: Bool, attempt: Int) {
+        if awake {
+            nextAttempt.removeValue(forKey: pid)
+            attempts.removeValue(forKey: pid)
+            return (false, 0)
+        }
+        guard now >= (nextAttempt[pid] ?? .distantPast) else {
+            return (false, attempts[pid] ?? 0)
+        }
+        nextAttempt[pid] = now.addingTimeInterval(5)
+        let attempt = (attempts[pid] ?? 0) + 1
+        attempts[pid] = attempt
+        return (true, attempt)
+    }
+
+    mutating func markPopulated(pid: pid_t) { populated.insert(pid) }
+    func isPopulated(pid: pid_t) -> Bool { populated.contains(pid) }
+
+    /// Drop bookkeeping for pids no longer running, so restarts start fresh
+    /// instead of inheriting a stale cooldown/count. Callers MUST include any
+    /// attached session's pid in `alive` unconditionally: pgrep can miss it
+    /// transiently, and pruning its entry mid-hollow-period would reset the
+    /// attempt-count math the "hollow for Ns" warnings depend on.
+    mutating func prune(alive: Set<pid_t>) {
+        attempts = attempts.filter { alive.contains($0.key) }
+        nextAttempt = nextAttempt.filter { alive.contains($0.key) }
+        populated = populated.intersection(alive)
+    }
+}
+
 /// Wakes the accessibility trees of web-view apps and tracks readability.
 /// Detection runs through here because the wake has to precede the anchor
 /// search: a freshly launched Teams, Slack, or Meet exposes a hollow tree, and
 /// the controls that say a call is happening only appear once it fills in.
 struct TreeWaker {
     let quiet: Bool
-    private var nextAttempt: [pid_t: Date] = [:]
-    private var attempts: [pid_t: Int] = [:]
+    var ledger = WakeLedger()
 
     init(quiet: Bool) { self.quiet = quiet }
 
@@ -885,22 +927,11 @@ struct TreeWaker {
     /// Pure rate-limiter behind ensureReadable: should this pid be poked right
     /// now, and at what attempt count? Separate so tests can drive cooldown
     /// and attempt behavior with synthetic dates — no AX element involved.
-    /// Clearing state only on genuine wake (not mere title-readability) keeps
-    /// Teams' deadline from resetting every scan into a poke storm.
     mutating func pokeDecision(pid: pid_t, awake: Bool, now: Date) -> (poke: Bool, attempt: Int) {
-        if awake {
-            nextAttempt.removeValue(forKey: pid)
-            attempts.removeValue(forKey: pid)
-            return (false, 0)
-        }
-        guard now >= (nextAttempt[pid] ?? .distantPast) else {
-            return (false, attempts[pid] ?? 0)
-        }
-        nextAttempt[pid] = now.addingTimeInterval(5)
-        let attempt = (attempts[pid] ?? 0) + 1
-        attempts[pid] = attempt
-        return (true, attempt)
+        ledger.pokeDecision(pid: pid, awake: awake, now: now)
     }
+
+    mutating func prune(alive: Set<pid_t>) { ledger.prune(alive: alive) }
 }
 
 // MARK: - Microsoft Teams
@@ -1556,9 +1587,7 @@ final class Session {
     private var written: [(speaker: String, text: String, at: Date)] = []
     /// Ids already written but still on screen.
     private var finalized = Set<String>()
-    private var wakeAttempts = 0
-    private var nextWake = Date.distantPast
-    private var treePopulated = false
+    var ledger = WakeLedger()
     /// What `[HH:MM:SS]` counts from: the app's clock (connection time) once
     /// it tells us, otherwise the moment we attached.
     private var timelineStart: Date
@@ -1649,23 +1678,27 @@ final class Session {
     }
 
     /// Both attributes are set by pokeWebTree; see it for how the wake works.
-    private func wakeTreeIfNeeded(app: AXUIElement, now: Date) {
-        guard meetingApp.rendersWebContent else { treePopulated = true; return }
+    private func wakeTreeIfNeeded(app: AXUIElement, pid: pid_t, now: Date) {
+        // Native short-circuit: mark populated even though no WebView exists —
+        // caption gating below reads the ledger, not rendersWebContent.
+        guard meetingApp.rendersWebContent else { ledger.markPopulated(pid: pid); return }
         if webTreeAwake(app) { // DOM ids specifically: Teams reads as "readable" from titles alone
-            if !treePopulated, wakeAttempts > 0, !options.quiet {
+            // Transition announcement only fires if we poked at least once
+            // before — detection-side wakes never announce, and this must not
+            // become a behavior change inside a refactor.
+            if !ledger.isPopulated(pid: pid), ledger.attempts[pid, default: 0] > 0, !options.quiet {
                 status("\(meetingApp.displayName) exposed its accessibility tree")
             }
-            treePopulated = true
+            ledger.markPopulated(pid: pid)
             return
         }
-        guard now >= nextWake else { return }
-        nextWake = now.addingTimeInterval(5)
-        wakeAttempts += 1
+        let (poke, attempt) = ledger.pokeDecision(pid: pid, awake: false, now: now)
+        guard poke else { return }
         pokeWebTree(app)
-        if !options.quiet, wakeAttempts <= 3 {
-            status("asked \(meetingApp.displayName) to expose its accessibility tree (attempt \(wakeAttempts))")
-        } else if !options.quiet, wakeAttempts == 4 || wakeAttempts % 12 == 0 {
-            status("\(meetingApp.displayName)'s accessibility tree has stayed hollow for \(wakeAttempts * 5)s; captions cannot be read. Check Accessibility permission for meeting-capture-daemon, or restart \(meetingApp.displayName)")
+        if !options.quiet, attempt <= 3 {
+            status("asked \(meetingApp.displayName) to expose its accessibility tree (attempt \(attempt))")
+        } else if !options.quiet, attempt == 4 || attempt % 12 == 0 {
+            status("\(meetingApp.displayName)'s accessibility tree has stayed hollow for \(attempt * 5)s; captions cannot be read. Check Accessibility permission for meeting-capture-daemon, or restart \(meetingApp.displayName)")
         }
     }
 
@@ -1752,7 +1785,7 @@ final class Session {
         // Drain the backlog before fresh polls emit anything new, so recovered
         // output always precedes newer lines.
         retryPendingWrites(now: now)
-        wakeTreeIfNeeded(app: app, now: now)
+        wakeTreeIfNeeded(app: app, pid: pid, now: now)
         resolveTimeline(app: app, now: now)
         let needsCaptions = options.captureCaptions && captionsContainer == nil
         let needsChat = options.captureChat && chatContainer == nil
@@ -1845,7 +1878,7 @@ final class Session {
         // really off and it is safe to toggle back on.
         if sawCaptions {
             guard !meetingApp.captionsSurfaceIsTransient else { return }
-            guard treePopulated else { return }
+            guard ledger.isPopulated(pid: pid) else { return }
             sawCaptions = false
             captionAttempts = 0
         }
@@ -1868,7 +1901,7 @@ final class Session {
             if !options.quiet {
                 status("asked \(meetingApp.displayName) to show live captions (attempt \(captionAttempts))")
             }
-            if meetingApp.captionPressToggles && !treePopulated {
+            if meetingApp.captionPressToggles && !ledger.isPopulated(pid: pid) {
                 sawCaptions = true
             } else {
                 nextCaptionCheck = now.addingTimeInterval(20)
@@ -2450,9 +2483,17 @@ while !stopRequested {
         if session == nil {
             // Look for a call in any supported app, re-resolving pids as apps
             // are quit and reopened.
+            let candidates = runningApps()
+            // Drop wake bookkeeping for pids that no longer exist so app
+            // restarts start fresh. LOAD-BEARING: the attached session's pid
+            // rides along unconditionally — pgrep can miss it transiently, and
+            // pruning its entry mid-hollow-period would reset the attempt
+            // counts the "hollow for Ns" warnings count on.
+            let alive = Set(candidates.map(\.pid)).union(attachment.map { [$0.pid] } ?? [])
+            waker.prune(alive: alive)
             var unreadable: [String] = []
             var waiting: [String] = []
-            for candidate in runningApps() {
+            for candidate in candidates {
                 guard waker.ensureReadable(candidate, now: now) else {
                     unreadable.append(candidate.meetingApp.displayName)
                     continue
