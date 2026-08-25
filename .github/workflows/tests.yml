@@ -1,5 +1,7 @@
 name: tests
 
+permissions: {} # default-deny; this job only checks out code and runs local scripts
+
 on:
   push:
     branches: [main]
@@ -9,6 +11,8 @@ jobs:
   test:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Build, type-check entry point, run test suite
         run: ./tests/run.sh
