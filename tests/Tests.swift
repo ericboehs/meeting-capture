@@ -47,12 +47,16 @@ expectEqual(elapsedString(from: Date(timeIntervalSince1970: 100), to: epoch), "0
 
 expectEqual(TimestampMode.elapsed(from: epoch).stamp(Date(timeIntervalSince1970: 61)), "00:01:01", "elapsed mode counts from its start")
 
-// Pin the timezone so the expected value is exact rather than length-shaped.
-let originalZone = Recorder.clockFormatter.timeZone
-Recorder.clockFormatter.timeZone = TimeZone(identifier: "UTC")!
-let utcNoon = Date(timeIntervalSince1970: 12 * 3600 + 34 * 60 + 56)
-expectEqual(TimestampMode.timeOfDay.stamp(utcNoon), "12:34:56", "time-of-day mode stamps HH:mm:ss exactly (UTC)")
-Recorder.clockFormatter.timeZone = originalZone
+// The recorder's wall-clock formatter is private by design; verify its output
+// against independently computed wall-clock components instead.
+do {
+    let date = Date(timeIntervalSince1970: 12 * 3600 + 34 * 60 + 56)
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = .current
+    let c = cal.dateComponents([.hour, .minute, .second], from: date)
+    let want = String(format: "%02d:%02d:%02d", c.hour!, c.minute!, c.second!)
+    expectEqual(TimestampMode.timeOfDay.stamp(date), want, "time-of-day mode stamps HH:mm:ss in the local zone")
+}
 
 // --- Recorder.slugify ---------------------------------------------------
 
@@ -126,7 +130,53 @@ expectTrue(broken.count > 1, "overlong words are broken across rows")
 expectEqual(broken.joined(), "extraordinarily", "broken words keep every character")
 let prose = "several ordinary words that will need wrapping across several rows"
 expectEqual(LiveView.wrap(prose, width: 12).joined(separator: " "), prose, "wrap preserves every word at word width")
-expectEqual(LiveView.layout(["one", "two"]).count, 2, "layout passes short output through")
+expectEqual(LiveView.layout(["one", "two"]), ["one", "two"], "layout renders rows unchanged when they fit")
+
+// --- State-file helpers -------------------------------------------------
+
+let dir = NSTemporaryDirectory() + "/meeting-capture-tests\(UUID().uuidString)"
+try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+let statePath = dir + "/state"
+
+func isAbsent(_ path: String) -> Bool {
+    if case .absent = readFile(path) { return true }
+    return false
+}
+expectTrue(isAbsent(statePath), "readFile reports absent for a missing file")
+try "hello".write(toFile: statePath, atomically: true, encoding: .utf8)
+switch readFile(statePath) {
+case .data("hello"): expectTrue(true, "readFile returns contents")
+default: expectTrue(false, "readFile returns contents")
+}
+removeStateFile(statePath)
+expectTrue(isAbsent(statePath), "removeStateFile removes the file")
+
+// --- drainFileTail ------------------------------------------------------
+
+let tailPath = dir + "/transcript.txt"
+try "first\n".write(toFile: tailPath, atomically: true, encoding: .utf8)
+let nullSink = FileHandle(forWritingAtPath: "/dev/null")!
+var eraseCalled = false
+var warnedCount = 0
+var off = drainFileTail(tailPath, from: 0, into: nullSink,
+    beforeWrite: { eraseCalled = true },
+    warn: { _ in warnedCount += 1 })
+expectEqual(off, UInt64("first\n".utf8.count), "drain consumes new bytes and advances offset")
+expectTrue(eraseCalled, "drain erases the live region before printing")
+
+let appendHandle = FileHandle(forWritingAtPath: tailPath)!
+try appendHandle.seekToEnd()
+try appendHandle.write(contentsOf: Data("second\n".utf8))
+try appendHandle.close()
+off = drainFileTail(tailPath, from: off, into: nullSink,
+    beforeWrite: {}, warn: { _ in warnedCount += 1 })
+expectEqual(off, UInt64("first\nsecond\n".utf8.count), "drain resumes from its previous offset")
+expectEqual(warnedCount, 0, "healthy drains never warn")
+
+// A missing file is absence, not a failure — no warning, offset untouched.
+off = drainFileTail(dir + "/missing", from: off, into: nullSink,
+    beforeWrite: {}, warn: { _ in warnedCount += 1 })
+expectEqual(warnedCount, 0, "missing files are absent, not failures")
 
 // --- Summary ------------------------------------------------------------
 

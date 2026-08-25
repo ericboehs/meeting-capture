@@ -162,6 +162,9 @@ still readable years later on its own:
 Join an hour into a call and the first line reads `[01:02:11]`; the header is
 what turns that back into a time of day. Where the app publishes no clock the
 lines are stamped with the time of day already, and the header says so.
+(One naming caveat: the header line "meeting started" and the jsonl field
+`meeting_started_at` are historical names — they record when this *participant*
+connected per the app's own clock, not when the meeting was convened.)
 
 ```json
 {"type":"metadata","app":"Microsoft Teams","meeting":"Weekly Sync","source":"teams-ax","recorded_at":"2026-08-24T14:05:10-05:00","meeting_started_at":"2026-08-24T13:28:15-05:00","timestamps":"elapsed"}

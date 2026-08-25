@@ -18,4 +18,10 @@ trap 'rm -rf "$out"' EXIT
 } > "$out/library.swift"
 cp tests/Tests.swift "$out/main.swift"
 swiftc -o "$out/tests" "$out/library.swift" "$out/main.swift"
+
+# The stripped build never sees post-MARK code, so type-check the full entry
+# point separately — otherwise nothing would catch breakage below the marker.
+cp bin/meeting-capture "$out/entry.swift"
+swiftc -o "$out/entry-check" "$out/entry.swift"
+
 "$out/tests"

@@ -24,8 +24,18 @@ cert_name="meeting-capture-signing"
 # signing re-hashes on every build, so each rebuild drops the permission. A
 # stable identity keeps the grant: `signing-cert` below makes a self-signed one,
 # and MEETING_CAPTURE_SIGN_ID overrides it (e.g. with a Developer ID).
+#
+# Tri-state: 0 = cert exists, 1 = lookup succeeded and it doesn't, 2 = the
+# keychain could not be consulted at all (never treated as "absent").
 signing_cert_exists() {
-  security find-identity -v -p codesigning 2>/dev/null | grep -q "$cert_name"
+  local out rc=0
+  out=$(security find-identity -v -p codesigning 2>&1) || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "error: cannot list code-signing identities (locked keychain?):" >&2
+    echo "$out" >&2
+    return 2
+  fi
+  grep -q "$cert_name" <<<"$out"
 }
 find_sign_id() {
   if [[ -n ${MEETING_CAPTURE_SIGN_ID:-} ]]; then
@@ -48,10 +58,8 @@ find_sign_id() {
     printf '%s' '-' # ad-hoc; only reached when lookup genuinely succeeded
   fi
 }
-sign_id=$(find_sign_id)
 
 settings_pane="x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-
 case "${1:-install}" in
   uninstall)
     launchctl bootout "gui/$UID/$label" 2>/dev/null || true
@@ -69,10 +77,18 @@ case "${1:-install}" in
     exit 0
     ;;
   signing-cert)
-  if signing_cert_exists; then
-    echo "$cert_name already exists"
-    exit 0
-  fi
+    # Deliberately tri-state: a broken keychain must not look like "no cert"
+    # and trigger creating a duplicate identity.
+    local_exists=0
+    signing_cert_exists || local_exists=$?
+    case $local_exists in
+      0)
+        echo "$cert_name already exists"
+        exit 0
+        ;;
+      1) ;; # genuinely absent; create it below
+      *) exit 1 ;; # lookup failed; diagnostics already printed
+    esac
     # A self-signed code signing certificate, trusted for code signing only.
     # The point is a signature that stays the same across rebuilds, so the
     # Accessibility grant survives; it proves nothing to anyone else.
@@ -118,6 +134,11 @@ case "${1:-install}" in
     exit 1
     ;;
 esac
+
+# Only the install path needs a signing identity — resolving it here (not at
+# the top of the script) keeps uninstall/reauthorize working with a broken or
+# locked keychain.
+sign_id=$(find_sign_id)
 
 mkdir -p "${binary%/*}" "$state_dir"
 
