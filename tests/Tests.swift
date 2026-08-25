@@ -204,12 +204,19 @@ func cocoaError(_ code: Int, underlyingPOSIX: Int32? = nil) -> NSError {
     }
     return NSError(domain: NSCocoaErrorDomain, code: code, userInfo: userInfo)
 }
-expectTrue(isMissingFileError(cocoaError(NSFileNoSuchFileError)), "code 4 is missing")
-expectTrue(isMissingFileError(cocoaError(NSFileReadNoSuchFileError)), "code 256 is missing")
+// Sanity: the Cocoa constants are easy to flip mentally — pin their values.
+expectEqual(NSFileNoSuchFileError, 4, "NSFileNoSuchFileError is 4")
+expectEqual(NSFileReadUnknownError, 256, "NSFileReadUnknownError is 256 (generic read failure)")
+expectEqual(NSFileReadNoSuchFileError, 260, "NSFileReadNoSuchFileError is 260 (definitive missing file)")
+
+expectTrue(isMissingFileError(cocoaError(NSFileNoSuchFileError)), "code 4 (no such file) is missing")
+expectTrue(isMissingFileError(cocoaError(NSFileReadNoSuchFileError)), "code 260 (read no-such-file) is missing")
 expectTrue(isMissingFileError(cocoaError(NSFileReadUnknownError, underlyingPOSIX: ENOENT)),
-           "generic 260 wrapped around ENOENT is missing")
+           "generic 256 wrapped around ENOENT is missing")
+expectTrue(isMissingFileError(NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT), userInfo: nil)),
+           "raw POSIX ENOENT is missing")
 expectTrue(!isMissingFileError(cocoaError(NSFileReadUnknownError)),
-           "generic 260 WITHOUT ENOENT underneath is a real failure (EIO/ESTALE surface as 260)")
+           "generic 256 WITHOUT ENOENT underneath is a real failure (EIO/ESTALE surface as 256)")
 expectTrue(!isMissingFileError(cocoaError(NSFileReadNoPermissionError)), "EACCES is a failure, not idle")
 expectTrue(!isMissingFileError(NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: nil)),
            "raw POSIX EACCES is a failure, not idle")
