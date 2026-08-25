@@ -412,6 +412,7 @@ do {
     expectTrue(s.finished, "finish marks the session finished even on total failure")
     expectEqual(s.pendingWrites.count, 2, "persistent failure leaves all queued items lost")
     expectTrue(!slept.isEmpty, "drain loop paused between attempts")
+    expectTrue(slept.count >= 2, "multiple pauses: the loop actually retried, not spun once")
     expectTrue(clock.fakeNow > epoch.addingTimeInterval(5), "fake clock advanced past the finish deadline")
 }
 
@@ -456,7 +457,7 @@ do {
     expectEqual(s.retryDelay, TimeInterval(2), "retry before nextRetry is a no-op")
     for want in [4.0, 8.0, 16.0, 30.0, 30.0] {
         s.retryPendingWrites(now: s.nextRetry)
-        expectEqual(s.retryDelay, TimeInterval(want), "backoff progression hits cap at 30s (")
+        expectEqual(s.retryDelay, TimeInterval(want), "backoff progression: next step is \(want)s (capped at 30)")
     }
 }
 
