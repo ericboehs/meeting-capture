@@ -67,6 +67,14 @@ find_sign_id() {
 }
 
 settings_pane="x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+
+# Sourcing mode for the installer's test suite (tests/installer.sh): with this
+# set, `source` defines the functions above and stops before any side effects.
+# Tests stub `security` as a bash function to drive the tri-state contract.
+if [[ -n ${MC_INSTALL_LIB_ONLY:-} ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 case "${1:-install}" in
   uninstall)
     launchctl bootout "gui/$UID/$label" 2>/dev/null || true
