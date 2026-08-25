@@ -376,7 +376,8 @@ final class StubMeetingApp: MeetingApp {
     func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
     func resetCaptureState() {}
     func hasStableIdentity(_ id: String) -> Bool { false }
-    func treeIsReadable(_ app: AXUIElement) -> Bool { true }
+    var stubReadiness: TreeReadiness = .webContent
+    func treeReadiness(_ app: AXUIElement) -> TreeReadiness { stubReadiness }
 }
 
 func injectedSession(clock: FakeClock) -> Session {
@@ -507,7 +508,7 @@ do {
         func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
         func resetCaptureState() {}
         func hasStableIdentity(_ id: String) -> Bool { false }
-        func treeIsReadable(_ app: AXUIElement) -> Bool { true }
+        func treeReadiness(_ app: AXUIElement) -> TreeReadiness { .webContent }
     }
     var waker = TreeWaker(quiet: true)
     let attachment = Attachment(meetingApp: NonWebStub(), pid: 42,
