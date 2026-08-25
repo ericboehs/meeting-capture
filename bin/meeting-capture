@@ -357,21 +357,53 @@ enum TimestampMode {
     }
 }
 
+/// One writable transcript file. A protocol so tests can inject failing or
+/// scripted sinks: FileHandle raises unrecoverable ObjC exceptions for closed
+/// descriptors and never throws in-process, so write-failure paths are only
+/// testable behind this seam.
+protocol TranscriptSink {
+    var path: String { get }
+    func append(_ data: Data) throws
+}
+
+/// The real thing: a FileHandle opened for writing, positioned at EOF.
+struct FileSink: TranscriptSink {
+    let path: String
+    private let handle: FileHandle
+
+    init(path: String, handle: FileHandle) {
+        self.path = path
+        self.handle = handle
+    }
+
+    /// nil when the file can't be opened for writing (missing directory,
+    /// permissions). Callers decide whether that's fatal. Opens at EOF so
+    /// appends never clobber existing transcripts.
+    init?(url: URL) {
+        guard let handle = FileHandle(forWritingAtPath: url.path) else { return nil }
+        handle.seekToEndOfFile()
+        self.init(path: url.path, handle: handle)
+    }
+
+    func append(_ data: Data) throws {
+        try handle.write(contentsOf: data)
+    }
+}
+
 final class Recorder {
     let startedAt: Date
     /// What `[HH:MM:SS]` stamps count from (see TimestampMode).
     let mode: TimestampMode
     let jsonlURL: URL
     let textURL: URL
-    private let jsonl: FileHandle
-    private let text: FileHandle
+    private let jsonl: any TranscriptSink
+    private let text: any TranscriptSink
     private let stdout = FileHandle.standardOutput
     let options: Options
 
-    init(options: Options, app: String, meeting: String, startedAt: Date, mode: TimestampMode) {
-        self.options = options
-        self.startedAt = startedAt
-        self.mode = mode
+    /// Opens both transcript files under options.directory. Tests inject
+    /// sinks directly via the delegating initializer instead.
+    convenience init(options: Options, app: String, meeting: String, startedAt: Date, mode: TimestampMode) {
         let directory = URL(fileURLWithPath: options.directory, isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
@@ -380,20 +412,32 @@ final class Recorder {
         // The app is in the name because meeting titles don't say where they
         // happened, and the same people meet in different places.
         let base = "\(stamp.string(from: startedAt))-\(app)-\(Recorder.slugify(meeting))"
-        jsonlURL = directory.appendingPathComponent(base + ".jsonl")
-        textURL = directory.appendingPathComponent(base + ".txt")
+        let jsonlURL = directory.appendingPathComponent(base + ".jsonl")
+        let textURL = directory.appendingPathComponent(base + ".txt")
 
         for url in [jsonlURL, textURL] where !FileManager.default.fileExists(atPath: url.path) {
             FileManager.default.createFile(atPath: url.path, contents: nil)
         }
-        guard let jsonlHandle = FileHandle(forWritingAtPath: jsonlURL.path),
-              let textHandle = FileHandle(forWritingAtPath: textURL.path) else {
+        guard let jsonlSink = FileSink(url: jsonlURL),
+              let textSink = FileSink(url: textURL) else {
             fail("cannot write to \(directory.path)")
         }
-        jsonl = jsonlHandle
-        text = textHandle
-        jsonl.seekToEndOfFile()
-        text.seekToEndOfFile()
+        self.init(options: options, startedAt: startedAt, mode: mode,
+                  jsonlURL: jsonlURL, textURL: textURL,
+                  jsonl: jsonlSink, text: textSink)
+    }
+
+    /// The storage-free initializer: everything above this line is about
+    /// naming and opening files, which fault-injection tests must bypass.
+    init(options: Options, startedAt: Date, mode: TimestampMode,
+         jsonlURL: URL, textURL: URL, jsonl: any TranscriptSink, text: any TranscriptSink) {
+        self.options = options
+        self.startedAt = startedAt
+        self.mode = mode
+        self.jsonlURL = jsonlURL
+        self.textURL = textURL
+        self.jsonl = jsonl
+        self.text = text
     }
 
     static func slugify(_ value: String) -> String {
@@ -437,7 +481,7 @@ final class Recorder {
         }
         line += "\n"
         do {
-            try jsonl.write(contentsOf: Data(line.utf8))
+            try jsonl.append(Data(line.utf8))
         } catch {
             status("cannot write to \(jsonlURL.path): \(error.localizedDescription); neither file records this event")
             return false
@@ -448,10 +492,16 @@ final class Recorder {
 
     /// Head the transcript with what the bracketed times mean. Without it a
     /// file of relative stamps can't be placed in time at all, and one of
-    /// wall-clock stamps doesn't say which day.
+    /// wall-clock stamps doesn't say which day. Best-effort: a failure here
+    /// is logged and otherwise ignored — losing the header must never cost
+    /// transcript lines.
     func writeHeader(_ lines: [String]) {
         let block = lines.map { "# \($0)\n" }.joined() + "\n"
-        text.write(Data(block.utf8))
+        do {
+            try text.append(Data(block.utf8))
+        } catch {
+            status("cannot write header to \(textURL.path): \(error.localizedDescription); continuing without it")
+        }
     }
 
     /// Append to both files and report what persisted. A failed jsonl write
@@ -472,7 +522,7 @@ final class Recorder {
         let tag = kind == "chat" ? "(chat) " : ""
         let line = "[\(stamped)] \(tag)\(speaker): \(body)"
         do {
-            try text.write(contentsOf: Data((line + "\n").utf8))
+            try text.append(Data((line + "\n").utf8))
         } catch {
             status("cannot write to \(textURL.path): \(error.localizedDescription); the transcript is missing this line")
             return .jsonOnly(line)
@@ -484,7 +534,7 @@ final class Recorder {
     /// replaying .jsonOnly outcomes. Throws so callers can surface cause and
     /// path in their own (throttled, aggregate) warnings.
     func appendText(_ line: String) throws {
-        try text.write(contentsOf: Data((line + "\n").utf8))
+        try text.append(Data((line + "\n").utf8))
     }
 }
 
@@ -492,7 +542,7 @@ final class Recorder {
 /// place, callers commit dedup state for ALL outcomes — a .failed event is
 /// queued, not dropped — but the outcome still decides whether the transcript
 /// line is drawn now or owed as text debt.
-enum WriteOutcome {
+enum WriteOutcome: Equatable {
     /// Both files have it; carries the transcript line for display.
     case written(String)
     /// The jsonl file has it; carries the transcript line for a text-only retry.

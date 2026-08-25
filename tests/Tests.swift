@@ -221,6 +221,128 @@ expectTrue(!isMissingFileError(cocoaError(NSFileReadNoPermissionError)), "EACCES
 expectTrue(!isMissingFileError(NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES), userInfo: nil)),
            "raw POSIX EACCES is a failure, not idle")
 
+// --- Recorder fault injection (TranscriptSink seam) ---------------------
+
+// In-memory sink that records everything it's given.
+final class MemorySink: TranscriptSink {
+    let path: String
+    private(set) var data = Data()
+    init(path: String) { self.path = path }
+    func append(_ data: Data) throws { self.data.append(data) }
+    var string: String { String(data: data, encoding: .utf8) ?? "" }
+}
+
+// Fails every append with the error a closed descriptor would produce —
+// FileHandle itself raises ObjC exceptions in-process and can't be tested.
+struct ClosedSink: TranscriptSink {
+    let path: String
+    func append(_ data: Data) throws {
+        throw cocoaError(NSFileWriteUnknownError)
+    }
+}
+
+// Succeeds every time except the `failAt`-th append (transient-failure shape:
+// one lost write, recovery on the next attempt).
+final class FailOnceSink: TranscriptSink {
+    let path: String
+    let failAt: Int
+    private(set) var appends = 0
+    init(path: String, failAt: Int) { self.path = path; self.failAt = failAt }
+    func append(_ data: Data) throws {
+        defer { appends += 1 }
+        if appends + 1 == failAt { throw cocoaError(NSFileWriteUnknownError) }
+    }
+}
+
+func injectedRecorder(jsonl: TranscriptSink, text: TranscriptSink) -> Recorder {
+    var opts = Options()
+    opts.quiet = true
+    // .elapsed makes stamps deterministic ([00:00:00] from the epoch start).
+    // URLs are unique per call so a future real-sink test can't collide.
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+    return Recorder(options: opts, startedAt: epoch, mode: .elapsed(from: epoch),
+                    jsonlURL: dir.appendingPathComponent("mc-injected-\(UUID().uuidString).jsonl"),
+                    textURL: dir.appendingPathComponent("mc-injected-\(UUID().uuidString).txt"),
+                    jsonl: jsonl, text: text)
+}
+
+// All-paths-succeed: both files carry the line.
+do {
+    let jsonl = MemorySink(path: "/tmp/j.jsonl"), text = MemorySink(path: "/tmp/t.txt")
+    let r = injectedRecorder(jsonl: jsonl, text: text)
+    expectEqual(r.record(kind: "caption", speaker: "A", body: "hello", at: epoch),
+                WriteOutcome.written("[00:00:00] A: hello"),
+                "record returns .written when both sinks accept")
+    expectTrue(jsonl.string.contains("\"text\":\"hello\""), "jsonl sink got the event JSON")
+    expectTrue(text.string.contains("A: hello"), "text sink got the transcript line")
+}
+
+// jsonl fails: nothing anywhere, not even the text half.
+do {
+    let jsonl = ClosedSink(path: "/tmp/j.jsonl"), text = MemorySink(path: "/tmp/t.txt")
+    let r = injectedRecorder(jsonl: jsonl, text: text)
+    expectEqual(r.record(kind: "caption", speaker: "A", body: "hi", at: epoch),
+                WriteOutcome.failed, "record returns .failed when the jsonl sink rejects")
+    expectTrue(text.string.isEmpty, "text sink untouched when jsonl fails first")
+    expectTrue(!r.writeJSON(["type": "metadata"]), "writeJSON reports failure via closed sink")
+}
+
+// text fails after jsonl succeeded: .jsonOnly debt, exactly once in jsonl.
+do {
+    let jsonl = MemorySink(path: "/tmp/j.jsonl"), text = ClosedSink(path: "/tmp/t.txt")
+    let r = injectedRecorder(jsonl: jsonl, text: text)
+    expectEqual(r.record(kind: "caption", speaker: "B", body: "owed", at: epoch),
+                WriteOutcome.jsonOnly("[00:00:00] B: owed"),
+                "record returns .jsonOnly when only the text sink rejects")
+    expectEqual(jsonl.string.components(separatedBy: "\n").filter { $0.contains("\"owed\"") }.count,
+                1, "jsonl carries the event exactly once despite the text failure")
+    let threw = { () -> Bool in do { try r.appendText("[00:00:00] retry"); return false } catch { return true } }()
+    expectTrue(threw, "appendText surfaces failure via thrown error")
+}
+
+// Transient failure then recovery: a flaky jsonl accepts the retry.
+do {
+    let jsonl = FailOnceSink(path: "/tmp/j.jsonl", failAt: 2), text = MemorySink(path: "/tmp/t.txt")
+    let r = injectedRecorder(jsonl: jsonl, text: text)
+    expectEqual(r.record(kind: "caption", speaker: "C", body: "one", at: epoch),
+                WriteOutcome.written("[00:00:00] C: one"), "first write lands")
+    expectEqual(r.record(kind: "caption", speaker: "C", body: "two", at: epoch),
+                WriteOutcome.failed, "flaky sink rejects the second event")
+    expectEqual(r.writeJSON(["type": "retry"]), true, "third attempt succeeds after transient failure")
+}
+
+// Header loss is downgraded to a warning, never a crash.
+do {
+    let r = injectedRecorder(jsonl: MemorySink(path: "/tmp/j.jsonl"), text: ClosedSink(path: "/tmp/t.txt"))
+    r.writeHeader(["Meeting: test"]) // must complete without throwing/exiting
+    expectTrue(true, "writeHeader survives a failing text sink")
+}
+
+// FileSink open-failure semantics: nil for an unwritable path, no process exit.
+expectTrue(FileSink(url: URL(fileURLWithPath: "/nonexistent-dir-xyz/a.jsonl")) == nil,
+           "FileSink is nil for unopenable paths (callers decide fatality)")
+
+do {
+    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mc-test-\(UUID().uuidString).txt")
+    // FileHandle(forWritingAtPath:) does NOT create files — same reason the
+    // real Recorder pre-creates them before opening.
+    expectTrue(FileManager.default.createFile(atPath: url.path, contents: nil),
+               "test fixture creates the sink target")
+    guard let sink = FileSink(url: url) else {
+        expectTrue(false, "FileSink opens a real writable file")
+        exit(failures == 0 ? 0 : 1)
+    }
+    try? sink.append(Data("first\n".utf8))
+    guard let reopened = FileSink(url: url) else {
+        expectTrue(false, "FileSink reopens an existing file")
+        exit(failures == 0 ? 0 : 1)
+    }
+    try? reopened.append(Data("second\n".utf8))
+    let contents = try? String(contentsOf: url, encoding: .utf8)
+    expectEqual(contents, "first\nsecond\n", "reopened FileSink appends at EOF without clobbering")
+    try? FileManager.default.removeItem(at: url)
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")
