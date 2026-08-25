@@ -490,6 +490,14 @@ protocol MeetingApp {
     /// meeting already in progress - those transcripts get the time of day.
     var reportsMeetingClock: Bool { get }
 
+    /// True when an utterance keeps one id for its whole life, and grows in
+    /// place rather than reappearing under a new one. Some apps re-render a
+    /// line as it is revised, so a shorter version of text already on screen
+    /// is assumed to be the same sentence caught mid-edit. Where ids are
+    /// stable that assumption is wrong, and saying the same short thing twice
+    /// ("Yeah.") loses the second one.
+    var captionIDsAreStable: Bool { get }
+
     /// True when the caption surface is only present while someone is
     /// speaking. Its absence then says nothing about whether captions are
     /// switched on, so once it has been seen the app must not be asked again.
@@ -508,6 +516,8 @@ extension MeetingApp {
     var idleFinalizeSeconds: TimeInterval? { nil }
     // Most apps leave the caption panel up between utterances.
     var captionsSurfaceIsTransient: Bool { false }
+    // Assume the pessimistic case: an app that re-renders finished lines.
+    var captionIDsAreStable: Bool { false }
     // Most apps don't say how long the call has been going.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
     var reportsMeetingClock: Bool { false }
@@ -1006,7 +1016,147 @@ struct ZoomApp: MeetingApp {
     var idleFinalizeSeconds: TimeInterval? { 6 }
 }
 
-let supportedApps: [MeetingApp] = [TeamsApp(), ZoomApp(), SlackApp()]
+// MARK: - Google Meet
+
+/// Google Meet installed as a Safari web app (Add to Dock), which is what
+/// `Web App` runs when handed the bundle on its command line. A Meet tab in an
+/// ordinary browser window is NOT supported: the browser would be the process,
+/// its other tabs would sit in the same tree, and finding the call would mean
+/// searching all of them.
+///
+/// Alpha. All of this was worked out in a call with one participant, so the
+/// single-speaker path is exercised and the rest is reasoned from it.
+final class MeetApp: MeetingApp {
+    let id = "meet"
+    let displayName = "Google Meet"
+    // Matches the --bundlepath argument. The bundle identifier carries a UUID
+    // generated when the web app was installed, so it is useless here.
+    let processPattern = "Web App .*Google Meet.app"
+    // WebKit also serves an empty tree until something asks for it: before the
+    // poke this app is 17 nodes with no AXWebArea at all.
+    let rendersWebContent = true
+    // The button says which way it goes, so pressing is never a guess.
+    let captionPressToggles = false
+    // Meet displays no call duration, so lines get the time of day.
+    let reportsMeetingClock = false
+    // Segments stay put once a newer one lands, so finalize on being
+    // superseded rather than waiting for text to disappear.
+    var finalizesWhenSuperseded: Bool { true }
+    var idleFinalizeSeconds: TimeInterval? { 6 }
+    // A segment holds its position for life, so the same sentence twice is two
+    // utterances rather than one line re-rendered.
+    var captionIDsAreStable: Bool { true }
+
+    /// Meet labels everything by ARIA, and its class names are obfuscated
+    /// build output (`vNKgIf.UDinHf`) that changes without warning. Nothing
+    /// here keys off them.
+    private let leaveDescription = "Leave call"
+    private let captionsDescription = "Captions"
+    private let captionsOnLabel = "Turn off captions"
+    private let captionsOffLabel = "Turn on captions"
+
+    /// Every caption segment reported so far, in order, as "speaker\u{1}text".
+    /// Position in this list is the identity: Meet exposes no DOM ids, and the
+    /// text repeats often enough that hashing it would merge separate
+    /// utterances - a single "Yeah." said twice was in the first capture.
+    private var history: [String] = []
+
+    func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) { axDescription($0) == leaveDescription }
+    }
+
+    func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String {
+        let windows = axAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        var title = windows.map { axString($0, kAXTitleAttribute) }.first { !$0.isEmpty } ?? ""
+        // "Meet - abc-defg-hij" for an unnamed call; a scheduled one is named.
+        if title.hasPrefix("Meet - ") { title = String(title.dropFirst("Meet - ".count)) }
+        title = title.trimmingCharacters(in: .whitespaces)
+        return title.isEmpty ? "Google Meet" : title
+    }
+
+    func captionsContainer(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) {
+            axDescription($0) == captionsDescription && axString($0, kAXRoleAttribute) == "AXGroup"
+        }
+    }
+
+    func captionsPanelOpen(_ app: AXUIElement) -> Bool {
+        // The button label is the authority: the caption group keeps its last
+        // text long after anyone stopped speaking, so its presence says only
+        // that captions were on at some point.
+        captionsButton(app).map { axDescription($0) == captionsOnLabel } ?? false
+    }
+
+    func requestCaptions(pid: pid_t) -> CaptionRequest {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 5.0)
+        guard let button = captionsButton(app) else { return .unreachable }
+        guard axDescription(button) == captionsOffLabel else { return .alreadyOn }
+        return AXUIElementPerformAction(button, kAXPressAction as CFString) == .success
+            ? .pressed : .unreachable
+    }
+
+    private func captionsButton(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) {
+            let label = axDescription($0)
+            return label == captionsOnLabel || label == captionsOffLabel
+        }
+    }
+
+    /// Captions are one block per speaker - a name, then a group of text
+    /// segments - laid out as alternating children. Segments are appended as
+    /// sentences finish; only the last one is still being revised.
+    func captionEntries(in container: AXUIElement) -> [CaptionEntry] {
+        var visible: [(speaker: String, text: String)] = []
+        let blocks = axChildren(container)
+        var index = 0
+        while index + 1 < blocks.count {
+            let speaker = axStaticTexts(blocks[index]).first ?? ""
+            for text in axStaticTexts(blocks[index + 1]) where !text.isEmpty {
+                visible.append((speaker, text))
+            }
+            index += 2
+        }
+        guard !visible.isEmpty else { return [] }
+
+        // All but the last are settled. Fold them into the history, which is
+        // what absolute positions are counted against.
+        let settled = visible.dropLast().map { key($0.speaker, $0.text) }
+        absorb(settled)
+
+        // The newest segment has no position yet - it is still being spoken
+        // and its text will change - so it takes the next one.
+        let base = history.count - settled.count
+        return visible.enumerated().map { offset, entry in
+            CaptionEntry(id: "seg:\(base + offset)", speaker: entry.speaker, text: entry.text)
+        }
+    }
+
+    /// Extend the history with segments not already in it. Meet appends, so
+    /// normally the visible settled segments are its tail and there is at most
+    /// one new one. If Meet ever drops old segments off the front, the visible
+    /// list stops being a tail of the history: re-anchor on the longest
+    /// overlap instead, so positions keep counting up rather than restarting
+    /// and rewriting the whole conversation.
+    private func absorb(_ settled: [String]) {
+        guard !settled.isEmpty else { return }
+        if history.isEmpty { history = settled; return }
+        for overlap in stride(from: min(history.count, settled.count), through: 0, by: -1) {
+            guard Array(history.suffix(overlap)) == Array(settled.prefix(overlap)) else { continue }
+            history.append(contentsOf: settled.dropFirst(overlap))
+            return
+        }
+    }
+
+    private func key(_ speaker: String, _ text: String) -> String { "\(speaker)\u{1}\(text)" }
+
+    func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
+    // Meet's chat is a side panel that has to be open to exist; not wired up.
+    func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
+    func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
+}
+
+let supportedApps: [MeetingApp] = [TeamsApp(), ZoomApp(), SlackApp(), MeetApp()]
 
 
 // MARK: - Session
@@ -1327,13 +1477,15 @@ final class Session {
     /// one holding the same (or corrected) text. Without this, the utterance
     /// gets written twice: once when the old node goes, once when the new does.
     private func supersededByActive(_ utterance: Utterance, id: String) -> Bool {
-        activeCaptions.contains { key, other in
+        guard !meetingApp.captionIDsAreStable else { return false }
+        return activeCaptions.contains { key, other in
             key != id && other.speaker == utterance.speaker && other.text.hasPrefix(utterance.text)
         }
     }
 
     private func alreadyWritten(_ utterance: Utterance, now: Date) -> Bool {
-        written.contains {
+        guard !meetingApp.captionIDsAreStable else { return false }
+        return written.contains {
             $0.speaker == utterance.speaker && $0.text == utterance.text
                 && now.timeIntervalSince($0.at) < 30
         }
