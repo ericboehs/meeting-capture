@@ -472,7 +472,7 @@ do {
     expectTrue(d1.poke && d1.attempt == 1, "hollow tree pokes immediately, attempt 1")
 
     let d2 = waker.pokeDecision(pid: 100, awake: false, now: t0.addingTimeInterval(4))
-    expectEqual(d2.poke, false, "within the 5s cooldown no second poke fires")
+    expectTrue(!d2.poke && d2.attempt == 1, "within the 5s cooldown: passthrough count, no second poke")
 
     let d3 = waker.pokeDecision(pid: 100, awake: false, now: t0.addingTimeInterval(5))
     expectTrue(d3.poke && d3.attempt == 2, "cooldown elapsed: pokes again, attempt increments")
