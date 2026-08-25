@@ -59,6 +59,7 @@ func usage() -> String {
 
       --once               capture only the meeting happening now, then stop
       --follow             just watch the newest transcript, never record
+                           (--watch does the same)
       --app <name>         only watch one app (\(supportedApps.map(\.id).joined(separator: ", ")))
       --auto-captions      turn live captions on when a meeting starts
       --interval <ms>      poll interval while in a meeting (default 250)
@@ -92,7 +93,7 @@ func parseOptions() -> Options {
     while !args.isEmpty {
         let flag = args.removeFirst()
         switch flag {
-        case "--watch": break // leftover; same as no args. Use --follow to only watch.
+        case "--watch": options.follow = true // reads as the passive verb; treat it as one
         case "--once": options.once = true
         case "--follow": options.follow = true
         case "--auto-captions": options.autoCaptions = true
@@ -206,14 +207,71 @@ final class LiveView {
     private var lines: [String] = []
 
     init(options: Options) {
-        printsLines = !options.quiet && !options.jsonToStdout
-        updatesRegion = printsLines && isatty(STDOUT_FILENO) == 1
+        // Only a terminal gets the transcript on stdout. Under launchd stdout is
+        // the log, and every finished line was landing there as well as in the
+        // .txt \u2014 so --follow, which tails both, drew each line twice.
+        printsLines = !options.quiet && !options.jsonToStdout && isatty(STDOUT_FILENO) == 1
+        updatesRegion = printsLines
     }
 
     static func terminalWidth() -> Int {
         var size = winsize()
         if ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0, size.ws_col > 0 { return Int(size.ws_col) }
         return 100
+    }
+
+    static func terminalHeight() -> Int {
+        var size = winsize()
+        if ioctl(STDOUT_FILENO, UInt(TIOCGWINSZ), &size) == 0, size.ws_row > 0 { return Int(size.ws_row) }
+        return 24
+    }
+
+    /// Break a line into rows that fit the terminal.
+    ///
+    /// The live region is erased by moving up one row per line we drew, so the
+    /// count has to match what the terminal actually used. Letting a line
+    /// soft-wrap would make it occupy several rows, and the region would stack
+    /// up instead of being replaced. Truncating kept the count honest but hid
+    /// the end of every sentence, which is exactly the part being spoken, so
+    /// wrap here and report the real number of rows instead. Stay a column
+    /// short of the width: filling the last one makes some terminals wrap by
+    /// themselves.
+    static func wrap(_ text: String, width: Int) -> [String] {
+        let limit = max(8, width - 1)
+        guard text.count > limit else { return [text] }
+        var rows: [String] = []
+        var line = ""
+        for word in text.split(separator: " ") {
+            var word = String(word)
+            // A word too long to ever fit has to be broken somewhere.
+            while word.count > limit {
+                if !line.isEmpty { rows.append(line); line = "" }
+                rows.append(String(word.prefix(limit)))
+                word = String(word.dropFirst(limit))
+            }
+            if line.isEmpty {
+                line = word
+            } else if line.count + 1 + word.count <= limit {
+                line += " " + word
+            } else {
+                rows.append(line)
+                line = word
+            }
+        }
+        if !line.isEmpty { rows.append(line) }
+        return rows
+    }
+
+    /// Wrap every pending line, keeping the most recent rows if the result is
+    /// taller than the terminal: the newest words matter most, and erasing more
+    /// rows than the screen has would eat the transcript above.
+    static func layout(_ pending: [String]) -> [String] {
+        let width = terminalWidth()
+        let rows = pending
+            .flatMap { wrap($0.replacingOccurrences(of: "\n", with: " "), width: width) }
+            .filter { !$0.isEmpty }
+        let ceiling = max(1, terminalHeight() - 1)
+        return rows.count > ceiling ? Array(rows.suffix(ceiling)) : rows
     }
 
     /// Erase the region, leaving the cursor at the start of its first line.
@@ -233,12 +291,7 @@ final class LiveView {
 
     func set(_ pending: [String]) {
         guard updatesRegion else { return }
-        let width = LiveView.terminalWidth()
-        let rendered = pending.map { line -> String in
-            var body = line.replacingOccurrences(of: "\n", with: " ")
-            if body.count > width - 1 { body = String(body.prefix(max(1, width - 2))) + "…" }
-            return body
-        }
+        let rendered = LiveView.layout(pending)
         guard rendered != lines else { return } // avoid redrawing unchanged text
         erase()
         draw(rendered)
@@ -265,6 +318,10 @@ struct Recorder {
     /// that report how long the call has been running let us number lines from
     /// the start of the meeting instead of from when we joined it.
     var timelineStart: Date
+    /// False when the app has no call clock: `[HH:MM:SS]` is then the time of
+    /// day, which is true whenever we joined, rather than a count from zero
+    /// that would imply the meeting began when we started watching.
+    var countsFromMeetingStart = true
     let jsonlURL: URL
     let textURL: URL
     private let jsonl: FileHandle
@@ -272,7 +329,7 @@ struct Recorder {
     private let stdout = FileHandle.standardOutput
     let options: Options
 
-    init(options: Options, meeting: String, startedAt: Date) {
+    init(options: Options, app: String, meeting: String, startedAt: Date) {
         self.options = options
         self.startedAt = startedAt
         self.timelineStart = startedAt
@@ -281,7 +338,9 @@ struct Recorder {
 
         let stamp = DateFormatter()
         stamp.dateFormat = "yyyyMMdd_HHmmss"
-        let base = "\(stamp.string(from: startedAt))-\(Recorder.slugify(meeting))"
+        // The app is in the name because meeting titles don't say where they
+        // happened, and the same people meet in different places.
+        let base = "\(stamp.string(from: startedAt))-\(app)-\(Recorder.slugify(meeting))"
         jsonlURL = directory.appendingPathComponent(base + ".jsonl")
         textURL = directory.appendingPathComponent(base + ".txt")
 
@@ -315,7 +374,17 @@ struct Recorder {
         return formatter
     }()
 
-    func elapsed(_ date: Date) -> String { elapsedString(from: timelineStart, to: date) }
+    func elapsed(_ date: Date) -> String {
+        countsFromMeetingStart
+            ? elapsedString(from: timelineStart, to: date)
+            : Recorder.clockFormatter.string(from: date)
+    }
+
+    static let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     func writeJSON(_ payload: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
@@ -323,6 +392,14 @@ struct Recorder {
         line += "\n"
         jsonl.write(Data(line.utf8))
         if options.jsonToStdout && !options.quiet { stdout.write(Data(line.utf8)) }
+    }
+
+    /// Head the transcript with what the bracketed times mean. Without it a
+    /// file of relative stamps can't be placed in time at all, and one of
+    /// wall-clock stamps doesn't say which day.
+    func writeHeader(_ lines: [String]) {
+        let block = lines.map { "# \($0)\n" }.joined() + "\n"
+        text.write(Data(block.utf8))
     }
 
     /// Append to both files; returns the transcript line for display.
@@ -407,6 +484,17 @@ protocol MeetingApp {
     /// apps that would otherwise leave the last line pending indefinitely.
     var idleFinalizeSeconds: TimeInterval? { get }
 
+    /// True when the app shows how long the call has been running, so lines
+    /// can be numbered from the start of the meeting. An app without one can
+    /// only count from when we joined, which says nothing useful about a
+    /// meeting already in progress - those transcripts get the time of day.
+    var reportsMeetingClock: Bool { get }
+
+    /// True when the caption surface is only present while someone is
+    /// speaking. Its absence then says nothing about whether captions are
+    /// switched on, so once it has been seen the app must not be asked again.
+    var captionsSurfaceIsTransient: Bool { get }
+
     /// True when the UI is a Chromium/Electron web view. Such apps keep their
     /// accessibility tree switched off until a client asks for it, and must be
     /// woken before anything can be read. Native apps must NOT be poked this
@@ -418,8 +506,11 @@ extension MeetingApp {
     // Teams-style: an utterance is done when its element disappears.
     var finalizesWhenSuperseded: Bool { false }
     var idleFinalizeSeconds: TimeInterval? { nil }
+    // Most apps leave the caption panel up between utterances.
+    var captionsSurfaceIsTransient: Bool { false }
     // Most apps don't say how long the call has been going.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
+    var reportsMeetingClock: Bool { false }
     var captionPressToggles: Bool { false }
     // Assume native AppKit; only opt in to the wake where it is needed.
     var rendersWebContent: Bool { false }
@@ -506,6 +597,8 @@ struct TeamsApp: MeetingApp {
             return title.hasPrefix("Meeting with ")
         }
     }
+
+    let reportsMeetingClock = true
 
     /// Teams paints the ticking clock as a child AXStaticText ("31:01").
     /// The group's title ("Elapsed time 21:54") is frozen at first render.
@@ -607,6 +700,178 @@ struct TeamsApp: MeetingApp {
 /// Zoom is a native app, so there are no DOM ids, but it labels its controls
 /// with AXIdentifier (`leave`, `captions`, `chat`) and its caption list with a
 /// description, which serve the same purpose.
+final class SlackApp: MeetingApp {
+    let id = "slack"
+    let displayName = "Slack"
+    let processPattern = "Slack.app/Contents/MacOS/Slack"
+    // Slack is Electron, so its tree starts switched off.
+    let rendersWebContent = true
+    // Overlay events vanish when they are done, so absence means finished.
+    // They also grow while being spoken, and Slack replaces the element each
+    // time it does, so give an utterance time to settle before writing it:
+    // finalizing early emits the partial, then the full line lands as a
+    // second copy.
+    var idleFinalizeSeconds: TimeInterval? { 8 }
+
+    // The overlay is drawn over the video tiles only while there is something
+    // to show, so it goes away during any pause. Absence means silence, not
+    // that captions were switched off.
+    var captionsSurfaceIsTransient: Bool { true }
+
+    private let leaveDescription = "Leave Huddle"
+    private let overlayClass = "p-huddle_closed_captions"
+    private let overlayEventClass = "p-huddle_closed_caption_event__wrapper"
+    private let settledMarker = "fade_out"
+
+    /// Which utterance the live slot is holding, and what it last said. Slack
+    /// swaps the element on every revision, so identity has to be tracked here
+    /// rather than read off the tree.
+    private var liveSequence = 0
+    private var previousLiveText = ""
+
+    /// A huddle gets its own window, and the Leave button only exists while
+    /// one is up.
+    func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) {
+            axString($0, kAXRoleAttribute) == kAXButtonRole
+                && axDescription($0) == leaveDescription
+        }
+    }
+
+    /// The window is titled "Huddle: #channel - Workspace - Slack \u{1F3A4}". Keep the
+    /// channel, drop the decoration.
+    func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String {
+        guard let window = huddleWindow(app) else { return "Slack huddle" }
+        var title = axString(window, kAXTitleAttribute)
+        if let range = title.range(of: "Huddle: ") { title = String(title[range.upperBound...]) }
+        // Trailing " - Workspace - Slack \u{1F3A4}" is chrome, not part of the name.
+        if let dash = title.range(of: " - ", options: .backwards) { title = String(title[..<dash.lowerBound]) }
+        title = title.trimmingCharacters(in: .whitespaces)
+        return title.isEmpty ? "Slack huddle" : title
+    }
+
+    private func huddleWindow(_ app: AXUIElement) -> AXUIElement? {
+        let windows = axAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        return windows.first { axString($0, kAXTitleAttribute).hasPrefix("Huddle:") }
+    }
+
+    private func captionsTab(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) {
+            axDomID($0) == "captions" && axString($0, kAXRoleAttribute) == "AXRadioButton"
+        }
+    }
+
+    /// Captions surface both in the side flexpane's captions tab and as an
+    /// overlay on the video tiles, and we deliberately read only the overlay.
+    ///
+    /// The flexpane shows one tab at a time, so reading it would stop
+    /// capturing the moment someone opened Threads. The overlay is there
+    /// whichever tab is up, which is the whole point.
+    ///
+    /// Reading both is worse than reading either. Neither source has a stable
+    /// identity \u2014 panel rows are a virtual list keyed by index, and Slack
+    /// reuses an index when it merges consecutive utterances by one speaker,
+    /// while overlay events are keyed by element hash and Slack replaces the
+    /// element whenever the text grows. Two sources of unstable ids meant the
+    /// same sentence was written once from each.
+    func captionsContainer(_ app: AXUIElement) -> AXUIElement? {
+        guard let window = huddleWindow(app) else { return nil }
+        return findElement(from: window) { axClasses($0).contains(overlayClass) }
+    }
+
+    /// Slack shows no call clock in the huddle window.
+    func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
+
+    /// Overlay events read [speaker, ":", text], the colon being its own node.
+    ///
+    /// They carry no id, and the element hash is useless as identity because
+    /// Slack replaces the element every time the text changes \u2014 which it does
+    /// constantly while speech is being recognised, revising words rather than
+    /// only appending ("Kinda hard to fill" becomes "Kind of hard to fill
+    /// her"). Keying on the hash wrote one line per revision, and prefix
+    /// matching could not collapse them because a revision is not a prefix.
+    ///
+    /// The list is ordered oldest to newest and holds about five events, and
+    /// Slack marks every settled one `fade_out`. So at most one event \u2014 the
+    /// last \u2014 is still being spoken, and it is the only one that can change.
+    /// Settled events are therefore keyed by their content, which is now
+    /// fixed, and the live one keeps a single synthetic id across all its
+    /// revisions so it lands as one utterance.
+    func captionEntries(in container: AXUIElement) -> [CaptionEntry] {
+        var settled: [(speaker: String, text: String)] = []
+        var live: (speaker: String, text: String)?
+
+        for item in axChildren(container) {
+            let classes = axClasses(item)
+            guard classes.contains(overlayEventClass) else { continue }
+            let texts = axStaticTexts(item)
+            guard texts.count >= 3 else { continue }
+            let spoken = texts.dropFirst(2).joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces)
+            guard !spoken.isEmpty else { continue }
+            if classes.contains(where: { $0.contains(settledMarker) }) {
+                settled.append((texts[0], spoken))
+            } else {
+                live = (texts[0], spoken)
+            }
+        }
+
+        // Once the sentence the live slot was holding shows up settled, the
+        // slot has moved on to a new utterance and must not keep the old id.
+        // Checked against every settled event, including ones filtered out of
+        // the result below.
+        if !previousLiveText.isEmpty, settled.contains(where: { $0.text == previousLiveText }) {
+            liveSequence += 1
+            previousLiveText = ""
+        }
+
+        // Every settled event is reported, including one whose text also sits
+        // in the live slot. Suppressing those looked like the way to avoid
+        // writing a sentence twice, but the live slot is not a safe place to
+        // have left it: if Slack settles an utterance with any edit at all,
+        // the turnover above is missed, the live id is reused for the next
+        // sentence, and the previous one is overwritten before it was ever
+        // written out. Reporting both and letting the recorder collapse them
+        // loses nothing when that happens.
+        var entries = settled.map {
+            CaptionEntry(id: "settled:\(identity(of: $0.speaker, $0.text))", speaker: $0.speaker, text: $0.text)
+        }
+        if let live {
+            previousLiveText = live.text
+            // Last, so the recorder treats it as the line still being spoken
+            // and leaves it out of idle finalization.
+            entries.append(CaptionEntry(id: "live:\(liveSequence)", speaker: live.speaker, text: live.text))
+        }
+        return entries
+    }
+
+    private func identity(of speaker: String, _ text: String) -> String {
+        String(UInt(bitPattern: "\(speaker)|\(text)".hashValue), radix: 16)
+    }
+
+    func captionsPanelOpen(_ app: AXUIElement) -> Bool {
+        captionsContainer(app) != nil
+    }
+
+    /// The control is a tab, not a toggle: selecting it starts captions and
+    /// selecting it again is a no-op. But switching tabs is the user's
+    /// business, so only reach for it when captions are nowhere to be found.
+    /// If the overlay is up, captions are already running and whatever tab
+    /// they are reading is left alone.
+    func requestCaptions(pid: pid_t) -> CaptionRequest {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 5.0)
+        if captionsContainer(app) != nil { return .alreadyOn }
+        guard let tab = captionsTab(app) else { return .unreachable }
+        guard AXUIElementPerformAction(tab, kAXPressAction as CFString) == .success
+        else { return .unreachable }
+        return .pressed
+    }
+
+    func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
+    func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
+}
+
 struct ZoomApp: MeetingApp {
     let id = "zoom"
     let displayName = "Zoom"
@@ -634,6 +899,8 @@ struct ZoomApp: MeetingApp {
     }
 
     /// Zoom keeps a clock in the title bar, described as "My connected time is
+    let reportsMeetingClock = true
+
     /// 34:50" (or "1:34:50"). It's the only account of when the call actually
     /// began that survives us being started late.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? {
@@ -739,7 +1006,7 @@ struct ZoomApp: MeetingApp {
     var idleFinalizeSeconds: TimeInterval? { 6 }
 }
 
-let supportedApps: [MeetingApp] = [TeamsApp(), ZoomApp()]
+let supportedApps: [MeetingApp] = [TeamsApp(), ZoomApp(), SlackApp()]
 
 
 // MARK: - Session
@@ -753,6 +1020,8 @@ final class Session {
     let startedAt = Date()
     var title: String
     private var recorder: Recorder?
+    /// Highest stamp written so far, so the transcript clock never goes back.
+    private var lastStamp: Date?
     private var captionsContainer: AXUIElement?
     private var chatContainer: AXUIElement?
     private var lastRelocate = Date.distantPast
@@ -792,19 +1061,33 @@ final class Session {
     /// Files are created on first write, so a silent meeting leaves no litter.
     private func recorderForWriting() -> Recorder {
         if let recorder { return recorder }
-        var created = Recorder(options: options, meeting: title, startedAt: startedAt)
+        var created = Recorder(options: options, app: meetingApp.id, meeting: title, startedAt: startedAt)
         created.timelineStart = timelineStart
+        created.countsFromMeetingStart = meetingApp.reportsMeetingClock
         var metadata: [String: Any] = [
             "type": "metadata",
             "source": "\(meetingApp.id)-ax",
             "app": meetingApp.displayName,
             "meeting": title,
-            "recorded_at": Recorder.isoFormatter.string(from: startedAt)
+            "recorded_at": Recorder.isoFormatter.string(from: startedAt),
+            "timestamps": created.countsFromMeetingStart ? "elapsed" : "time-of-day"
         ]
         if timelineResolved {
             metadata["meeting_started_at"] = Recorder.isoFormatter.string(from: timelineStart)
         }
         created.writeJSON(metadata)
+
+        var header = ["\(title) (\(meetingApp.displayName))",
+                      "recording started \(Recorder.isoFormatter.string(from: startedAt))"]
+        if timelineResolved {
+            header.append("meeting started   \(Recorder.isoFormatter.string(from: timelineStart))")
+            header.append("[hh:mm:ss] counts from the start of the meeting")
+        } else if created.countsFromMeetingStart {
+            header.append("[hh:mm:ss] counts from when recording started")
+        } else {
+            header.append("[hh:mm:ss] is the time of day")
+        }
+        created.writeHeader(header)
         recorder = created
         let pointer = options.stateDirectory + "/current"
         try? created.textURL.path.write(toFile: pointer, atomically: true, encoding: .utf8)
@@ -861,8 +1144,24 @@ final class Session {
     }
 
     private func emit(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any]) {
-        let line = recorderForWriting().record(kind: kind, speaker: speaker, body: body, at: date, extra: extra)
+        // Lines are appended as they finish but stamped with when they began,
+        // so a long sentence can land after a short one that started later and
+        // the clock appears to run backwards. Hold the stamp at the high-water
+        // mark, keeping the real start alongside it when they differ.
+        let stamp = max(date, lastStamp ?? date)
+        lastStamp = stamp
+        var extra = extra
+        if stamp != date { extra["started_at"] = Recorder.isoFormatter.string(from: date) }
+        let line = recorderForWriting().record(kind: kind, speaker: speaker, body: body, at: stamp, extra: extra)
         live.permanent(line)
+    }
+
+    /// Matches how the recorder stamps finished lines, so the live region and
+    /// the transcript above it read the same way.
+    private func stamp(_ date: Date) -> String {
+        meetingApp.reportsMeetingClock
+            ? elapsedString(from: timelineStart, to: date)
+            : Recorder.clockFormatter.string(from: date)
     }
 
     func tick(app: AXUIElement, pid: pid_t, now: Date) {
@@ -888,10 +1187,14 @@ final class Session {
             sawCaptions = true
             return
         }
-        // Panel looks closed. If we already pressed while the tree was hollow,
+        // Panel looks closed. For an app whose captions only appear while
+        // someone is speaking, that is just silence - asking again would
+        // reopen a panel the user closed, or warn about captions that are
+        // running. Otherwise, if we already pressed while the tree was hollow,
         // do not guess again. Once the tree is readable we can see it is
         // really off and it is safe to toggle back on.
         if sawCaptions {
+            guard !meetingApp.captionsSurfaceIsTransient else { return }
             guard treePopulated else { return }
             sawCaptions = false
             captionAttempts = 0
@@ -931,7 +1234,6 @@ final class Session {
             captionsContainer = nil // panel closed or re-rendered
         }
         let visible = Set(entries.map(\.id))
-        for id in captionOrder where !visible.contains(id) { finalizeCaption(id, at: now) }
         finalized.formIntersection(visible) // let ids be reused once they are gone
         for entry in entries {
             if finalized.contains(entry.id) {
@@ -959,6 +1261,13 @@ final class Session {
             }
         }
 
+        // Finalize what left the screen only after taking in what is on it.
+        // An app can retire one element and put the same sentence up under
+        // another in a single refresh, and finalizing first meant the
+        // replacement was not there yet to be recognised as the same
+        // utterance, so it was written twice.
+        for id in captionOrder where !visible.contains(id) { finalizeCaption(id, at: now) }
+
         // Apps that keep finished utterances on screen need another way to tell
         // that one is done.
         if meetingApp.finalizesWhenSuperseded, let newest = entries.last?.id {
@@ -977,7 +1286,7 @@ final class Session {
         let pending = captionOrder.compactMap { id -> String? in
             guard let utterance = activeCaptions[id],
                   !supersededByActive(utterance, id: id) else { return nil }
-            return "[\(elapsedString(from: timelineStart, to: utterance.startedAt))] \(utterance.speaker): \(utterance.text)"
+            return "[\(stamp(utterance.startedAt))] \(utterance.speaker): \(utterance.text)"
         }
         let shown = pending.enumerated().map { $0.offset == pending.count - 1 ? "\($0.element) ▍" : $0.element }
         live.set(shown)
@@ -1164,17 +1473,11 @@ func followTranscripts(_ options: Options) {
         if liveText != lastLive {
             eraseLive()
             lastLive = liveText
-            let width = LiveView.terminalWidth()
-            let rendered = liveText.trimmingCharacters(in: .newlines)
-                .split(separator: "\n", omittingEmptySubsequences: false)
-                .map { line -> String in
-                    var body = String(line).replacingOccurrences(of: "\n", with: " ")
-                    if body.count > width - 1 {
-                        body = String(body.prefix(max(1, width - 2))) + "…"
-                    }
-                    return body
-                }
-                .filter { !$0.isEmpty }
+            let rendered = LiveView.layout(
+                liveText.trimmingCharacters(in: .newlines)
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .map(String.init)
+            )
             if !rendered.isEmpty {
                 stdout.write(Data(rendered.joined(separator: "\n").utf8))
                 liveRows = rendered.count
@@ -1183,6 +1486,15 @@ func followTranscripts(_ options: Options) {
         usleep(250_000)
     }
     eraseLive()
+    // On the way out, say where the words went. The filename alone was shown
+    // when the meeting started, which may be a long way up the scrollback.
+    if let transcript = current ?? newestTranscript(in: options.directory) {
+        var report = "transcript: \(transcript.path)"
+        let json = transcript.deletingPathExtension().appendingPathExtension("jsonl")
+        if FileManager.default.fileExists(atPath: json.path) { report += "\n  jsonl: \(json.path)" }
+        stdout.write(Data("\n".utf8)) // stand the report off from the last thing said
+        status(report)
+    }
 }
 
 // MARK: - Main

@@ -149,15 +149,34 @@ and off every eight seconds.
 
 ## Output
 
-Transcripts land in `~/.local/share/meeting-capture`, one pair per meeting:
+Transcripts land in `~/.local/share/meeting-capture`, one pair per meeting,
+named for when it started, where it happened, and what it was called:
 
 ```
-20260824_140510-weekly-sync.txt     [00:00:38] Grace Hopper: Mic check 1-2.
-20260824_140510-weekly-sync.jsonl
+20260824_140510-teams-weekly-sync.txt
+20260824_140510-teams-weekly-sync.jsonl
+20260824_185316-zoom-personal-meeting-room.jsonl
+20260824_185849-slack-eng-standup.txt
 ```
+
+The text file opens with what the bracketed times mean, so a transcript is
+still readable years later on its own:
+
+```
+# Weekly Sync (Microsoft Teams)
+# recording started 2026-08-24T14:05:10-05:00
+# meeting started   2026-08-24T13:28:15-05:00
+# [hh:mm:ss] counts from the start of the meeting
+
+[00:37:33] Grace Hopper: Mic check 1-2.
+```
+
+Join an hour into a call and the first line reads `[01:02:11]`; the header is
+what turns that back into a time of day. Where the app publishes no clock the
+lines are stamped with the time of day already, and the header says so.
 
 ```json
-{"type":"metadata","app":"Microsoft Teams","meeting":"Weekly Sync","source":"teams-ax","recorded_at":"2026-08-24T14:05:10-05:00"}
+{"type":"metadata","app":"Microsoft Teams","meeting":"Weekly Sync","source":"teams-ax","recorded_at":"2026-08-24T14:05:10-05:00","meeting_started_at":"2026-08-24T13:28:15-05:00","timestamps":"elapsed"}
 {"type":"caption","speaker":"Grace Hopper","text":"Mic check 1-2.","ts":"2026-08-24T14:05:48-05:00","ended_at":"2026-08-24T14:05:53-05:00","elapsed":"00:00:38","node_id":"8046"}
 {"type":"chat","speaker":"Ada Lovelace","text":"here's the dashboard","ts":"2026-08-24T14:06:02-05:00","elapsed":"00:00:52","message_id":"1756061162000"}
 {"type":"metadata","event":"stopped","stopped_at":"2026-08-24T14:05:53-05:00","duration":"00:00:42"}
@@ -172,6 +191,11 @@ where the app will say how long the call has been running — Zoom keeps a clock
 in its title bar. Attach to a meeting already in progress and the first line
 reads `[00:36:41]` rather than `[00:00:00]`, and `meeting_started_at` records
 what it was measured against.
+
+Slack publishes no such clock, so a huddle is stamped with the time of day
+instead. Counting from zero there would claim the huddle began when the capture
+did, which is only true if you opened it; the time of day is true whenever you
+joined, and lines up with the channel it happened in.
 
 Wall-clock `ts` and `ended_at` on every caption make this useful beyond reading:
 align the timestamps against a Whisper transcript of the same meeting and you
