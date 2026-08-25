@@ -24,13 +24,28 @@ cert_name="meeting-capture-signing"
 # signing re-hashes on every build, so each rebuild drops the permission. A
 # stable identity keeps the grant: `signing-cert` below makes a self-signed one,
 # and MEETING_CAPTURE_SIGN_ID overrides it (e.g. with a Developer ID).
+signing_cert_exists() {
+  security find-identity -v -p codesigning 2>/dev/null | grep -q "$cert_name"
+}
 find_sign_id() {
   if [[ -n ${MEETING_CAPTURE_SIGN_ID:-} ]]; then
     printf '%s' "$MEETING_CAPTURE_SIGN_ID"
-  elif security find-identity -v -p codesigning 2>/dev/null | grep -q "$cert_name"; then
+    return
+  fi
+  local identities
+  # A keychain that cannot be read is not the same as "no certificate".
+  # Falling back to ad-hoc here would rebuild an already cert-signed binary
+  # unsigned and silently drop the Accessibility grant — worse than stopping.
+  if ! identities=$(security find-identity -v -p codesigning 2>&1); then
+    echo "error: cannot list code-signing identities (locked keychain?):" >&2
+    echo "$identities" >&2
+    echo "fix keychain access or set MEETING_CAPTURE_SIGN_ID, then retry" >&2
+    exit 1
+  fi
+  if grep -q "$cert_name" <<<"$identities"; then
     printf '%s' "$cert_name"
   else
-    printf '%s' '-' # ad-hoc
+    printf '%s' '-' # ad-hoc; only reached when lookup genuinely succeeded
   fi
 }
 sign_id=$(find_sign_id)
@@ -54,28 +69,38 @@ case "${1:-install}" in
     exit 0
     ;;
   signing-cert)
-    if security find-identity -v -p codesigning 2>/dev/null | grep -q "$cert_name"; then
-      echo "$cert_name already exists"
-      exit 0
-    fi
+  if signing_cert_exists; then
+    echo "$cert_name already exists"
+    exit 0
+  fi
     # A self-signed code signing certificate, trusted for code signing only.
     # The point is a signature that stays the same across rebuilds, so the
     # Accessibility grant survives; it proves nothing to anyone else.
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
+    # Diagnostics are kept per step: a bare "exit 1" from set -e leaves no
+    # hint whether OpenSSL is missing, too old for -addext, or out of entropy.
     openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
       -keyout "$tmp/key.pem" -out "$tmp/cert.pem" \
       -subj "/CN=$cert_name" \
       -addext "basicConstraints=critical,CA:false" \
       -addext "extendedKeyUsage=critical,codeSigning" \
-      -addext "keyUsage=critical,digitalSignature" 2>/dev/null
+      -addext "keyUsage=critical,digitalSignature" 2>"$tmp/req.err" || {
+        echo "openssl could not generate the certificate (is OpenSSL >= 1.1 installed?):" >&2
+        cat "$tmp/req.err" >&2
+        exit 1
+      }
     # Security.framework can't read OpenSSL 3's default PKCS#12 encryption, so
     # ask for the old algorithms. The passphrase only has to survive the import
     # on the next line.
     pass=$(openssl rand -hex 16)
     openssl pkcs12 -export -out "$tmp/id.p12" \
       -inkey "$tmp/key.pem" -in "$tmp/cert.pem" -passout "pass:$pass" \
-      -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 2>/dev/null
+      -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 2>"$tmp/p12.err" || {
+        echo "openssl could not export PKCS#12 (legacy algorithm support missing?):" >&2
+        cat "$tmp/p12.err" >&2
+        exit 1
+      }
 
     keychain="$HOME/Library/Keychains/login.keychain-db"
     # -A/-T let codesign use the key without a prompt on every build.
@@ -96,11 +121,16 @@ esac
 
 mkdir -p "${binary%/*}" "$state_dir"
 
-# Only rebuild when the source changed: with ad-hoc signing every rebuild costs
-# the Accessibility grant.
+# Only rebuild when something relevant changed — the source, or the signing
+# identifier. The stamp carries both: after creating a certificate, an unchanged
+# source still has to be rebuilt, or codesign never runs and the binary stays
+# ad-hoc signed while everything above claims otherwise. Note it tracks the
+# identity's NAME: rotating a certificate under the same name does not trigger
+# a rebuild (remove $stamp by hand after rotating).
 source_hash=$(shasum -a 256 "$source_script" | cut -d' ' -f1)
+build_hash="$sign_id:$source_hash"
 rebuilt=false
-if [[ ! -x $binary || ! -f $stamp || $(cat "$stamp") != "$source_hash" ]]; then
+if [[ ! -x $binary || ! -f $stamp || $(cat "$stamp") != "$build_hash" ]]; then
   echo "building $binary"
   build_dir=$(mktemp -d)
   trap 'rm -rf "$build_dir"' EXIT
@@ -109,7 +139,7 @@ if [[ ! -x $binary || ! -f $stamp || $(cat "$stamp") != "$source_hash" ]]; then
   # No --identifier: giving a bare binary a bundle-style id makes TCC try to
   # resolve it as an app, fail to find one, and reject the grant.
   codesign --force --sign "$sign_id" "$binary"
-  echo "$source_hash" > "$stamp"
+  echo "$build_hash" > "$stamp"
   rebuilt=true
 else
   echo "$binary is current, skipping build"

@@ -202,16 +202,14 @@ struct Utterance {
 /// meeting can be displayed before it has written anything.
 final class LiveView {
     private let stdout = FileHandle.standardOutput
-    private let printsLines: Bool
-    private let updatesRegion: Bool
+    /// Only a terminal gets the transcript drawn on stdout. Under launchd stdout
+    /// is the log, and every finished line was landing there as well as in the
+    /// .txt — so --follow, which tails both, drew each line twice.
+    private let isInteractive: Bool
     private var lines: [String] = []
 
     init(options: Options) {
-        // Only a terminal gets the transcript on stdout. Under launchd stdout is
-        // the log, and every finished line was landing there as well as in the
-        // .txt \u2014 so --follow, which tails both, drew each line twice.
-        printsLines = !options.quiet && !options.jsonToStdout && isatty(STDOUT_FILENO) == 1
-        updatesRegion = printsLines
+        isInteractive = !options.quiet && !options.jsonToStdout && isatty(STDOUT_FILENO) == 1
     }
 
     static func terminalWidth() -> Int {
@@ -276,7 +274,7 @@ final class LiveView {
 
     /// Erase the region, leaving the cursor at the start of its first line.
     func erase() {
-        guard updatesRegion, !lines.isEmpty else { lines = []; return }
+        guard isInteractive, !lines.isEmpty else { lines = []; return }
         var escape = "\r\u{1B}[2K"
         for _ in 1..<max(1, lines.count) { escape += "\u{1B}[1A\u{1B}[2K" }
         stdout.write(Data(escape.utf8))
@@ -284,13 +282,13 @@ final class LiveView {
     }
 
     private func draw(_ rendered: [String]) {
-        guard updatesRegion, !rendered.isEmpty else { return }
+        guard isInteractive, !rendered.isEmpty else { return }
         stdout.write(Data(rendered.joined(separator: "\n").utf8))
         lines = rendered
     }
 
     func set(_ pending: [String]) {
-        guard updatesRegion else { return }
+        guard isInteractive else { return }
         let rendered = LiveView.layout(pending)
         guard rendered != lines else { return } // avoid redrawing unchanged text
         erase()
@@ -299,7 +297,7 @@ final class LiveView {
 
     /// Print a finished transcript line above the live region.
     func permanent(_ line: String) {
-        guard printsLines else { return }
+        guard isInteractive else { return }
         let pending = lines
         erase()
         stdout.write(Data((line + "\n").utf8))
@@ -312,16 +310,47 @@ func elapsedString(from start: Date, to end: Date) -> String {
     return String(format: "%02d:%02d:%02d", total / 3600, (total / 60) % 60, total % 60)
 }
 
-struct Recorder {
+/// Pull "mm:ss" or "h:mm:ss" out of a label like "Elapsed time 21:54" or
+/// "My connected time is 34:50". Strict on purpose: every component must be
+/// digits, and minutes/seconds must be under 60, so "1::30" fails to parse
+/// instead of silently becoming one minute thirty.
+func parseMeetingClock(_ raw: String) -> TimeInterval? {
+    let token = raw.split(whereSeparator: { !$0.isNumber && $0 != ":" }).first { $0.contains(":") } ?? ""
+    var comps: [Int] = []
+    for part in token.split(separator: ":", omittingEmptySubsequences: false) {
+        guard let value = Int(part) else { return nil }
+        comps.append(value)
+    }
+    guard (2...3).contains(comps.count), comps.dropFirst().allSatisfy({ $0 < 60 }) else { return nil }
+    switch comps.count {
+    case 2: return TimeInterval(comps[0] * 60 + comps[1])
+    default: return TimeInterval(comps[0] * 3600 + comps[1] * 60 + comps[2])
+    }
+}
+
+/// How `[HH:MM:SS]` stamps are rendered. Chosen once, when the first line is
+/// written: the header documents what the stamps mean, so switching the
+/// reference halfway through a file would make it contradict itself.
+enum TimestampMode {
+    /// Counting from a reference point — the app's connection clock when it
+    /// displays a call clock, otherwise the moment recording began.
+    case elapsed(from: Date)
+    /// The time of day, for apps with no call clock: true whenever we joined,
+    /// rather than a count from zero implying the meeting began when we did.
+    case timeOfDay
+
+    func stamp(_ date: Date) -> String {
+        switch self {
+        case .elapsed(let start): return elapsedString(from: start, to: date)
+        case .timeOfDay: return Recorder.clockFormatter.string(from: date)
+        }
+    }
+}
+
+final class Recorder {
     let startedAt: Date
-    /// What `[HH:MM:SS]` counts from. Usually the same as startedAt, but apps
-    /// that report how long the call has been running let us number lines from
-    /// the start of the meeting instead of from when we joined it.
-    var timelineStart: Date
-    /// False when the app has no call clock: `[HH:MM:SS]` is then the time of
-    /// day, which is true whenever we joined, rather than a count from zero
-    /// that would imply the meeting began when we started watching.
-    var countsFromMeetingStart = true
+    /// What `[HH:MM:SS]` stamps count from (see TimestampMode).
+    let mode: TimestampMode
     let jsonlURL: URL
     let textURL: URL
     private let jsonl: FileHandle
@@ -329,10 +358,10 @@ struct Recorder {
     private let stdout = FileHandle.standardOutput
     let options: Options
 
-    init(options: Options, app: String, meeting: String, startedAt: Date) {
+    init(options: Options, app: String, meeting: String, startedAt: Date, mode: TimestampMode) {
         self.options = options
         self.startedAt = startedAt
-        self.timelineStart = startedAt
+        self.mode = mode
         let directory = URL(fileURLWithPath: options.directory, isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
@@ -374,11 +403,7 @@ struct Recorder {
         return formatter
     }()
 
-    func elapsed(_ date: Date) -> String {
-        countsFromMeetingStart
-            ? elapsedString(from: timelineStart, to: date)
-            : Recorder.clockFormatter.string(from: date)
-    }
+    func elapsed(_ date: Date) -> String { mode.stamp(date) }
 
     static let clockFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -386,12 +411,25 @@ struct Recorder {
         return f
     }()
 
-    func writeJSON(_ payload: [String: Any]) {
+    /// Serializes and appends one JSONL event. Returns false when the event
+    /// could not be produced or written — the caller then holds back the text
+    /// half too (see record).
+    @discardableResult
+    func writeJSON(_ payload: [String: Any]) -> Bool {
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
-              var line = String(data: data, encoding: .utf8) else { return }
+              var line = String(data: data, encoding: .utf8) else {
+            status("could not serialize a \(payload["type"] ?? "json") event; neither file records it")
+            return false
+        }
         line += "\n"
-        jsonl.write(Data(line.utf8))
+        do {
+            try jsonl.write(contentsOf: Data(line.utf8))
+        } catch {
+            status("cannot write to \(jsonlURL.path): \(error.localizedDescription); neither file records this event")
+            return false
+        }
         if options.jsonToStdout && !options.quiet { stdout.write(Data(line.utf8)) }
+        return true
     }
 
     /// Head the transcript with what the bracketed times mean. Without it a
@@ -402,8 +440,13 @@ struct Recorder {
         text.write(Data(block.utf8))
     }
 
-    /// Append to both files; returns the transcript line for display.
-    func record(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any] = [:]) -> String {
+    /// Append to both files; returns the transcript line for display, or nil
+    /// when either half could not be written. A failed jsonl write holds the
+    /// transcript line back, so the pair never disagrees about what happened;
+    /// a text write that fails after jsonl succeeded cannot be undone and is
+    /// logged loudly instead.
+    @discardableResult
+    func record(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any] = [:]) -> String? {
         var payload: [String: Any] = [
             "type": kind,
             "speaker": speaker,
@@ -412,10 +455,16 @@ struct Recorder {
             "elapsed": elapsed(date)
         ]
         payload.merge(extra) { current, _ in current }
-        writeJSON(payload)
+        guard writeJSON(payload) else { return nil }
         let tag = kind == "chat" ? "(chat) " : ""
-        let line = "[\(elapsed(date))] \(tag)\(speaker): \(body)"
-        text.write(Data((line + "\n").utf8))
+        let stamped = elapsed(date)
+        let line = "[\(stamped)] \(tag)\(speaker): \(body)"
+        do {
+            try text.write(contentsOf: Data((line + "\n").utf8))
+        } catch {
+            status("cannot write to \(textURL.path): \(error.localizedDescription); the transcript is missing this line")
+            return nil
+        }
         return line
     }
 }
@@ -428,14 +477,71 @@ struct CaptionEntry {
     let text: String
 }
 
+/// Absolute identities for caption segments that reach us as a sliding window
+/// with no ids at all (Google Meet's per-speaker blocks, Slack's overlay
+/// events). Each poll reports the settled segments currently visible — the
+/// tail of the conversation so far — and gets back where they sit overall, so
+/// the same words spoken twice land as two utterances and an old segment
+/// falling off-screen shifts nothing.
+///
+/// These apps append, so the visible settled segments are normally the exact
+/// tail of the history. If the window ever moves past what history still
+/// holds, it re-anchors on the longest overlap so positions keep counting up
+/// rather than restarting and rewriting the conversation. Keys are a struct
+/// rather than joined strings: a speaker name containing the would-be
+/// delimiter must not be able to impersonate a different utterance.
+struct SegmentKey: Equatable {
+    let speaker: String
+    let text: String
+}
+
+final class SegmentHistory {
+    private var keys: [SegmentKey] = []
+    /// Segments already dropped off the front of `keys`.
+    private var dropped = 0
+
+    /// Fold the visible settled segments into the history; returns the absolute
+    /// position of the first one. The rest number on from there, and the
+    /// segment still being spoken takes `returned + settled.count`.
+    func absorb(_ settled: [SegmentKey]) -> Int {
+        guard !settled.isEmpty else { return dropped + keys.count }
+        for overlap in stride(from: min(keys.count, settled.count), through: 1, by: -1)
+        where Array(keys.suffix(overlap)) == Array(settled.prefix(overlap)) {
+            keys.append(contentsOf: settled.dropFirst(overlap))
+            trim()
+            return dropped + keys.count - settled.count
+        }
+        // No overlap with anything remembered: all of these are new.
+        keys.append(contentsOf: settled)
+        trim()
+        return dropped + keys.count - settled.count
+    }
+
+    /// A many-hour call produces thousands of segments; keep memory flat.
+    /// Retain far more than any real window holds (overlays show ~5, Meet's
+    /// blocks a handful): overlap matching compares the visible window against
+    /// retained history only, so a window wider than what was retained would
+    /// find no overlap and jump the numbering.
+    private func trim() {
+        guard keys.count > 600 else { return }
+        let excess = keys.count - 300
+        keys.removeFirst(excess)
+        dropped += excess
+    }
+
+    /// Forget everything: positions are per meeting, and the apps are singletons.
+    func reset() {
+        keys = []
+        dropped = 0
+    }
+}
+
 struct ChatMessage {
     let id: String
     let author: String
     let text: String
 }
 
-/// What meeting-capture needs to know about a conferencing app. Everything
-/// else in this file is app-agnostic.
 /// What came of asking an app to turn captions on.
 enum CaptionRequest {
     /// The control was pressed; captions should appear shortly.
@@ -460,8 +566,9 @@ protocol MeetingApp {
     /// The element whose children are caption entries, if captions are showing.
     func captionsContainer(_ app: AXUIElement) -> AXUIElement?
     /// How long the call has been running, if the app displays it. Lets lines be
-    /// numbered from the start of the meeting rather than from when we attached,
-    /// which matters when the daemon is restarted mid-meeting.
+    /// numbered from that reference (the moment this participant connected)
+    /// rather than from when we attached, which matters when the daemon is
+    /// restarted mid-meeting.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval?
     func captionEntries(in container: AXUIElement) -> [CaptionEntry]
     /// Whether the captions UI is up, regardless of whether it has any text in
@@ -475,6 +582,10 @@ protocol MeetingApp {
 
     func chatContainer(_ app: AXUIElement) -> AXUIElement?
     func chatMessages(in container: AXUIElement) -> [ChatMessage]
+    /// Called when a session starts. Apps are singletons, so any per-meeting
+    /// caption bookkeeping (position histories, live-slot tracking) must be
+    /// cleared here rather than leaking across meetings.
+    func resetCaptureState()
 
     /// True when finished utterances stay on screen, so waiting for one to
     /// disappear would hold the whole transcript back. Such an app is assumed
@@ -485,9 +596,9 @@ protocol MeetingApp {
     var idleFinalizeSeconds: TimeInterval? { get }
 
     /// True when the app shows how long the call has been running, so lines
-    /// can be numbered from the start of the meeting. An app without one can
-    /// only count from when we joined, which says nothing useful about a
-    /// meeting already in progress - those transcripts get the time of day.
+    /// can be numbered from a shared reference. An app without one can only
+    /// count from when we joined, which says nothing useful about a meeting
+    /// already in progress - those transcripts get the time of day.
     var reportsMeetingClock: Bool { get }
 
     /// True when an utterance keeps one id for its whole life, and grows in
@@ -495,8 +606,15 @@ protocol MeetingApp {
     /// line as it is revised, so a shorter version of text already on screen
     /// is assumed to be the same sentence caught mid-edit. Where ids are
     /// stable that assumption is wrong, and saying the same short thing twice
-    /// ("Yeah.") loses the second one.
+    /// ("Yeah.") loses the second one. Apps whose ids are stable only for some
+    /// entries override hasStableIdentity instead.
     var captionIDsAreStable: Bool { get }
+
+    /// Whether one specific caption id names an immutable utterance — one
+    /// that can only ever be that sentence, spoken once. Stable ids bypass
+    /// the content-based deduplication below, which exists precisely because
+    /// unstable apps re-render finished lines under fresh ids.
+    func hasStableIdentity(_ id: String) -> Bool
 
     /// True when the caption surface is only present while someone is
     /// speaking. Its absence then says nothing about whether captions are
@@ -508,6 +626,12 @@ protocol MeetingApp {
     /// woken before anything can be read. Native apps must NOT be poked this
     /// way: AXEnhancedUserInterface triggers window-resize bugs in AppKit.
     var rendersWebContent: Bool { get }
+
+    /// Whether the tree can be searched at all right now. Web views ship a
+    /// hollow shell that wakes into DOM ids; native apps are readable as soon
+    /// as they answer with children. Kept app-specific because "readable"
+    /// means something different per renderer.
+    func treeIsReadable(_ app: AXUIElement) -> Bool
 }
 
 extension MeetingApp {
@@ -518,12 +642,20 @@ extension MeetingApp {
     var captionsSurfaceIsTransient: Bool { false }
     // Assume the pessimistic case: an app that re-renders finished lines.
     var captionIDsAreStable: Bool { false }
+    func hasStableIdentity(_ id: String) -> Bool { captionIDsAreStable }
     // Most apps don't say how long the call has been going.
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
     var reportsMeetingClock: Bool { false }
     var captionPressToggles: Bool { false }
     // Assume native AppKit; only opt in to the wake where it is needed.
     var rendersWebContent: Bool { false }
+    func treeIsReadable(_ app: AXUIElement) -> Bool {
+        rendersWebContent ? webTreeAwake(app) : !axChildren(app).isEmpty
+    }
+    // Chat is optional; most apps don't expose it to us yet.
+    func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
+    func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
+    func resetCaptureState() {}
 }
 
 func windowTitle(containing element: AXUIElement) -> String? {
@@ -543,16 +675,114 @@ func firstWindowTitle(_ app: AXUIElement) -> String {
     return windows.map { axString($0, kAXTitleAttribute) }.first { !$0.isEmpty } ?? ""
 }
 
-func processID(matching pattern: String) -> pid_t? {
+func queryProcess(matching pattern: String) -> ProcessQuery {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
     process.arguments = ["-f", pattern]
     let pipe = Pipe()
     process.standardOutput = pipe
-    guard (try? process.run()) != nil else { return nil }
+    do {
+        try process.run()
+    } catch {
+        return .failed("cannot run pgrep: \(error.localizedDescription)")
+    }
     process.waitUntilExit()
-    let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    return output.split(separator: "\n").first.flatMap { pid_t($0) }
+    switch process.terminationStatus {
+    case 0: break
+    case 1: return .notRunning
+    default: return .failed("pgrep exited \(process.terminationStatus)")
+    }
+    // Exit 0 with unusable output is pgrep misbehaving, not proof the app is
+    // gone — treating it as notRunning would end an active meeting.
+    guard let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
+          let pid = output.split(separator: "\n").first.flatMap({ pid_t($0) }) else {
+        return .failed("pgrep produced no usable pid")
+    }
+    return .running(pid)
+}
+
+enum ProcessQuery {
+    case running(pid_t)
+    /// pgrep confirmed no matching process (exit 1) — and only that.
+    case notRunning
+    /// The lookup itself failed (launch error, nonzero exit, unusable output);
+    /// this says nothing about whether the app is running. Carries the reason.
+    case failed(String)
+}
+
+var lastProcessLookupNote = ""
+var lastProcessLookupAt = Date.distantPast
+
+/// Process lookups failing is worth knowing even under --quiet, but not once
+/// per poll.
+func noteProcessLookupFailure(_ message: String) {
+    let now = Date()
+    guard !(message == lastProcessLookupNote && now.timeIntervalSince(lastProcessLookupAt) < 60) else { return }
+    lastProcessLookupNote = message
+    lastProcessLookupAt = now
+    status(message)
+}
+
+/// True once a Chromium/WebKit tree is serving real content (DOM ids), as
+/// opposed to the hollow shell it starts with.
+func webTreeAwake(_ app: AXUIElement) -> Bool {
+    findElement(from: app, where: { !axDomID($0).isEmpty }) != nil
+}
+
+/// Chromium keeps its accessibility tree switched off until a client asks for
+/// it, so a fresh launch is a hollow window: ~229 nodes, no DOM ids, no
+/// captions. Two attributes turn it on, and which one applies depends on how
+/// the app is built:
+///
+///   AXManualAccessibility   Electron's documented opt-in (Slack, VS Code).
+///   AXEnhancedUserInterface Chromium's own switch, which is what Teams 2
+///                           needs — it is Edge WebView2, not Electron
+///                           (see the EdgeBrowserFrameViewMac DOM class).
+///
+/// Both report failure on Teams (attributeUnsupported / notImplemented) yet
+/// the tree still populates within a second, because Chromium activates on the
+/// attempt rather than on a successful set. So ignore the return codes and
+/// check whether DOM ids showed up instead.
+func pokeWebTree(_ app: AXUIElement) {
+    AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+    AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+}
+
+/// A conferencing app we are currently watching.
+struct Attachment {
+    let meetingApp: MeetingApp
+    let pid: pid_t
+    let element: AXUIElement
+}
+
+/// Wakes the accessibility trees of web-view apps and tracks readability.
+/// Detection runs through here because the wake has to precede the anchor
+/// search: a freshly launched Teams, Slack, or Meet exposes a hollow tree, and
+/// the controls that say a call is happening only appear once it fills in.
+struct TreeWaker {
+    let quiet: Bool
+    private var nextAttempt: [pid_t: Date] = [:]
+    private var attempts: [pid_t: Int] = [:]
+
+    init(quiet: Bool) { self.quiet = quiet }
+
+    /// True when the app's tree can be searched for a meeting. Web-content
+    /// apps are poked (rate-limited) until they say they are readable; native
+    /// apps are never poked, so unreadable simply stays unreadable.
+    mutating func ensureReadable(_ attachment: Attachment, now: Date) -> Bool {
+        let app = attachment.element
+        if attachment.meetingApp.treeIsReadable(app) { return true }
+        guard attachment.meetingApp.rendersWebContent else { return false }
+        guard now >= (nextAttempt[attachment.pid] ?? .distantPast) else { return false }
+        nextAttempt[attachment.pid] = now.addingTimeInterval(5)
+        let attempt = (attempts[attachment.pid] ?? 0) + 1
+        attempts[attachment.pid] = attempt
+        pokeWebTree(app)
+        if !quiet, attempt <= 3 {
+            status("asked \(attachment.meetingApp.displayName) to expose its accessibility tree (attempt \(attempt))")
+        }
+        return false
+    }
 }
 
 // MARK: - Microsoft Teams
@@ -620,15 +850,7 @@ struct TeamsApp: MeetingApp {
         return Self.parseClock(axString(clock, kAXTitleAttribute))
     }
 
-    private static func parseClock(_ raw: String) -> TimeInterval? {
-        let digits = raw.split(whereSeparator: { !$0.isNumber && $0 != ":" }).first { $0.contains(":") } ?? ""
-        let parts = digits.split(separator: ":").compactMap { Int($0) }
-        switch parts.count {
-        case 2: return TimeInterval(parts[0] * 60 + parts[1])
-        case 3: return TimeInterval(parts[0] * 3600 + parts[1] * 60 + parts[2])
-        default: return nil
-        }
-    }
+    private static func parseClock(_ raw: String) -> TimeInterval? { parseMeetingClock(raw) }
 
     func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String {
         var title = ""
@@ -705,11 +927,11 @@ struct TeamsApp: MeetingApp {
     }
 }
 
-// MARK: - Zoom
+// MARK: - Slack
 
-/// Zoom is a native app, so there are no DOM ids, but it labels its controls
-/// with AXIdentifier (`leave`, `captions`, `chat`) and its caption list with a
-/// description, which serve the same purpose.
+// Slack is Electron: its tree starts switched off until woken, and its
+// controls then carry DOM ids ("captions" tab) or AXIdentifier-style labels;
+// its caption overlay is found by class list. All serve as anchors.
 final class SlackApp: MeetingApp {
     let id = "slack"
     let displayName = "Slack"
@@ -738,6 +960,10 @@ final class SlackApp: MeetingApp {
     /// rather than read off the tree.
     private var liveSequence = 0
     private var previousLiveText = ""
+    /// Settled events carry no id at all, so they are identified by position in
+    /// the huddle's whole conversation (see SegmentHistory) — hashing the text
+    /// would collapse a repeated phrase into one utterance.
+    private var history = SegmentHistory()
 
     /// A huddle gets its own window, and the Leave button only exists while
     /// one is up.
@@ -804,9 +1030,9 @@ final class SlackApp: MeetingApp {
     /// The list is ordered oldest to newest and holds about five events, and
     /// Slack marks every settled one `fade_out`. So at most one event \u2014 the
     /// last \u2014 is still being spoken, and it is the only one that can change.
-    /// Settled events are therefore keyed by their content, which is now
-    /// fixed, and the live one keeps a single synthetic id across all its
-    /// revisions so it lands as one utterance.
+    /// Settled events therefore take positional ids (see SegmentHistory), and
+    /// the live one keeps a single synthetic id across all its revisions so it
+    /// lands as one utterance.
     func captionEntries(in container: AXUIElement) -> [CaptionEntry] {
         var settled: [(speaker: String, text: String)] = []
         var live: (speaker: String, text: String)?
@@ -843,8 +1069,9 @@ final class SlackApp: MeetingApp {
         // sentence, and the previous one is overwritten before it was ever
         // written out. Reporting both and letting the recorder collapse them
         // loses nothing when that happens.
-        var entries = settled.map {
-            CaptionEntry(id: "settled:\(identity(of: $0.speaker, $0.text))", speaker: $0.speaker, text: $0.text)
+        let base = history.absorb(settled.map { SegmentKey(speaker: $0.speaker, text: $0.text) })
+        var entries = settled.enumerated().map {
+            CaptionEntry(id: "seg:\(base + $0.offset)", speaker: $0.element.speaker, text: $0.element.text)
         }
         if let live {
             previousLiveText = live.text
@@ -855,9 +1082,18 @@ final class SlackApp: MeetingApp {
         return entries
     }
 
-    private func identity(of speaker: String, _ text: String) -> String {
-        String(UInt(bitPattern: "\(speaker)|\(text)".hashValue), radix: 16)
+    func resetCaptureState() {
+        liveSequence = 0
+        previousLiveText = ""
+        history.reset()
     }
+
+    // Settled events carry positional seg: ids that name one specific utterance
+    // for life, so they must bypass the content dedup that guards against
+    // re-rendering — otherwise saying the same short thing twice in thirty
+    // seconds loses the second one. Only the synthetic live: id, which is
+    // reused across revisions, needs that protection.
+    func hasStableIdentity(_ id: String) -> Bool { id.hasPrefix("seg:") }
 
     func captionsPanelOpen(_ app: AXUIElement) -> Bool {
         captionsContainer(app) != nil
@@ -877,11 +1113,13 @@ final class SlackApp: MeetingApp {
         else { return .unreachable }
         return .pressed
     }
-
-    func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
-    func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
 }
 
+// MARK: - Zoom
+
+/// Zoom is a native app, so there are no DOM ids, but it labels its controls
+/// with AXIdentifier (`leave`, `captions`, `chat`) and its caption list with a
+/// description, which serve the same purpose.
 struct ZoomApp: MeetingApp {
     let id = "zoom"
     let displayName = "Zoom"
@@ -917,13 +1155,7 @@ struct ZoomApp: MeetingApp {
         guard let clock = findElement(from: app, where: {
             axDescription($0).hasPrefix("My connected time is")
         }) else { return nil }
-        let digits = axDescription(clock).split(separator: " ").last ?? ""
-        let parts = digits.split(separator: ":").compactMap { Int($0) }
-        switch parts.count {
-        case 2: return TimeInterval(parts[0] * 60 + parts[1])
-        case 3: return TimeInterval(parts[0] * 3600 + parts[1] * 60 + parts[2])
-        default: return nil
-        }
+        return parseMeetingClock(axDescription(clock))
     }
 
     /// Rows are AXRow > AXCell > [speaker, text]. Zoom hands out no ids, but
@@ -1005,10 +1237,8 @@ struct ZoomApp: MeetingApp {
         return press(item) ? .pressed : .unreachable // pressing an item closes the overflow
     }
 
-    // Zoom's chat panel is a separate surface that has to be open to read; not
-    // wired up yet, so chat is simply skipped.
-    func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
-    func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
+    // Chat is skipped via the MeetingApp defaults: Zoom's chat panel is a
+    // separate surface that has to be open to read; not wired up yet.
 
     // Rows accumulate rather than being cleared, so finalize on being pushed
     // up by a newer row, and give the newest row a few seconds to settle.
@@ -1055,11 +1285,11 @@ final class MeetApp: MeetingApp {
     private let captionsOnLabel = "Turn off captions"
     private let captionsOffLabel = "Turn on captions"
 
-    /// Every caption segment reported so far, in order, as "speaker\u{1}text".
-    /// Position in this list is the identity: Meet exposes no DOM ids, and the
-    /// text repeats often enough that hashing it would merge separate
-    /// utterances - a single "Yeah." said twice was in the first capture.
-    private var history: [String] = []
+    /// Every caption segment reported so far, tracked by position in the whole
+    /// conversation (see SegmentHistory). Meet exposes no DOM ids, and the text
+    /// repeats often enough that hashing it would merge separate utterances —
+    /// a single "Yeah." said twice was in the first capture.
+    private var history = SegmentHistory()
 
     func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
         findElement(from: app) { axDescription($0) == leaveDescription }
@@ -1121,34 +1351,13 @@ final class MeetApp: MeetingApp {
 
         // All but the last are settled. Fold them into the history, which is
         // what absolute positions are counted against.
-        let settled = visible.dropLast().map { key($0.speaker, $0.text) }
-        absorb(settled)
-
-        // The newest segment has no position yet - it is still being spoken
-        // and its text will change - so it takes the next one.
-        let base = history.count - settled.count
+        let base = history.absorb(visible.dropLast().map { SegmentKey(speaker: $0.speaker, text: $0.text) })
         return visible.enumerated().map { offset, entry in
             CaptionEntry(id: "seg:\(base + offset)", speaker: entry.speaker, text: entry.text)
         }
     }
 
-    /// Extend the history with segments not already in it. Meet appends, so
-    /// normally the visible settled segments are its tail and there is at most
-    /// one new one. If Meet ever drops old segments off the front, the visible
-    /// list stops being a tail of the history: re-anchor on the longest
-    /// overlap instead, so positions keep counting up rather than restarting
-    /// and rewriting the whole conversation.
-    private func absorb(_ settled: [String]) {
-        guard !settled.isEmpty else { return }
-        if history.isEmpty { history = settled; return }
-        for overlap in stride(from: min(history.count, settled.count), through: 0, by: -1) {
-            guard Array(history.suffix(overlap)) == Array(settled.prefix(overlap)) else { continue }
-            history.append(contentsOf: settled.dropFirst(overlap))
-            return
-        }
-    }
-
-    private func key(_ speaker: String, _ text: String) -> String { "\(speaker)\u{1}\(text)" }
+    func resetCaptureState() { history.reset() }
 
     func meetingElapsed(_ app: AXUIElement) -> TimeInterval? { nil }
     // Meet's chat is a side panel that has to be open to exist; not wired up.
@@ -1181,6 +1390,10 @@ final class Session {
     private var chatBaselineDone: Bool
     private var captionAttempts = 0
     private var warnedCaptionsUnreachable = false
+    /// finish() must be idempotent: it runs both on leave detection and on exit,
+    /// and running twice would double-flush and double-report.
+    private var finished = false
+    private var lastPublishWarning = Date.distantPast
     private var nextCaptionCheck = Date.distantPast
     private var sawCaptions = false
     /// Recently written utterances, to catch an app re-rendering a finished one.
@@ -1190,8 +1403,8 @@ final class Session {
     private var wakeAttempts = 0
     private var nextWake = Date.distantPast
     private var treePopulated = false
-    /// What `[HH:MM:SS]` counts from: the start of the meeting once the app
-    /// tells us, otherwise the moment we attached.
+    /// What `[HH:MM:SS]` counts from: the app's clock (connection time) once
+    /// it tells us, otherwise the moment we attached.
     private var timelineStart: Date
     private var timelineResolved = false
     private var nextTimelineCheck = Date.distantPast
@@ -1203,6 +1416,8 @@ final class Session {
         self.title = title
         self.timelineStart = Date()
         chatBaselineDone = options.includeChatBacklog
+        // Apps are singletons; drop any caption bookkeeping a previous meeting left.
+        meetingApp.resetCaptureState()
     }
 
     var wroteAnything: Bool { recorder != nil }
@@ -1211,16 +1426,26 @@ final class Session {
     /// Files are created on first write, so a silent meeting leaves no litter.
     private func recorderForWriting() -> Recorder {
         if let recorder { return recorder }
-        var created = Recorder(options: options, app: meetingApp.id, meeting: title, startedAt: startedAt)
-        created.timelineStart = timelineStart
-        created.countsFromMeetingStart = meetingApp.reportsMeetingClock
+        // Whatever the timeline looks like now is what the file gets: the header
+        // documents it, and changing it later would rewrite history (see resolveTimeline).
+        let mode: TimestampMode
+        if timelineResolved {
+            mode = .elapsed(from: timelineStart)
+        } else if meetingApp.reportsMeetingClock {
+            mode = .elapsed(from: startedAt)
+        } else {
+            mode = .timeOfDay
+        }
+        let created = Recorder(
+            options: options, app: meetingApp.id, meeting: title, startedAt: startedAt,
+            mode: mode)
         var metadata: [String: Any] = [
             "type": "metadata",
             "source": "\(meetingApp.id)-ax",
             "app": meetingApp.displayName,
             "meeting": title,
             "recorded_at": Recorder.isoFormatter.string(from: startedAt),
-            "timestamps": created.countsFromMeetingStart ? "elapsed" : "time-of-day"
+            "timestamps": timelineResolved || meetingApp.reportsMeetingClock ? "elapsed" : "time-of-day"
         ]
         if timelineResolved {
             metadata["meeting_started_at"] = Recorder.isoFormatter.string(from: timelineStart)
@@ -1231,8 +1456,8 @@ final class Session {
                       "recording started \(Recorder.isoFormatter.string(from: startedAt))"]
         if timelineResolved {
             header.append("meeting started   \(Recorder.isoFormatter.string(from: timelineStart))")
-            header.append("[hh:mm:ss] counts from the start of the meeting")
-        } else if created.countsFromMeetingStart {
+            header.append("[hh:mm:ss] counts from the app's connection clock")
+        } else if meetingApp.reportsMeetingClock {
             header.append("[hh:mm:ss] counts from when recording started")
         } else {
             header.append("[hh:mm:ss] is the time of day")
@@ -1240,30 +1465,22 @@ final class Session {
         created.writeHeader(header)
         recorder = created
         let pointer = options.stateDirectory + "/current"
-        try? created.textURL.path.write(toFile: pointer, atomically: true, encoding: .utf8)
+        do {
+            try created.textURL.path.write(toFile: pointer, atomically: true, encoding: .utf8)
+        } catch {
+            // Without this pointer --follow has nothing to tail and silently waits forever.
+            status("cannot update \(pointer): \(error.localizedDescription)")
+        }
         if !options.quiet {
             status("recording \"\(title)\"\n  jsonl: \(created.jsonlURL.path)\n  text:  \(created.textURL.path)")
         }
         return created
     }
 
-    /// Chromium keeps its accessibility tree switched off until a client asks
-    /// for it, so a fresh Teams launch is a hollow window: ~229 nodes, no DOM
-    /// ids, no captions. Two attributes turn it on, and which one applies
-    /// depends on how the app is built:
-    ///
-    ///   AXManualAccessibility   Electron's documented opt-in (Slack, VS Code).
-    ///   AXEnhancedUserInterface Chromium's own switch, which is what Teams 2
-    ///                           needs — it is Edge WebView2, not Electron
-    ///                           (see the EdgeBrowserFrameViewMac DOM class).
-    ///
-    /// Both report failure on Teams (attributeUnsupported / notImplemented) yet
-    /// the tree still populates within a second, because Chromium activates on
-    /// the attempt rather than on a successful set. So ignore the return codes
-    /// and check whether DOM ids showed up instead.
-    private func wakeTreeIfNeeded(app: AXUIElement, pid: pid_t, now: Date) {
+    /// Both attributes are set by pokeWebTree; see it for how the wake works.
+    private func wakeTreeIfNeeded(app: AXUIElement, now: Date) {
         guard meetingApp.rendersWebContent else { treePopulated = true; return }
-        if findElement(from: app, where: { !axDomID($0).isEmpty }) != nil {
+        if meetingApp.treeIsReadable(app) {
             if !treePopulated, wakeAttempts > 0, !options.quiet {
                 status("\(meetingApp.displayName) exposed its accessibility tree")
             }
@@ -1273,37 +1490,45 @@ final class Session {
         guard now >= nextWake else { return }
         nextWake = now.addingTimeInterval(5)
         wakeAttempts += 1
-        AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        pokeWebTree(app)
         if !options.quiet, wakeAttempts <= 3 {
             status("asked \(meetingApp.displayName) to expose its accessibility tree (attempt \(wakeAttempts))")
         }
     }
 
     /// Ask the app how long the call has been running, so lines are numbered
-    /// from the start of the meeting even if we joined it late. The clock is
+    /// from its clock rather than from when we joined, even mid-meeting. The
+    /// clock is
     /// part of the window chrome, which Zoom hides along with its toolbar, so
-    /// keep asking until it answers.
+    /// keep asking until it answers — but only until the first line is written.
+    /// Past that the header already declares what the stamps mean, and moving
+    /// the reference halfway through would make the file contradict itself; such
+    /// a recording simply counts from when recording began.
     private func resolveTimeline(app: AXUIElement, now: Date) {
+        guard recorder == nil else { return }
         guard now >= nextTimelineCheck else { return }
         nextTimelineCheck = now.addingTimeInterval(5)
         guard let elapsed = meetingApp.meetingElapsed(app), elapsed > 0 else { return }
         timelineResolved = true
         timelineStart = now.addingTimeInterval(-elapsed)
-        recorder?.timelineStart = timelineStart
     }
 
     private func emit(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any]) {
         // Lines are appended as they finish but stamped with when they began,
         // so a long sentence can land after a short one that started later and
         // the clock appears to run backwards. Hold the stamp at the high-water
-        // mark, keeping the real start alongside it when they differ.
+        // mark, keeping the real start alongside it when they differ. The mark
+        // only moves once the line is actually written — a failed write must
+        // not clamp later lines against an event that exists in neither file.
         let stamp = max(date, lastStamp ?? date)
-        lastStamp = stamp
         var extra = extra
         if stamp != date { extra["started_at"] = Recorder.isoFormatter.string(from: date) }
-        let line = recorderForWriting().record(kind: kind, speaker: speaker, body: body, at: stamp, extra: extra)
-        live.permanent(line)
+        // A nil here means the jsonl half failed; record() then skips the text
+        // half too, so the pair of files never disagrees about what happened.
+        if let line = recorderForWriting().record(kind: kind, speaker: speaker, body: body, at: stamp, extra: extra) {
+            lastStamp = stamp
+            live.permanent(line)
+        }
     }
 
     /// Matches how the recorder stamps finished lines, so the live region and
@@ -1315,7 +1540,8 @@ final class Session {
     }
 
     func tick(app: AXUIElement, pid: pid_t, now: Date) {
-        wakeTreeIfNeeded(app: app, pid: pid, now: now)
+        guard !finished else { return }
+        wakeTreeIfNeeded(app: app, now: now)
         resolveTimeline(app: app, now: now)
         let needsCaptions = options.captureCaptions && captionsContainer == nil
         let needsChat = options.captureChat && chatContainer == nil
@@ -1425,9 +1651,12 @@ final class Session {
         }
         if let idle = meetingApp.idleFinalizeSeconds {
             let newest = entries.last?.id
-            for id in captionOrder where id != newest {
+            for id in captionOrder {
+                // The newest utterance may simply be paused mid-speech, so it
+                // waits twice as long before idle finalization calls it done.
+                let threshold = id == newest ? idle * 2 : idle
                 guard let utterance = activeCaptions[id],
-                      now.timeIntervalSince(utterance.changedAt) > idle else { continue }
+                      now.timeIntervalSince(utterance.changedAt) > threshold else { continue }
                 finalizeCaption(id, at: now)
             }
         }
@@ -1447,7 +1676,15 @@ final class Session {
     /// LiveView's in-place region never appears in launchd.log.
     private func publishLive(_ pending: [String]) {
         let url = URL(fileURLWithPath: options.stateDirectory + "/live")
-        try? pending.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        do {
+            try pending.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            // This runs every poll while broken; say something occasionally,
+            // not once per caption.
+            guard Date().timeIntervalSince(lastPublishWarning) > 30 else { return }
+            lastPublishWarning = Date()
+            status("cannot update \(url.path): \(error.localizedDescription)")
+        }
     }
 
     private func pollChat(now: Date) {
@@ -1477,14 +1714,14 @@ final class Session {
     /// one holding the same (or corrected) text. Without this, the utterance
     /// gets written twice: once when the old node goes, once when the new does.
     private func supersededByActive(_ utterance: Utterance, id: String) -> Bool {
-        guard !meetingApp.captionIDsAreStable else { return false }
+        guard !meetingApp.hasStableIdentity(id) else { return false }
         return activeCaptions.contains { key, other in
             key != id && other.speaker == utterance.speaker && other.text.hasPrefix(utterance.text)
         }
     }
 
-    private func alreadyWritten(_ utterance: Utterance, now: Date) -> Bool {
-        guard !meetingApp.captionIDsAreStable else { return false }
+    private func alreadyWritten(_ utterance: Utterance, id: String, now: Date) -> Bool {
+        guard !meetingApp.hasStableIdentity(id) else { return false }
         return written.contains {
             $0.speaker == utterance.speaker && $0.text == utterance.text
                 && now.timeIntervalSince($0.at) < 30
@@ -1496,7 +1733,7 @@ final class Session {
         captionOrder.removeAll { $0 == id }
         finalized.insert(id)
         guard !utterance.text.isEmpty else { return }
-        guard !supersededByActive(utterance, id: id), !alreadyWritten(utterance, now: date) else { return }
+        guard !supersededByActive(utterance, id: id), !alreadyWritten(utterance, id: id, now: date) else { return }
         emit(
             kind: "caption",
             speaker: utterance.speaker,
@@ -1508,20 +1745,26 @@ final class Session {
         if written.count > 40 { written.removeFirst(written.count - 40) }
     }
 
-    /// Flush in-flight captions and close out the transcript.
+    /// Flush in-flight captions and close out the transcript. Safe to call more
+    /// than once (leave detection and process exit both do).
     func finish(at date: Date) {
+        guard !finished else { return }
+        finished = true
         live.erase()
         for id in captionOrder { finalizeCaption(id, at: date) }
-        try? FileManager.default.removeItem(atPath: options.stateDirectory + "/live")
-        try? FileManager.default.removeItem(atPath: options.stateDirectory + "/current")
+        removeStateFile(options.stateDirectory + "/live")
+        removeStateFile(options.stateDirectory + "/current")
         guard let writer = recorder else { return }
+        // A duration is time spent recording — not whatever the transcript
+        // stamps happen to count from (Slack/Meet stamps are the time of day).
+        let duration = elapsedString(from: startedAt, to: date)
         writer.writeJSON([
             "type": "metadata",
             "event": "stopped",
             "stopped_at": Recorder.isoFormatter.string(from: date),
-            "duration": writer.elapsed(date)
+            "duration": duration
         ])
-        if !options.quiet { status("finished \"\(title)\" after \(writer.elapsed(date))") }
+        if !options.quiet { status("finished \"\(title)\" after \(duration)") }
     }
 }
 
@@ -1550,6 +1793,59 @@ func newestTranscript(in directory: String) -> URL? {
     return entries.filter { $0.pathExtension == "txt" }.max { modified($0) < modified($1) }
 }
 
+/// What became of reading a state/transcript file. `.absent` is normal while
+/// idle — the pointer only exists during a meeting; swallowing anything else
+/// would make --follow sit silent through real I/O trouble.
+enum FileRead {
+    case data(String)
+    case absent
+    case failed(Error)
+}
+
+func readFile(_ path: String) -> FileRead {
+    do { return .data(try String(contentsOfFile: path, encoding: .utf8)) }
+    catch let error as NSError
+    where error.domain == NSCocoaErrorDomain
+        && [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code) {
+        return .absent
+    }
+    catch { return .failed(error) }
+}
+
+/// Remove a state file, tolerating only its absence; anything else is worth
+/// hearing about, since a stale pointer sends --follow to a dead transcript.
+func removeStateFile(_ path: String) {
+    do { try FileManager.default.removeItem(atPath: path) }
+    catch let error as NSError
+    where error.domain == NSCocoaErrorDomain
+        && [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code) {}
+    catch { status("cannot remove \(path): \(error.localizedDescription)") }
+}
+
+/// Append whatever appeared past `offset` in a growing file to stdout, and
+/// return the offset to resume from. Seek and read failures are reported
+/// through `warn` and leave the offset untouched — the caller must not skip
+/// ahead over bytes it never printed.
+func drainFileTail(_ path: String, from offset: UInt64, into sink: FileHandle,
+                   warn: (String) -> Void) -> UInt64 {
+    guard FileManager.default.fileExists(atPath: path) else { return offset }
+    guard let handle = FileHandle(forReadingAtPath: path) else {
+        warn("cannot open \(path)")
+        return offset
+    }
+    defer { try? handle.close() } // closing is inconsequential; reading is not
+    do {
+        try handle.seek(toOffset: offset)
+    } catch {
+        warn("cannot seek in \(path): \(error.localizedDescription)")
+        return offset
+    }
+    let data = handle.readDataToEndOfFile()
+    if data.isEmpty { return offset }
+    sink.write(data)
+    return offset + UInt64(data.count)
+}
+
 /// Tail the meeting the daemon is recording. Prefers the `current` pointer
 /// (set when the first line is written) so we never reopen last week's Zoom
 /// file. In-progress speech lives in `live` because the daemon is not a tty
@@ -1570,6 +1866,17 @@ func followTranscripts(_ options: Options) {
         logOffset = size
     }
     if !options.quiet { status("following \(options.directory)") }
+    var lastWarned = ""
+    var lastWarnedAt = Date.distantPast
+    // Real I/O trouble (permissions, a full disk) deserves a mention, but not
+    // one per poll.
+    func warnThrottled(_ message: String) {
+        let now = Date()
+        guard !(message == lastWarned && now.timeIntervalSince(lastWarnedAt) < 30) else { return }
+        lastWarned = message
+        lastWarnedAt = now
+        status(message)
+    }
 
     func eraseLive() {
         guard liveRows > 0, isatty(STDOUT_FILENO) == 1 else { liveRows = 0; return }
@@ -1583,7 +1890,8 @@ func followTranscripts(_ options: Options) {
         let now = Date()
         if now.timeIntervalSince(lastScan) > 0.4 {
             lastScan = now
-            if let path = try? String(contentsOfFile: pointer, encoding: .utf8) {
+            switch readFile(pointer) {
+            case .data(let path):
                 let url = URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
                 if url != current {
                     eraseLive()
@@ -1591,37 +1899,44 @@ func followTranscripts(_ options: Options) {
                     offset = 0
                     if !options.quiet { status(url.lastPathComponent) }
                 }
-            } else if current != nil {
-                eraseLive()
-                current = nil
-                offset = 0
-                lastLive = ""
-                if !options.quiet { status("waiting for the next meeting") }
-            }
-            if let handle = try? FileHandle(forReadingFrom: logURL) {
-                try? handle.seek(toOffset: logOffset)
-                let data = handle.readDataToEndOfFile()
-                if !data.isEmpty {
+            case .absent:
+                if current != nil {
                     eraseLive()
+                    current = nil
+                    offset = 0
                     lastLive = ""
-                    stdout.write(data)
-                    logOffset += UInt64(data.count)
+                    if !options.quiet { status("waiting for the next meeting") }
                 }
-                try? handle.close()
+            case .failed(let error):
+                warnThrottled("cannot read active-transcript pointer \(pointer): \(error.localizedDescription)")
             }
-        }
-        if let current, let handle = try? FileHandle(forReadingFrom: current) {
-            try? handle.seek(toOffset: offset)
-            let data = handle.readDataToEndOfFile()
-            if !data.isEmpty {
+            let before = logOffset
+            logOffset = drainFileTail(logURL.path, from: logOffset, into: stdout, warn: warnThrottled)
+            if logOffset != before {
                 eraseLive()
-                stdout.write(data)
-                offset += UInt64(data.count)
-                lastLive = "" // redraw the live region under the new permanent lines
+                lastLive = ""
             }
-            try? handle.close()
         }
-        let liveText = (try? String(contentsOfFile: livePath, encoding: .utf8)) ?? ""
+        if let current {
+            if FileManager.default.fileExists(atPath: current.path) {
+                let before = offset
+                offset = drainFileTail(current.path, from: offset, into: stdout, warn: warnThrottled)
+                if offset != before {
+                    lastLive = "" // redraw the live region under the new permanent lines
+                }
+            } else {
+                warnThrottled("transcript \(current.path) has vanished")
+            }
+        }
+        let liveText: String
+        switch readFile(livePath) {
+        case .data(let text): liveText = text
+        case .absent: liveText = ""
+        case .failed(let error):
+            // Keep what is already drawn rather than flapping on every read.
+            liveText = lastLive
+            warnThrottled("cannot read \(livePath): \(error.localizedDescription)")
+        }
         if liveText != lastLive {
             eraseLive()
             lastLive = liveText
@@ -1649,9 +1964,14 @@ func followTranscripts(_ options: Options) {
     }
 }
 
+// The flag lives above the entry-point marker so it survives tests/run.sh's
+// strip; followTranscripts polls it.
+var stopRequested = false
+
 // MARK: - Main
 
-var stopRequested = false
+// Everything from here down is the daemon's entry point; tests/run.sh strips
+// this section so the rest of the file compiles as a plain module.
 signal(SIGINT) { _ in stopRequested = true }
 signal(SIGTERM) { _ in stopRequested = true }
 
@@ -1680,13 +2000,6 @@ if lockDescriptor == nil {
     exit(0)
 }
 
-/// A conferencing app we are currently watching.
-struct Attachment {
-    let meetingApp: MeetingApp
-    let pid: pid_t
-    let element: AXUIElement
-}
-
 let wanted: [MeetingApp] = {
     guard let name = options.app else { return supportedApps }
     guard let match = supportedApps.first(where: { $0.id == name }) else {
@@ -1706,19 +2019,45 @@ func attach(_ meetingApp: MeetingApp, pid: pid_t) -> Attachment {
 /// Every wanted app that is currently running.
 func runningApps() -> [Attachment] {
     wanted.compactMap { meetingApp in
-        guard let pid = options.pid ?? processID(matching: meetingApp.processPattern) else { return nil }
-        return attach(meetingApp, pid: pid)
+        let pid: pid_t?
+        if let forced = options.pid {
+            pid = forced
+        } else {
+            switch queryProcess(matching: meetingApp.processPattern) {
+            case .running(let found):
+                pid = found
+            case .notRunning:
+                // Confirmed gone; nothing to attach to.
+                pid = nil
+            case .failed(let why):
+                noteProcessLookupFailure("cannot look up \(meetingApp.displayName): \(why)")
+                pid = nil
+            }
+        }
+        return pid.map { attach(meetingApp, pid: $0) }
     }
 }
 
 var attachment: Attachment?
 var session: Session?
+var waker = TreeWaker(quiet: options.quiet)
 var leaveMissingSince: Date?
 var treeUnreadableSince: Date?
 
 if options.once {
-    guard let found = runningApps().first(where: { !axChildren($0.element).isEmpty }) else {
-        fail("no supported meeting app is running (\(wanted.map(\.displayName).joined(separator: ", ")))")
+    // Attach to a meeting, not merely to a running app: an idle Teams must not
+    // shadow an active Zoom. Web-view apps get woken here too, since a freshly
+    // launched one looks like nothing at all until its tree fills in.
+    var found: Attachment?
+    for _ in 0..<20 {
+        let now = Date()
+        found = runningApps().filter { waker.ensureReadable($0, now: now) }
+            .first { $0.meetingApp.meetingAnchor($0.element) != nil }
+        if found != nil { break }
+        usleep(500_000)
+    }
+    guard let found else {
+        fail("no active meeting in \(wanted.map(\.displayName).joined(separator: ", "))")
     }
     attachment = found
     let anchor = found.meetingApp.meetingAnchor(found.element)
@@ -1735,6 +2074,7 @@ if options.once {
 var lastMeetingCheck = Date.distantPast
 var lastUnreadableWarning = Date.distantPast
 var lastWaitingWarning = Date.distantPast
+var lastProcessWarning = Date.distantPast
 
 while !stopRequested {
     let now = Date()
@@ -1750,7 +2090,7 @@ while !stopRequested {
             var unreadable: [String] = []
             var waiting: [String] = []
             for candidate in runningApps() {
-                guard !axChildren(candidate.element).isEmpty else {
+                guard waker.ensureReadable(candidate, now: now) else {
                     unreadable.append(candidate.meetingApp.displayName)
                     continue
                 }
@@ -1789,12 +2129,30 @@ while !stopRequested {
                 treeUnreadableSince = nil
             }
 
-            let livePID = options.pid ?? processID(matching: current.meetingApp.processPattern)
-            if livePID != current.pid {
-                // Quitting the app ends the meeting as surely as leaving does,
-                // and a new pid means a different instance entirely.
-                endSession("\(current.meetingApp.displayName) \(livePID == nil ? "quit" : "restarted")")
-            } else if axChildren(current.element).isEmpty {
+            if let forced = options.pid {
+                if forced != current.pid {
+                    endSession("\(current.meetingApp.displayName) restarted")
+                }
+            } else {
+                switch queryProcess(matching: current.meetingApp.processPattern) {
+                case .running(let livePID):
+                    // A new pid means a different instance entirely.
+                    if livePID != current.pid {
+                        endSession("\(current.meetingApp.displayName) restarted")
+                    }
+                case .notRunning:
+                    // Quitting the app ends the meeting as surely as leaving does.
+                    endSession("\(current.meetingApp.displayName) quit")
+                case .failed:
+                    // The lookup itself failed; that says nothing about the app,
+                    // and ending the session here would truncate an active meeting.
+                    if now.timeIntervalSince(lastProcessWarning) > 60 {
+                        lastProcessWarning = now
+                        status("cannot tell whether \(current.meetingApp.displayName) is still running; assuming it is")
+                    }
+                }
+            }
+            if session != nil && axChildren(current.element).isEmpty {
                 // A failed read is not evidence that the call ended — but if it
                 // never recovers we are stuck watching a tree that will never
                 // answer, and would miss every later meeting.
@@ -1832,3 +2190,5 @@ while !stopRequested {
 }
 
 session?.finish(at: Date())
+
+

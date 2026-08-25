@@ -98,7 +98,7 @@ write a second transcript of the same meeting.
 | `--app <name>` | Only watch one app (`teams`, `zoom`, `slack`, `meet`) |
 | `--auto-captions` | Turn live captions on when a meeting starts |
 | `--dir <path>` | Output directory |
-| `--follow`, `--watch` | Watch the newest transcript, never record |
+| `--follow`, `--watch` | Watch whatever the running daemon is recording, never record |
 | `--interval <ms>` | Poll interval during a meeting (default 250) |
 | `--no-captions`, `--no-chat` | Skip one of the two sources |
 | `--chat-backlog` | Also record chat that was already on screen |
@@ -112,8 +112,10 @@ a meeting without them. Zoom exposes a pressable captions button, so it just
 presses it. Teams doesn't, so its shortcut (⇧⌘A) goes straight to the process
 with `CGEvent.postToPid`, which bypasses global event taps — a Hammerspoon or
 Karabiner remap of that shortcut won't intercept it. Slack has a captions tab
-in the huddle's side panel, pressed only if no captions are running at all, so
-a panel you chose to close stays closed. Meet's button says which way it goes
+in the huddle's side panel, pressed only if no captions are anywhere on screen,
+so a huddle already captioning is left alone — but the press does switch the
+side panel to captions, which is worth knowing if you were reading another tab
+in it. Meet's button says which way it goes
 ("Turn on captions" against "Turn off captions"), so it is never a guess.
 
 Zoom takes two extra steps. Unless you've pinned it, its captions control lives
@@ -134,8 +136,9 @@ again, since every pause would otherwise look like captions being switched off.
 
 ## Output
 
-Transcripts land in `~/.local/share/meeting-capture`, one pair per meeting,
-named for when it started, where it happened, and what it was called:
+Transcripts land in `~/.local/share/meeting-capture`, one pair per meeting.
+Filenames carry when capture began (not when the meeting did), where it
+happened, and what it was called:
 
 ```
 20260824_140510-teams-weekly-sync.txt
@@ -151,7 +154,7 @@ still readable years later on its own:
 # Weekly Sync (Microsoft Teams)
 # recording started 2026-08-24T14:05:10-05:00
 # meeting started   2026-08-24T13:28:15-05:00
-# [hh:mm:ss] counts from the start of the meeting
+# [hh:mm:ss] counts from the app's connection clock
 
 [00:37:33] Grace Hopper: Mic check 1-2.
 ```
@@ -162,20 +165,27 @@ lines are stamped with the time of day already, and the header says so.
 
 ```json
 {"type":"metadata","app":"Microsoft Teams","meeting":"Weekly Sync","source":"teams-ax","recorded_at":"2026-08-24T14:05:10-05:00","meeting_started_at":"2026-08-24T13:28:15-05:00","timestamps":"elapsed"}
-{"type":"caption","speaker":"Grace Hopper","text":"Mic check 1-2.","ts":"2026-08-24T14:05:48-05:00","ended_at":"2026-08-24T14:05:53-05:00","elapsed":"00:00:38","node_id":"8046"}
-{"type":"chat","speaker":"Ada Lovelace","text":"here's the dashboard","ts":"2026-08-24T14:06:02-05:00","elapsed":"00:00:52","message_id":"1756061162000"}
-{"type":"metadata","event":"stopped","stopped_at":"2026-08-24T14:05:53-05:00","duration":"00:00:42"}
+{"type":"caption","speaker":"Grace Hopper","text":"Mic check 1-2.","ts":"2026-08-24T14:05:48-05:00","ended_at":"2026-08-24T14:05:53-05:00","elapsed":"00:37:33","node_id":"8046"}
+{"type":"chat","speaker":"Ada Lovelace","text":"here's the dashboard","ts":"2026-08-24T14:06:02-05:00","elapsed":"00:37:47","message_id":"1756061162000"}
+{"type":"metadata","event":"stopped","stopped_at":"2026-08-24T14:06:20-05:00","duration":"00:01:10"}
 ```
 
 Files are created on the first line written, so a meeting nobody speaks in
 leaves nothing behind. Ctrl-C or leaving the meeting flushes whatever was
 mid-sentence.
 
-`elapsed` counts from the start of the meeting, not from when recording began,
-where the app will say how long the call has been running — Zoom keeps a clock
-in its title bar. Attach to a meeting already in progress and the first line
-reads `[00:36:41]` rather than `[00:00:00]`, and `meeting_started_at` records
-what it was measured against.
+`elapsed` counts from the app's own clock (when this participant connected),
+not from when recording began,
+where the app will say how long the call has been running. Zoom keeps such a
+clock in its title bar — though note it reads "My connected time", so it is
+when *you* joined the call rather than when the meeting was convened; Teams'
+call timer behaves likewise. That is still far better than counting from zero:
+attach an hour in and the first line reads `[00:36:41]` instead of
+`[00:00:00]`, with `meeting_started_at` recording what the stamps were
+measured against. The reference is picked once, before the first line is
+written, so a file never changes its story halfway through; if the clock only
+becomes visible after capture has begun writing, the whole file counts from
+when recording began instead.
 
 Slack publishes no such clock, so a huddle is stamped with the time of day
 instead. Counting from zero there would claim the huddle began when the capture
@@ -202,12 +212,18 @@ The daemon polls the accessibility tree of each supported app:
    - **Teams** clears old captions, keeping about three on screen. An utterance
      is done when its node id disappears.
    - **Zoom** appends rows and keeps them, so nothing would ever "disappear". A
-     row is done once a newer row appears beneath it, or once its text has been
-     unchanged for six seconds.
+     row is done once a newer row appears beneath it; the idle timer is the
+     backstop for the newest row (twelve seconds, since a pause mid-speech
+     looks just like silence). Every app with such a timer treats its newest
+     utterance the same way. Note what this does and does not buy: leaving a
+     meeting or stopping the daemon gracefully flushes pending lines via
+     finish(), but a crash or SIGKILL writes nothing — the timer only limits
+     how long the final words would have sat unwritten in the ordinary case.
    - **Slack** overlays about five events on the video tiles and fades them,
      replacing the element on every revision — so one sentence arrives as a
-     succession of elements sharing no id. Faded events are keyed by their
-     content; the one still being spoken is tracked through its revisions.
+     succession of elements sharing no id. Faded events are identified by their
+     position in the huddle's conversation; the one still being spoken is
+     tracked through its revisions.
      The overlay is also absent whenever nobody is talking, which says nothing
      about whether captions are on.
    - **Google Meet** keeps one block per speaker holding a list of sentences,
@@ -232,8 +248,22 @@ prefix, or if it was written in the last thirty seconds.
 ### Adding an app
 
 Implement `MeetingApp` — roughly a dozen small methods over the accessibility
+
 tree — and add it to `supportedApps`. Everything else (sessions, files, the
 terminal view, the daemon) is app-agnostic.
+
+## Tests
+
+The pure logic (clock parsing, timestamps, slugs, wrapping, caption-segment
+identity) has unit tests:
+
+```sh
+tests/run.sh
+```
+
+They compile the daemon with its entry point stripped and drive the rest.
+The accessibility-facing code needs a real meeting to reason about, so it is
+not covered here.
 
 ## Privacy
 
