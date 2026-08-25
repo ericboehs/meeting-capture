@@ -788,6 +788,13 @@ func queryProcess(matching pattern: String) -> ProcessQuery {
     process.arguments = ["-f", pattern]
     let pipe = Pipe()
     process.standardOutput = pipe
+    // Pipe does not reliably release its descriptors on deinit once the
+    // handles have been accessed — without these closes every pgrep call
+    // leaks a pair, and ~2,500 leaked fds broke all lookups live on 2026-08-25.
+    defer {
+        try? pipe.fileHandleForReading.closeFile()
+        try? pipe.fileHandleForWriting.closeFile()
+    }
     do {
         try process.run()
     } catch {
