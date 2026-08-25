@@ -23,29 +23,7 @@ $ meeting-capture
 The last line updates in place as the sentence is spoken, then scrolls up when
 it's final.
 
-**Supported:** Microsoft Teams, Zoom.
-
-## Why the Accessibility API
-
-Every other option is worse:
-
-| Approach | Problem |
-| --- | --- |
-| Microsoft Graph | Post-meeting only, needs recording enabled, no live access |
-| Teams CART captions | Send-only. You can push captions in, not read them out |
-| OCR the caption panel | Slow, lossy, needs the window visible and unobscured |
-| Chrome DevTools protocol | The desktop app opens no debugging port |
-| Audio + Whisper | No speaker names, and you still need the audio |
-
-Both apps label the parts we need. Teams renders its UI in a Chromium WebView,
-so the accessibility tree carries DOM ids and class lists: caption entries are
-`fui-ChatMessageCompact__body` groups holding `[speaker, text]`, chat messages
-carry `message-body-<epoch_ms>` ids. Zoom is native but sets `AXIdentifier` on
-its controls (`leave`, `captions`, `chat`) and describes its caption list as
-`Closed caption subtitles`.
-
-Reading those costs no CPU worth mentioning, works with the window in the
-background, and hands you speaker names for free.
+**Supported:** Microsoft Teams, Zoom, Slack huddles.
 
 ## Install
 
@@ -116,9 +94,10 @@ write a second transcript of the same meeting.
 
 | Flag | Effect |
 | --- | --- |
-| `--app <name>` | Only watch one app (`teams`, `zoom`) |
+| `--app <name>` | Only watch one app (`teams`, `zoom`, `slack`) |
 | `--auto-captions` | Turn live captions on when a meeting starts |
 | `--dir <path>` | Output directory |
+| `--follow`, `--watch` | Watch the newest transcript, never record |
 | `--interval <ms>` | Poll interval during a meeting (default 250) |
 | `--no-captions`, `--no-chat` | Skip one of the two sources |
 | `--chat-backlog` | Also record chat that was already on screen |
@@ -131,7 +110,9 @@ write a second transcript of the same meeting.
 a meeting without them. Zoom exposes a pressable captions button, so it just
 presses it. Teams doesn't, so its shortcut (⇧⌘A) goes straight to the process
 with `CGEvent.postToPid`, which bypasses global event taps — a Hammerspoon or
-Karabiner remap of that shortcut won't intercept it.
+Karabiner remap of that shortcut won't intercept it. Slack has a captions tab
+in the huddle's side panel, pressed only if no captions are running at all, so
+a panel you chose to close stays closed.
 
 Zoom takes two extra steps. Unless you've pinned it, its captions control lives
 in the **More** overflow, so the button gets opened first and put back if the
@@ -145,7 +126,9 @@ works just as well; capture doesn't depend on any of this.
 It checks the captions panel chrome rather than whether captions are visible,
 because apps clear the text after a few seconds of silence, and it stops trying
 after two attempts. An earlier version got this wrong and toggled the panel on
-and off every eight seconds.
+and off every eight seconds. Slack has no such chrome — its captions exist only
+while someone is speaking — so once its overlay has been seen it is never asked
+again, since every pause would otherwise look like captions being switched off.
 
 ## Output
 
@@ -205,11 +188,12 @@ can attribute diarised audio to real names.
 
 The daemon polls the accessibility tree of each supported app:
 
-1. **Is there a meeting?** Both apps show a Leave button only during a call
-   (`hangup-button` in Teams, `AXIdentifier=leave` in Zoom). Its absence for ten
-   consecutive seconds ends the session — the button also disappears briefly
-   during UI transitions, hence the debounce.
-2. **Read the captions**, and decide when an utterance is finished. The two apps
+1. **Is there a meeting?** Each app shows a leave control only during a call
+   (`hangup-button` in Teams, `AXIdentifier=leave` in Zoom, a `Leave Huddle`
+   button in Slack). Its absence for ten consecutive seconds ends the session —
+   the control also disappears briefly during UI transitions, hence the
+   debounce.
+2. **Read the captions**, and decide when an utterance is finished. The apps
    differ here, which is why `MeetingApp` gets a say:
 
    - **Teams** clears old captions, keeping about three on screen. An utterance
@@ -217,9 +201,15 @@ The daemon polls the accessibility tree of each supported app:
    - **Zoom** appends rows and keeps them, so nothing would ever "disappear". A
      row is done once a newer row appears beneath it, or once its text has been
      unchanged for six seconds.
+   - **Slack** overlays about five events on the video tiles and fades them,
+     replacing the element on every revision — so one sentence arrives as a
+     succession of elements sharing no id. Faded events are keyed by their
+     content; the one still being spoken is tracked through its revisions.
+     The overlay is also absent whenever nobody is talking, which says nothing
+     about whether captions are on.
 3. **Read the chat.** In Teams, message ids are epoch milliseconds, which double
    as timestamps; anything already on screen when you join is treated as seen.
-   Zoom chat is not wired up yet.
+   Zoom and Slack chat are not wired up yet.
 
 A finished utterance is often re-rendered under a fresh id, so identical text
 from the same speaker is dropped if an active entry already carries it as a
