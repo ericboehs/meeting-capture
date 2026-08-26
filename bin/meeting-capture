@@ -213,10 +213,56 @@ func axFrame(_ element: AXUIElement) -> (origin: CGPoint, size: CGSize) {
 }
 
 @discardableResult
+func axSetPosition(_ element: AXUIElement, _ point: CGPoint) -> Bool {
+    var point = point
+    guard let value = AXValueCreate(.cgPoint, &point) else { return false }
+    return AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, value) == .success
+}
+
+@discardableResult
 func axSetSize(_ element: AXUIElement, _ size: CGSize) -> Bool {
     var size = size
     guard let value = AXValueCreate(.cgSize, &size) else { return false }
     return AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, value) == .success
+}
+
+/// Every active display, in the global top-left space AX positions use.
+func displayBounds() -> [CGRect] {
+    var count: UInt32 = 0
+    guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+    guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return [] }
+    return ids.prefix(Int(count)).map { CGDisplayBounds($0) }
+}
+
+/// Where to tuck a window so it is out of sight but still open.
+///
+/// It cannot simply be minimized: a minimized window stops receiving updates
+/// entirely. Being covered or offscreen is fine, though — so this hides all
+/// but a small nub of it past the outside edge of the second display (or of
+/// the only display there is), which macOS allows and which keeps it alive.
+///
+/// Which edge is "outside" depends on the arrangement: pushing left is right
+/// for a second display sitting to the left of the primary, but would shove
+/// the window ONTO the primary for one sitting to the right. So both are
+/// tried and the one that spills least onto another display wins.
+///
+/// Pure, so the geometry is testable on a single-monitor machine.
+func tuckOrigin(windowSize: CGSize, displays: [CGRect], showing: CGFloat = 40) -> CGPoint? {
+    // The primary display is the one at the origin of the global space.
+    let secondary = displays.first { $0.origin != .zero }
+    guard let screen = secondary ?? displays.first else { return nil }
+    let others = displays.filter { $0 != screen }
+    let y = screen.maxY - showing // hangs off the bottom edge too
+    let candidates = [
+        CGPoint(x: screen.minX - (windowSize.width - showing), y: y), // off the left
+        CGPoint(x: screen.maxX - showing, y: y),                      // off the right
+    ]
+    func spill(_ origin: CGPoint) -> CGFloat {
+        let rect = CGRect(origin: origin, size: windowSize)
+        return others.reduce(0) { $0 + $1.intersection(rect).size.width * $1.intersection(rect).size.height }
+    }
+    return candidates.min { spill($0) < spill($1) }
 }
 
 /// The window server's layer for a window, or nil when it can't be found (it
@@ -1092,6 +1138,7 @@ final class TeamsApp: MeetingApp {
     private var popOutAttempts = 0
     private var nextPopOutAttempt = Date.distantPast
     private var handledCaptionsWindow = false
+    private var warnedMinimized = false
 
     /// Meeting-only chrome. hangup-button is the obvious one, but Teams'
     /// WebView can take minutes to expose the full toolbar; the call timer
@@ -1246,17 +1293,18 @@ final class TeamsApp: MeetingApp {
     ///
     /// The way out is the captions panel's own window: it goes on rendering
     /// while the meeting window is parked, because caption text does not come
-    /// from that renderer. So pop it out and park it on the second display,
-    /// where nothing covers it. Without --popout-captions, say what is
-    /// happening rather than let the transcript trail off in silence.
+    /// from that renderer. So pop it out and park it out of the way on the
+    /// second display. Without --popout-captions, say what is happening rather
+    /// than let the transcript trail off in silence.
     func maintainCaptionSurface(_ app: AXUIElement, pid: pid_t, now: Date, popOut: Bool) {
         if let window = captionsWindow(app) {
-            // Already popped out, by us or by hand. Leave it where it is —
-            // that placement is the user's — but take the pin off, since it
-            // does not need to be in front to keep working.
+            // Every poll, because it can be minimized at any moment and a
+            // minimized window receives nothing at all.
+            unminimize(window)
             guard !handledCaptionsWindow else { return }
             handledCaptionsWindow = true
             unpin(window, pid: pid)
+            park(window)
             return
         }
         guard popOut else { return warnIfStalled(app, now: now) }
@@ -1267,6 +1315,33 @@ final class TeamsApp: MeetingApp {
         popOutAttempts += 1
         nextPopOutAttempt = now.addingTimeInterval(60)
         popOutCaptions(app, pid: pid)
+    }
+
+    /// Tuck the captions window off the edge of the second display, leaving a
+    /// nub of it on screen. It does not need to be visible to work — measured
+    /// on a live call, 620x360 with a 40x40 corner showing produced captions
+    /// without a gap — but it does need to be OPEN, so this is as far out of
+    /// the way as it can go. Done once, so dragging it back is respected.
+    private func park(_ window: AXUIElement) {
+        let size = axFrame(window).size
+        guard let origin = tuckOrigin(windowSize: size, displays: displayBounds()) else { return }
+        axSetPosition(window, origin)
+    }
+
+    /// Un-minimize the captions window, and say why once.
+    ///
+    /// Minimizing is the one thing that really does stop it. Being covered is
+    /// survivable; being in the Dock is not — measured on a live call, the
+    /// rows sat frozen for 30 seconds and jumped from 4 to 12 the instant the
+    /// window came back. Nothing about the tree says so meanwhile: the stale
+    /// rows stay readable, so the daemon would write a silent meeting.
+    private func unminimize(_ window: AXUIElement) {
+        guard (axAttribute(window, kAXMinimizedAttribute) as? NSNumber)?.boolValue == true else { return }
+        AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        if !warnedMinimized {
+            warnedMinimized = true
+            status("reopened Teams' captions window: minimized, it stops receiving captions altogether")
+        }
     }
 
     /// Press the panel's "Pop out", putting the pointer, the window width and
@@ -1312,7 +1387,7 @@ final class TeamsApp: MeetingApp {
             if let popped = captionsWindow(app) {
                 handledCaptionsWindow = true
                 unpin(popped, pid: pid)
-                status("moved Teams' captions into their own window; a covered meeting window can no longer pause them")
+                status("moved Teams' captions into their own window, tucked off the edge of the second display; a covered meeting window can no longer pause them")
                 return
             }
         }
@@ -1382,6 +1457,7 @@ final class TeamsApp: MeetingApp {
         popOutAttempts = 0
         nextPopOutAttempt = .distantPast
         handledCaptionsWindow = false
+        warnedMinimized = false
     }
 
     /// Teams' own shortcut (⇧⌘A), delivered straight to the process so it

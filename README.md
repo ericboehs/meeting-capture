@@ -155,12 +155,21 @@ come from the meeting window's renderer. So at the start of a Teams meeting the
 panel is popped out, and captions are read from there in preference to the
 panel in the meeting window, which may be a frozen copy of itself.
 
-The window is left wherever Teams puts it — it doesn't need to be visible, so
-it doesn't need placing. Teams does pop it out pinned (floating above every
-other window), which is in the way for no gain, so the pin comes off. Pinning
-is read from the window server's layer rather than the button's label, which is
-localized; a window it can't report on — one on another Space — is left alone,
-since the control is a toggle and a wrong guess would pin what you unpinned.
+The window is tucked off the outside edge of your second display with a small
+nub of it left on screen, which is as close to out of sight as it can get: it
+does not need to be visible (a 620x360 window showing a 40x40 corner produced
+captions without a gap for the length of a test), but it does need to be OPEN.
+Minimizing it is the one thing that really stops it — measured on a live call,
+the rows sat frozen for 30 seconds and jumped from 4 to 12 the instant the
+window came back — so a minimized captions window is reopened, with a line in
+the log saying why. Drag it somewhere you like and it stays there; it is only
+placed once per meeting.
+
+Teams pops it out pinned above every other window, which is in the way for no
+gain, so the pin comes off. Pinning is read from the window server's layer
+rather than the button's label, which is localized; a window it can't report on
+— one on another Space — is left alone, since the control is a toggle and a
+wrong guess would pin what you unpinned.
 
 Popping out costs a couple of seconds of focus: Teams' WebView ignores both
 `AXPress` and mouse events posted to the process — they report success and do

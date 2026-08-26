@@ -67,6 +67,36 @@ expectEqual(Recorder.slugify("Weekly Sync | Microsoft Teams"), "weekly-sync", "s
 expectEqual(Recorder.slugify("!!!"), "meeting", "all-punctuation title falls back to 'meeting'")
 expectEqual(Recorder.slugify("Ada's 2nd standup!"), "ada-s-2nd-standup", "slug keeps letters and digits")
 
+// --- Tucking the popped-out captions window ------------------------------
+// The window has to stay OPEN (minimized, it receives nothing at all) but it
+// does not have to be visible, so it is pushed off the outside edge of the
+// second display with a nub left on screen. Display rects are in the global
+// top-left space AX and CGDisplayBounds share; the primary is at the origin.
+do {
+    let primary = CGRect(x: 0, y: 0, width: 2560, height: 1440)
+    let onTheLeft = CGRect(x: -1920, y: 252, width: 1920, height: 1080)
+    let onTheRight = CGRect(x: 2560, y: 0, width: 1920, height: 1080)
+    let panel = CGSize(width: 620, height: 360)
+
+    expectEqual(tuckOrigin(windowSize: panel, displays: [primary, onTheLeft]),
+                CGPoint(x: -2500, y: 1292),
+                "a display on the left: push off ITS left edge, away from the primary")
+    expectEqual(tuckOrigin(windowSize: panel, displays: [onTheLeft, primary]),
+                CGPoint(x: -2500, y: 1292),
+                "which display is listed first does not matter; the origin decides")
+    expectEqual(tuckOrigin(windowSize: panel, displays: [primary, onTheRight]),
+                CGPoint(x: 4440, y: 1040),
+                "a display on the right: push off its right edge, or it lands on the primary")
+    expectEqual(tuckOrigin(windowSize: panel, displays: [primary]),
+                CGPoint(x: -580, y: 1400),
+                "one display: still tuck it, there is nowhere else to put it")
+    expectTrue(tuckOrigin(windowSize: panel, displays: []) == nil,
+               "no displays, nowhere to tuck")
+    expectEqual(tuckOrigin(windowSize: panel, displays: [primary, onTheLeft], showing: 0),
+                CGPoint(x: -2540, y: 1332),
+                "showing is how much of the window is left on screen")
+}
+
 // --- Naming a Teams meeting ---------------------------------------------
 // Teams' side windows put a label in FRONT of the meeting's own title. When
 // the meeting window is covered, the meeting is found in the compact view,
