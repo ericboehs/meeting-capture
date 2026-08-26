@@ -39,6 +39,9 @@ struct Options {
     /// Teams only: move the captions panel into its own window at the start of
     /// a meeting, so a covered meeting window cannot stop the transcript.
     var popOutCaptions = false
+    /// Teams only: open the meeting chat and move it into its own window, for
+    /// the same reason, and because a chat panel nobody opened records nothing.
+    var popOutChat = false
     var once = false
     var follow = false
     var jsonToStdout = false
@@ -68,6 +71,8 @@ func usage() -> String {
       --popout-captions    Teams: put captions in their own window, which
                            keeps running even when every Teams window is
                            covered
+      --popout-chat        Teams: open the meeting chat in its own window, so
+                           chat is recorded without opening the panel by hand
       --interval <ms>      poll interval while in a meeting (default 250)
       --idle-interval <ms> poll interval while waiting for one (default 2000)
       --dir <path>         output directory (default $XDG_DATA_HOME/meeting-capture)
@@ -104,6 +109,7 @@ func parseOptions() -> Options {
         case "--follow": options.follow = true
         case "--auto-captions": options.autoCaptions = true
         case "--popout-captions": options.popOutCaptions = true
+        case "--popout-chat": options.popOutChat = true
         case "--interval": options.intervalMs = UInt32(next(flag)) ?? options.intervalMs
         case "--idle-interval": options.idleIntervalMs = UInt32(next(flag)) ?? options.idleIntervalMs
         case "--dir": options.directory = (next(flag) as NSString).expandingTildeInPath
@@ -827,10 +833,12 @@ protocol MeetingApp {
     func resetCaptureState()
 
     /// Called every poll while a meeting is being recorded, so an app can keep
-    /// its caption surface readable — Teams stops updating a meeting window
-    /// that another window completely covers. Free to be slow and to touch the
-    /// UI, but only rarely: it runs on the polling thread.
-    func maintainCaptionSurface(_ app: AXUIElement, pid: pid_t, now: Date, popOut: Bool)
+    /// the surfaces it reads from readable — Teams stops updating a meeting
+    /// window that another window completely covers, and its chat panel may
+    /// not even be open. Free to be slow and to touch the UI, but only rarely:
+    /// it runs on the polling thread.
+    func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
+                          popOutCaptions: Bool, popOutChat: Bool)
 
     /// True when finished utterances stay on screen, so waiting for one to
     /// disappear would hold the whole transcript back. Such an app is assumed
@@ -898,7 +906,8 @@ extension MeetingApp {
     func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
     func resetCaptureState() {}
     // Only Teams parks a covered window; everyone else keeps rendering.
-    func maintainCaptionSurface(_ app: AXUIElement, pid: pid_t, now: Date, popOut: Bool) {}
+    func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
+                          popOutCaptions: Bool, popOutChat: Bool) {}
 }
 
 func windowTitle(containing element: AXUIElement) -> String? {
@@ -1123,6 +1132,17 @@ final class TeamsApp: MeetingApp {
     /// and that menu cannot be opened through accessibility — hence the
     /// widen-then-click dance in popOutCaptions.
     private let popOutButtonID = "closed-captions-pop-out-button"
+    /// Teams: the chat panel's header, and the button in it that moves the
+    /// panel into a window of its own. That button has no DOM id and its
+    /// description ("Open in new window") is localized, so it is identified
+    /// structurally: the header's other direct child button is the one that
+    /// closes the panel, and that one does have an id.
+    private let chatPanelID = "message-pane-layout-a11y"
+    private let chatCloseButtonID = "rail-header-close-button"
+    /// Opens the chat panel in the meeting window.
+    private let chatButtonID = "chat-button"
+    /// A rendered chat message. The panel can be open with none of them yet.
+    private let chatBodyClass = "fui-ChatMessage__body"
     /// The pop-out window's pin (⌃⌘T) control. Teams pops the window out
     /// pinned; see unpin for why it doesn't stay that way.
     private let pinButtonID = "window-always-on-top-button"
@@ -1138,6 +1158,8 @@ final class TeamsApp: MeetingApp {
     private var popOutAttempts = 0
     private var nextPopOutAttempt = Date.distantPast
     private var handledCaptionsWindow = false
+    private var chatPopOutAttempts = 0
+    private var nextChatPopOutAttempt = Date.distantPast
     private var warnedMinimized = false
 
     /// Meeting-only chrome. hangup-button is the obvious one, but Teams'
@@ -1261,8 +1283,24 @@ final class TeamsApp: MeetingApp {
     }
 
     /// The ordinary meeting window — the one with the toolbar and the timer.
+    /// Matched by the hangup button rather than by being a standard window,
+    /// because the popped-out chat is a standard window too, and widening or
+    /// measuring the wrong one would be a mess.
     private func standardWindow(_ app: AXUIElement) -> AXUIElement? {
-        axWindows(app).first { axString($0, kAXSubroleAttribute) == "AXStandardWindow" }
+        axWindows(app).first { window in
+            axString(window, kAXSubroleAttribute) == "AXStandardWindow"
+                && findElement(from: window, where: { axDomID($0) == "hangup-button" }) != nil
+        }
+    }
+
+    /// The meeting chat after it has been popped out. Unlike the captions
+    /// window this one IS a standard window, and its title is the meeting's
+    /// own, so it is told apart by content: chat messages, no hangup button.
+    private func chatWindow(_ app: AXUIElement) -> AXUIElement? {
+        axWindows(app).first { window in
+            findElement(from: window, where: { axDomID($0) == "hangup-button" }) == nil
+                && findElement(from: window, where: { axClasses($0).contains(chatBodyClass) }) != nil
+        }
     }
 
     func captionEntries(in container: AXUIElement) -> [CaptionEntry] {
@@ -1296,7 +1334,14 @@ final class TeamsApp: MeetingApp {
     /// from that renderer. So pop it out and park it out of the way on the
     /// second display. Without --popout-captions, say what is happening rather
     /// than let the transcript trail off in silence.
-    func maintainCaptionSurface(_ app: AXUIElement, pid: pid_t, now: Date, popOut: Bool) {
+    func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
+                          popOutCaptions: Bool, popOutChat: Bool) {
+        maintainCaptionSurface(app, pid: pid, now: now, popOut: popOutCaptions)
+        guard popOutChat else { return }
+        maintainChatSurface(app, pid: pid, now: now)
+    }
+
+    private func maintainCaptionSurface(_ app: AXUIElement, pid: pid_t, now: Date, popOut: Bool) {
         if let window = captionsWindow(app) {
             // Every poll, because it can be minimized at any moment and a
             // minimized window receives nothing at all.
@@ -1304,7 +1349,7 @@ final class TeamsApp: MeetingApp {
             guard !handledCaptionsWindow else { return }
             handledCaptionsWindow = true
             unpin(window, pid: pid)
-            park(window)
+            tuck(window)
             return
         }
         guard popOut else { return warnIfStalled(app, now: now) }
@@ -1317,12 +1362,86 @@ final class TeamsApp: MeetingApp {
         popOutCaptions(app, pid: pid)
     }
 
-    /// Tuck the captions window off the edge of the second display, leaving a
+    /// Chat is a panel nobody has to open, and an unopened panel records
+    /// nothing at all — so with --popout-chat the meeting chat is opened and
+    /// moved into a window of its own. It is read from there in preference to
+    /// the in-meeting panel, which stops updating along with the rest of a
+    /// covered meeting window.
+    ///
+    /// Unlike the captions window this one is left in plain sight: chat is
+    /// something you read and reply to during a meeting, so hiding it would
+    /// take away the panel it just opened.
+    private func maintainChatSurface(_ app: AXUIElement, pid: pid_t, now: Date) {
+        if let window = chatWindow(app) {
+            unminimize(window)
+            return
+        }
+        guard chatPopOutAttempts < 2, now >= nextChatPopOutAttempt else { return }
+        chatPopOutAttempts += 1
+        nextChatPopOutAttempt = now.addingTimeInterval(60)
+        popOutChat(app, pid: pid)
+    }
+
+    /// Open the chat panel if it is closed, then press the button in its
+    /// header that gives it a window. Both are real clicks for the same
+    /// reason as the captions pop-out: Teams' WebView ignores AXPress.
+    private func popOutChat(_ app: AXUIElement, pid: pid_t) {
+        let priorApp = NSWorkspace.shared.frontmostApplication
+        let priorPointer = CGEvent(source: nil)?.location
+        defer {
+            if let priorPointer {
+                CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                        mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
+            }
+            priorApp?.activate()
+        }
+        NSRunningApplication(processIdentifier: pid)?.activate()
+        usleep(300_000)
+
+        var panel = findElement(from: app) { axDomID($0) == chatPanelID }
+        if panel == nil {
+            guard let chatButton = findElement(from: app, where: { axDomID($0) == chatButtonID })
+            else { return }
+            press(chatButton)
+            for _ in 0..<10 where panel == nil {
+                usleep(400_000)
+                panel = findElement(from: app) { axDomID($0) == chatPanelID }
+            }
+        }
+        guard let panel else {
+            status("could not open Teams' meeting chat; chat will only be recorded if you open the panel yourself")
+            return
+        }
+        // The header holds two buttons: this one and the one that closes the
+        // panel. Only the latter has an id, so the other one is the pop-out.
+        guard let button = axChildren(panel).first(where: {
+            axString($0, kAXRoleAttribute) == "AXButton" && axDomID($0) != chatCloseButtonID
+        }) else {
+            status("could not find Teams' chat pop-out control; chat will be read from the meeting window")
+            return
+        }
+        press(button)
+        for _ in 0..<12 {
+            usleep(500_000)
+            guard chatWindow(app) != nil else { continue }
+            status("opened Teams' meeting chat in its own window")
+            return
+        }
+    }
+
+    /// Click an element where it sits on screen.
+    private func press(_ element: AXUIElement) {
+        let (origin, size) = axFrame(element)
+        clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
+                                             y: origin.y + size.height / 2))
+    }
+
+    /// Tuck a pop-out window off the edge of the second display, leaving a
     /// nub of it on screen. It does not need to be visible to work — measured
     /// on a live call, 620x360 with a 40x40 corner showing produced captions
     /// without a gap — but it does need to be OPEN, so this is as far out of
     /// the way as it can go. Done once, so dragging it back is respected.
-    private func park(_ window: AXUIElement) {
+    private func tuck(_ window: AXUIElement) {
         let size = axFrame(window).size
         guard let origin = tuckOrigin(windowSize: size, displays: displayBounds()) else { return }
         axSetPosition(window, origin)
@@ -1387,6 +1506,7 @@ final class TeamsApp: MeetingApp {
             if let popped = captionsWindow(app) {
                 handledCaptionsWindow = true
                 unpin(popped, pid: pid)
+                tuck(popped)
                 status("moved Teams' captions into their own window, tucked off the edge of the second display; a covered meeting window can no longer pause them")
                 return
             }
@@ -1458,6 +1578,8 @@ final class TeamsApp: MeetingApp {
         nextPopOutAttempt = .distantPast
         handledCaptionsWindow = false
         warnedMinimized = false
+        chatPopOutAttempts = 0
+        nextChatPopOutAttempt = .distantPast
     }
 
     /// Teams' own shortcut (⇧⌘A), delivered straight to the process so it
@@ -1477,11 +1599,17 @@ final class TeamsApp: MeetingApp {
     }
 
     /// The chat message list: the grandparent of any rendered message body.
+    /// The popped-out window is preferred, for the same reason captions are
+    /// read from theirs: the panel inside a covered meeting window can be a
+    /// frozen copy of itself.
     func chatContainer(_ app: AXUIElement) -> AXUIElement? {
-        guard let body = findElement(from: app, where: {
-            axDomID($0).hasPrefix("message-body-") && axClasses($0).contains("fui-ChatMessage__body")
-        }) else { return nil }
-        return axParent(body).flatMap(axParent)
+        func list(in root: AXUIElement) -> AXUIElement? {
+            findElement(from: root, where: {
+                axDomID($0).hasPrefix("message-body-") && axClasses($0).contains(chatBodyClass)
+            }).flatMap { axParent($0).flatMap(axParent) }
+        }
+        if let window = chatWindow(app), let container = list(in: window) { return container }
+        return list(in: app)
     }
 
     func chatMessages(in container: AXUIElement) -> [ChatMessage] {
@@ -1489,7 +1617,7 @@ final class TeamsApp: MeetingApp {
         return rows.compactMap { row -> ChatMessage? in
             let parts = axChildren(row)
             guard let body = parts.first(where: {
-                axClasses($0).contains("fui-ChatMessage__body") && axDomID($0).hasPrefix("message-body-")
+                axClasses($0).contains(chatBodyClass) && axDomID($0).hasPrefix("message-body-")
             }) else { return nil }
             let author = parts.first { axClasses($0).contains("fui-ChatMessage__author") }.map { axText($0) } ?? ""
             let text = axText(body).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2254,7 +2382,9 @@ final class Session {
         }
 
         if options.autoCaptions { ensureCaptionsOn(app: app, pid: pid, now: now) }
-        meetingApp.maintainCaptionSurface(app, pid: pid, now: now, popOut: options.popOutCaptions)
+        meetingApp.maintainSurfaces(app, pid: pid, now: now,
+                                    popOutCaptions: options.popOutCaptions,
+                                    popOutChat: options.popOutChat)
         if options.captureCaptions { pollCaptions(now: now) }
         if options.captureChat { pollChat(now: now) }
     }

@@ -98,6 +98,7 @@ write a second transcript of the same meeting.
 | `--app <name>` | Only watch one app (`teams`, `zoom`, `slack`, `meet`) |
 | `--auto-captions` | Turn live captions on when a meeting starts |
 | `--popout-captions` | Teams: move captions into their own window, which a covered window can't pause |
+| `--popout-chat` | Teams: open the meeting chat in its own window, so chat is recorded unattended |
 | `--dir <path>` | Output directory |
 | `--follow`, `--watch` | Watch whatever the running daemon is recording, never record |
 | `--interval <ms>` | Poll interval during a meeting (default 250) |
@@ -170,6 +171,22 @@ gain, so the pin comes off. Pinning is read from the window server's layer
 rather than the button's label, which is localized; a window it can't report on
 — one on another Space — is left alone, since the control is a toggle and a
 wrong guess would pin what you unpinned.
+
+`--popout-chat` does the same for the meeting chat, which has a second problem
+besides: the panel has to be OPEN to exist at all, so an unattended meeting
+records no chat whatever the window is doing. The panel is opened and given its
+own window, which is read from in preference to the panel inside the meeting
+window. Its pop-out control carries no id and its label is localized, so it is
+found structurally: the chat panel header has exactly two buttons, and the one
+that is not `rail-header-close-button` is it.
+
+That window is left in plain sight rather than tucked away — chat is something
+you read and reply to — so put it where you like. It is only reopened if
+minimized, since a minimized window receives nothing. Whether Teams parks a
+completely covered chat window the way it parks the meeting window has not been
+measured (it needs someone to post while it is buried); if chat ever goes quiet
+in a transcript while the window was covered, that is the first thing to
+suspect.
 
 Popping out costs a couple of seconds of focus: Teams' WebView ignores both
 `AXPress` and mouse events posted to the process — they report success and do

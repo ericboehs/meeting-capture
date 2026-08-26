@@ -219,6 +219,7 @@ cat > "$plist" <<PLIST
     <string>$binary</string>
     <string>--auto-captions</string>
     <string>--popout-captions</string>
+    <string>--popout-chat</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
