@@ -68,6 +68,32 @@ find_sign_id() {
 
 settings_pane="x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
+# Stop the agent and start it again.
+#
+# `launchctl bootout` returns before launchd has finished tearing the service
+# down, so bootstrapping straight after it loses the race and fails with
+# "Bootstrap failed: 5: Input/output error" — which leaves the daemon NOT
+# RUNNING. That is the worst possible outcome for an installer whose whole job
+# is shipping a fixed build to a live meeting, and it is silent unless you read
+# the output. So wait for the label to actually leave the domain (bootout's own
+# exit status says nothing about that; `launchctl print` does), then bootstrap,
+# retrying a few times for whatever race is left.
+restart_agent() { # restart_agent <domain> <label> <plist>
+  local domain=$1 label=$2 plist=$3 attempt out=""
+  launchctl bootout "$domain/$label" 2>/dev/null || true
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    launchctl print "$domain/$label" >/dev/null 2>&1 || break
+    sleep 0.2
+  done
+  for ((attempt = 1; attempt <= 5; attempt++)); do
+    out=$(launchctl bootstrap "$domain" "$plist" 2>&1) && return 0
+    sleep 1
+  done
+  echo "error: could not start $label after 5 attempts:" >&2
+  echo "$out" >&2
+  return 1
+}
+
 # Sourcing mode for the installer's test suite (tests/installer.sh): with this
 # set, `source` defines the functions above and stops before any side effects.
 # Tests stub `security` as a bash function to drive the tri-state contract.
@@ -216,8 +242,7 @@ cat > "$plist" <<PLIST
 </plist>
 PLIST
 
-launchctl bootout "gui/$UID/$label" 2>/dev/null || true
-launchctl bootstrap "gui/$UID" "$plist"
+restart_agent "gui/$UID" "$label" "$plist"
 
 cat <<INFO
 

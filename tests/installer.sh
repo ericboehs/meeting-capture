@@ -90,6 +90,77 @@ SECURITY_RC=0; SECURITY_OUT='  1) valid identities present "/tmp/other"'
 out=$(find_sign_id)
 check "absent cert falls back to ad-hoc marker only after clean lookup" "-" "$out"
 
+# --- restart_agent --------------------------------------------------------
+#
+# `launchctl bootout` returns before the domain releases the label, so the
+# bootstrap that follows used to fail with "Input/output error" and leave the
+# daemon stopped — an installer that reports success while shipping nothing.
+# Stub launchctl and sleep to drive the two races deterministically.
+
+# Stub launchctl and sleep to drive the two races deterministically. State
+# lives in files, not variables: restart_agent captures bootstrap's output in a
+# command substitution, and a subshell's variable writes never come back.
+STUB_DIR=$(mktemp -d)
+trap 'rm -rf "$STUB_DIR"' EXIT
+launchctl() {
+  echo "$1" >> "$STUB_DIR/calls"
+  local left
+  case $1 in
+    bootout) return 0 ;;
+    print)
+      left=$(cat "$STUB_DIR/print_hits")
+      if [[ $left -gt 0 ]]; then echo $((left - 1)) > "$STUB_DIR/print_hits"; return 0; fi
+      return 1 ;; # label is gone
+    bootstrap)
+      left=$(cat "$STUB_DIR/bootstrap_failures")
+      if [[ $left -gt 0 ]]; then
+        echo $((left - 1)) > "$STUB_DIR/bootstrap_failures"
+        echo "Bootstrap failed: 5: Input/output error" >&2
+        return 5
+      fi
+      return 0 ;;
+  esac
+}
+sleep() { echo x >> "$STUB_DIR/slept"; }
+count_calls() { grep -c "^$1$" "$STUB_DIR/calls" 2>/dev/null || echo 0; }
+count_sleeps() { wc -l < "$STUB_DIR/slept" | tr -d ' '; }
+reset_launchctl() { # reset_launchctl <print_hits> <bootstrap_failures>
+  : > "$STUB_DIR/calls"; : > "$STUB_DIR/slept"
+  echo "${1:-0}" > "$STUB_DIR/print_hits"
+  echo "${2:-0}" > "$STUB_DIR/bootstrap_failures"
+}
+
+# Clean case: label already gone, bootstrap takes on the first try.
+reset_launchctl 0 0
+rc=0; restart_agent "gui/501" "com.example.agent" "/tmp/agent.plist" || rc=$?
+check "clean restart succeeds" "0" "$rc"
+check "clean restart bootstraps exactly once" "1" "$(count_calls bootstrap)"
+check "clean restart does not wait" "0" "$(count_sleeps)"
+
+# The teardown race: the label lingers in the domain for a few polls.
+reset_launchctl 3 0
+rc=0; restart_agent "gui/501" "com.example.agent" "/tmp/agent.plist" || rc=$?
+check "lingering label is waited out, not bootstrapped over" "0" "$rc"
+check "waiting polls until the label leaves the domain" "4" "$(count_calls print)"
+check "each poll pauses" "3" "$(count_sleeps)"
+
+# The residual race: bootstrap itself fails twice, then lands.
+reset_launchctl 0 2
+rc=0; restart_agent "gui/501" "com.example.agent" "/tmp/agent.plist" || rc=$?
+check "a losing bootstrap is retried rather than reported as installed" "0" "$rc"
+check "retries stop as soon as one succeeds" "3" "$(count_calls bootstrap)"
+
+# Persistent failure must be loud and nonzero: silence here is how a fixed
+# build never reaches the meeting.
+reset_launchctl 0 99
+rc=0; err=$(restart_agent "gui/501" "com.example.agent" "/tmp/agent.plist" 2>&1) || rc=$?
+check "a daemon that will not start fails the install" "1" "$rc"
+check "bootstrap is not retried forever" "5" "$(count_calls bootstrap)"
+check "the launchctl diagnostic is surfaced" "0" \
+  "$(case $err in *"Input/output error"*) echo 0 ;; *) echo "missing: $err" ;; esac)"
+
+unset -f launchctl sleep
+
 # --- Summary --------------------------------------------------------------
 
 total=$((pass + fail))
