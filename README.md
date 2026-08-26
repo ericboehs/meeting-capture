@@ -97,6 +97,7 @@ write a second transcript of the same meeting.
 | --- | --- |
 | `--app <name>` | Only watch one app (`teams`, `zoom`, `slack`, `meet`) |
 | `--auto-captions` | Turn live captions on when a meeting starts |
+| `--popout-captions` | Teams: move captions into their own window, which a covered window can't pause |
 | `--dir <path>` | Output directory |
 | `--follow`, `--watch` | Watch whatever the running daemon is recording, never record |
 | `--interval <ms>` | Poll interval during a meeting (default 250) |
@@ -133,6 +134,44 @@ after two attempts. An earlier version got this wrong and toggled the panel on
 and off every eight seconds. Slack has no such chrome — its captions exist only
 while someone is speaking — so once its overlay has been seen it is never asked
 again, since every pause would otherwise look like captions being switched off.
+
+### Teams stops transcribing when its window is covered
+
+Cover the Teams meeting window *completely* — one full-screen window over it is
+enough — and the transcript stops. macOS reports the window as occluded, Teams
+parks it and puts up the small "compact view" instead, and everything in the
+parked window freezes: the call timer stops ticking, no new caption rows
+arrive. The accessibility tree still holds the whole captions panel, so nothing
+looks wrong; it is just a photograph of the last live moment. Leave one pixel
+showing and it never happens, and the window resumes the instant any of it is
+visible again — even moving it is enough.
+
+`--popout-captions` (on by default in the agent) sidesteps it. Teams' captions
+panel can be popped out into its own window, and that window is not subject to
+any of this: it goes on receiving captions while completely covered, even with
+the meeting window parked at the same time — measured on a live call, 36
+seconds under an opaque window, captions arriving throughout. The text does not
+come from the meeting window's renderer. So at the start of a Teams meeting the
+panel is popped out, and captions are read from there in preference to the
+panel in the meeting window, which may be a frozen copy of itself.
+
+The window is left wherever Teams puts it — it doesn't need to be visible, so
+it doesn't need placing. Teams does pop it out pinned (floating above every
+other window), which is in the way for no gain, so the pin comes off. Pinning
+is read from the window server's layer rather than the button's label, which is
+localized; a window it can't report on — one on another Space — is left alone,
+since the control is a toggle and a wrong guess would pin what you unpinned.
+
+Popping out costs a couple of seconds of focus: Teams' WebView ignores both
+`AXPress` and mouse events posted to the process — they report success and do
+nothing — so it takes a real click through the window server, which means
+bringing Teams to the front. The pointer and the previously frontmost app are
+put back afterwards. If the window is too narrow, Teams folds the pop-out
+control into an overflow menu that can't be opened through accessibility, so
+the window is widened for the click and set back to its old width.
+
+Without the flag, a stalled call timer is reported in the log rather than left
+to look like a quiet meeting.
 
 ## Output
 

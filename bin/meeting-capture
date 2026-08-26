@@ -36,6 +36,9 @@ struct Options {
     var captureChat = true
     var includeChatBacklog = false
     var autoCaptions = false
+    /// Teams only: move the captions panel into its own window at the start of
+    /// a meeting, so a covered meeting window cannot stop the transcript.
+    var popOutCaptions = false
     var once = false
     var follow = false
     var jsonToStdout = false
@@ -62,6 +65,9 @@ func usage() -> String {
                            record (--watch does the same)
       --app <name>         only watch one app (\(supportedApps.map(\.id).joined(separator: ", ")))
       --auto-captions      turn live captions on when a meeting starts
+      --popout-captions    Teams: put captions in their own window, which
+                           keeps running even when every Teams window is
+                           covered
       --interval <ms>      poll interval while in a meeting (default 250)
       --idle-interval <ms> poll interval while waiting for one (default 2000)
       --dir <path>         output directory (default $XDG_DATA_HOME/meeting-capture)
@@ -97,6 +103,7 @@ func parseOptions() -> Options {
         case "--once": options.once = true
         case "--follow": options.follow = true
         case "--auto-captions": options.autoCaptions = true
+        case "--popout-captions": options.popOutCaptions = true
         case "--interval": options.intervalMs = UInt32(next(flag)) ?? options.intervalMs
         case "--idle-interval": options.idleIntervalMs = UInt32(next(flag)) ?? options.idleIntervalMs
         case "--dir": options.directory = (next(flag) as NSString).expandingTildeInPath
@@ -186,6 +193,72 @@ func findElement(from root: AXUIElement, depth: Int = 0, where match: (AXUIEleme
         if let hit = findElement(from: child, depth: depth + 1, where: match) { return hit }
     }
     return nil
+}
+
+func axWindows(_ app: AXUIElement) -> [AXUIElement] {
+    axAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+}
+
+/// Position and size in the global, top-left-origin space AX uses — the same
+/// one CGDisplayBounds reports in, and NOT the bottom-left space of NSScreen.
+func axFrame(_ element: AXUIElement) -> (origin: CGPoint, size: CGSize) {
+    var origin = CGPoint.zero, size = CGSize.zero
+    if let value = axAttribute(element, kAXPositionAttribute), CFGetTypeID(value) == AXValueGetTypeID() {
+        AXValueGetValue(value as! AXValue, .cgPoint, &origin)
+    }
+    if let value = axAttribute(element, kAXSizeAttribute), CFGetTypeID(value) == AXValueGetTypeID() {
+        AXValueGetValue(value as! AXValue, .cgSize, &size)
+    }
+    return (origin, size)
+}
+
+@discardableResult
+func axSetSize(_ element: AXUIElement, _ size: CGSize) -> Bool {
+    var size = size
+    guard let value = AXValueCreate(.cgSize, &size) else { return false }
+    return AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, value) == .success
+}
+
+/// The window server's layer for a window, or nil when it can't be found (it
+/// may be on another Space). Teams' "Pin window" raises the layer above the
+/// ordinary 0, which is how pinning is detected — the button's own label is
+/// localized, so it is no use.
+func windowLayer(pid: pid_t, frame: (origin: CGPoint, size: CGSize)) -> Int? {
+    let listed = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                            kCGNullWindowID) as? [[String: Any]] ?? []
+    for window in listed {
+        guard window[kCGWindowOwnerPID as String] as? pid_t == pid,
+              let bounds = window[kCGWindowBounds as String] as? [String: CGFloat],
+              let layer = window[kCGWindowLayer as String] as? Int else { continue }
+        guard bounds["X"] == frame.origin.x, bounds["Y"] == frame.origin.y,
+              bounds["Width"] == frame.size.width, bounds["Height"] == frame.size.height
+        else { continue }
+        return layer
+    }
+    return nil
+}
+
+/// Click a point the way a hand would: through the window server, with the
+/// pointer really there.
+///
+/// Teams' WebView ignores both AXPress and mouse events posted straight to the
+/// process (`postToPid`) — the button reports success and nothing happens — so
+/// a real click is the only thing that works on its caption controls. The
+/// caller is responsible for putting the pointer and the front app back.
+func clickThroughWindowServer(at point: CGPoint) {
+    let source = CGEventSource(stateID: .combinedSessionState)
+    CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+            mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
+    usleep(150_000)
+    let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
+                       mouseCursorPosition: point, mouseButton: .left)
+    let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp,
+                     mouseCursorPosition: point, mouseButton: .left)
+    down?.setIntegerValueField(.mouseEventClickState, value: 1)
+    up?.setIntegerValueField(.mouseEventClickState, value: 1)
+    down?.post(tap: .cghidEventTap)
+    usleep(80_000)
+    up?.post(tap: .cghidEventTap)
 }
 
 // MARK: - Recording
@@ -707,6 +780,12 @@ protocol MeetingApp {
     /// cleared here rather than leaking across meetings.
     func resetCaptureState()
 
+    /// Called every poll while a meeting is being recorded, so an app can keep
+    /// its caption surface readable — Teams stops updating a meeting window
+    /// that another window completely covers. Free to be slow and to touch the
+    /// UI, but only rarely: it runs on the polling thread.
+    func maintainCaptionSurface(_ app: AXUIElement, pid: pid_t, now: Date, popOut: Bool)
+
     /// True when finished utterances stay on screen, so waiting for one to
     /// disappear would hold the whole transcript back. Such an app is assumed
     /// to append: anything above the newest entry is done being edited.
@@ -772,6 +851,8 @@ extension MeetingApp {
     func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
     func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
     func resetCaptureState() {}
+    // Only Teams parks a covered window; everyone else keeps rendering.
+    func maintainCaptionSurface(_ app: AXUIElement, pid: pid_t, now: Date, popOut: Bool) {}
 }
 
 func windowTitle(containing element: AXUIElement) -> String? {
@@ -969,7 +1050,10 @@ struct TreeWaker {
 
 /// Teams renders its UI in a Chromium WebView, which exposes DOM ids and class
 /// lists through the accessibility tree, so we can anchor on those.
-struct TeamsApp: MeetingApp {
+///
+/// A class rather than a struct because keeping captions readable is stateful:
+/// see maintainCaptionSurface.
+final class TeamsApp: MeetingApp {
     let id = "teams"
     let displayName = "Microsoft Teams"
     let processPattern = "Microsoft Teams.app/Contents/MacOS/MSTeams"
@@ -988,6 +1072,26 @@ struct TeamsApp: MeetingApp {
         "closed-captions-pop-out-button",
         "captions-settings-menu-trigger-button-non-overflow"
     ]
+    /// The captions panel's "Pop out" control. Teams folds it into an overflow
+    /// menu ("closed-captions-overflow-menu-button") when the window is narrow,
+    /// and that menu cannot be opened through accessibility — hence the
+    /// widen-then-click dance in popOutCaptions.
+    private let popOutButtonID = "closed-captions-pop-out-button"
+    /// The pop-out window's pin (⌃⌘T) control. Teams pops the window out
+    /// pinned; see unpin for why it doesn't stay that way.
+    private let pinButtonID = "window-always-on-top-button"
+    /// Width at which Teams shows the pop-out control rather than folding it away.
+    private let popOutRevealWidth: CGFloat = 1250
+
+    // --- keeping a covered meeting readable (see maintainCaptionSurface) ---
+    /// Last value of the call timer, and when it last changed. A frozen timer
+    /// is how a parked window announces itself.
+    private var lastClock = ""
+    private var clockChangedAt = Date.distantPast
+    private var warnedStalledAt = Date.distantPast
+    private var popOutAttempts = 0
+    private var nextPopOutAttempt = Date.distantPast
+    private var handledCaptionsWindow = false
 
     /// Meeting-only chrome. hangup-button is the obvious one, but Teams'
     /// WebView can take minutes to expose the full toolbar; the call timer
@@ -1055,10 +1159,36 @@ struct TeamsApp: MeetingApp {
         axClasses(element).contains(captionEntryClass)
     }
 
-    /// The captions list is simply the parent of the caption entries. Anchoring
-    /// on the entries themselves survives the panel being popped out.
+    /// The captions list is simply the parent of the caption entries.
+    ///
+    /// The popped-out window is preferred over the in-window panel. When
+    /// another window completely covers the meeting window, Teams stops
+    /// updating it but leaves the whole panel in the accessibility tree, so
+    /// the frozen copy reads as a live one; the popped-out window keeps
+    /// running (its captions arrive independently of that renderer).
     func captionsContainer(_ app: AXUIElement) -> AXUIElement? {
-        findElement(from: app, where: isCaptionEntry).flatMap(axParent)
+        if let window = captionsWindow(app),
+           let entry = findElement(from: window, where: isCaptionEntry) {
+            return axParent(entry)
+        }
+        return findElement(from: app, where: isCaptionEntry).flatMap(axParent)
+    }
+
+    /// The captions panel after it has been popped out into its own window.
+    /// Found by content rather than by its "Captions | …" title, which is
+    /// localized: any non-standard window holding caption rows is it. (The
+    /// compact view Teams shows when the meeting window is hidden is also a
+    /// non-standard window, but it carries no captions.)
+    private func captionsWindow(_ app: AXUIElement) -> AXUIElement? {
+        axWindows(app).first { window in
+            axString(window, kAXSubroleAttribute) != "AXStandardWindow"
+                && findElement(from: window, where: isCaptionEntry) != nil
+        }
+    }
+
+    /// The ordinary meeting window — the one with the toolbar and the timer.
+    private func standardWindow(_ app: AXUIElement) -> AXUIElement? {
+        axWindows(app).first { axString($0, kAXSubroleAttribute) == "AXStandardWindow" }
     }
 
     func captionEntries(in container: AXUIElement) -> [CaptionEntry] {
@@ -1072,8 +1202,159 @@ struct TeamsApp: MeetingApp {
         }
     }
 
+    /// True while the captions panel is up, in the window or popped out of it.
+    /// Missing the popped-out case would read as "captions are off" and make
+    /// --auto-captions press ⇧⌘A, switching them off for real.
     func captionsPanelOpen(_ app: AXUIElement) -> Bool {
-        findElement(from: app) { captionPanelIDs.contains(axDomID($0)) } != nil
+        if captionsWindow(app) != nil { return true }
+        return findElement(from: app) { captionPanelIDs.contains(axDomID($0)) } != nil
+    }
+
+    /// Teams stops updating a meeting window that is COMPLETELY covered by
+    /// another window: the call timer freezes, the caption rows stop arriving,
+    /// and the transcript quietly stops. (macOS reports the window as
+    /// occluded; Teams parks it and puts up the small "compact view" instead.
+    /// A single visible pixel is enough to keep it running, and it resumes the
+    /// moment any of it shows again.)
+    ///
+    /// The way out is the captions panel's own window: it goes on rendering
+    /// while the meeting window is parked, because caption text does not come
+    /// from that renderer. So pop it out and park it on the second display,
+    /// where nothing covers it. Without --popout-captions, say what is
+    /// happening rather than let the transcript trail off in silence.
+    func maintainCaptionSurface(_ app: AXUIElement, pid: pid_t, now: Date, popOut: Bool) {
+        if let window = captionsWindow(app) {
+            // Already popped out, by us or by hand. Leave it where it is —
+            // that placement is the user's — but take the pin off, since it
+            // does not need to be in front to keep working.
+            guard !handledCaptionsWindow else { return }
+            handledCaptionsWindow = true
+            unpin(window, pid: pid)
+            return
+        }
+        guard popOut else { return warnIfStalled(app, now: now) }
+        // Nothing to pop out until the panel exists.
+        guard findElement(from: app, where: { captionPanelIDs.contains(axDomID($0)) }) != nil
+            || findElement(from: app, where: isCaptionEntry) != nil else { return }
+        guard popOutAttempts < 2, now >= nextPopOutAttempt else { return }
+        popOutAttempts += 1
+        nextPopOutAttempt = now.addingTimeInterval(60)
+        popOutCaptions(app, pid: pid)
+    }
+
+    /// Press the panel's "Pop out", putting the pointer, the window width and
+    /// the front app back afterwards. Takes a few seconds and blocks the poll
+    /// loop, which is why maintainCaptionSurface only allows two tries.
+    private func popOutCaptions(_ app: AXUIElement, pid: pid_t) {
+        guard let window = standardWindow(app) else { return }
+        let priorApp = NSWorkspace.shared.frontmostApplication
+        let priorPointer = CGEvent(source: nil)?.location
+        let originalSize = axFrame(window).size
+        var widened = false
+
+        NSRunningApplication(processIdentifier: pid)?.activate()
+        usleep(300_000)
+        var button = findElement(from: app) { axDomID($0) == popOutButtonID }
+        if button == nil, originalSize.width < popOutRevealWidth {
+            // Narrow window: the control is in an overflow menu accessibility
+            // cannot open, so make room for it and put the width back after.
+            widened = axSetSize(window, CGSize(width: popOutRevealWidth, height: originalSize.height))
+            for _ in 0..<8 where button == nil {
+                usleep(400_000)
+                button = findElement(from: app) { axDomID($0) == popOutButtonID }
+            }
+        }
+
+        defer {
+            if widened { axSetSize(window, originalSize) }
+            if let priorPointer {
+                CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                        mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
+            }
+            priorApp?.activate()
+        }
+
+        guard let button else {
+            status("could not find Teams' captions pop-out control; captions will pause whenever the meeting window is fully covered")
+            return
+        }
+        let (origin, size) = axFrame(button)
+        clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2))
+        for _ in 0..<12 {
+            usleep(500_000)
+            if let popped = captionsWindow(app) {
+                handledCaptionsWindow = true
+                unpin(popped, pid: pid)
+                status("moved Teams' captions into their own window; a covered meeting window can no longer pause them")
+                return
+            }
+        }
+    }
+
+    /// Take the pin off the captions window. Teams pops it out floating above
+    /// everything, which is in the way for no gain: unlike the meeting window,
+    /// this one goes on rendering captions while completely covered — measured
+    /// on a live call, with the meeting window parked at the same time — so it
+    /// has no reason to be in front.
+    ///
+    /// Only ever pressed while the window is known to be PINNED, and the check
+    /// is repeated before every press. The control is a toggle, so acting on a
+    /// guess would pin a window that was fine; one the window server won't
+    /// report on (on another Space) is left alone. The press is repeated once
+    /// because the first click on a background window can be swallowed as the
+    /// click that focuses it.
+    ///
+    /// The button only exists while the window is pinned — it IS the "Unpin"
+    /// affordance — which is exactly when this needs it.
+    private func unpin(_ window: AXUIElement, pid: pid_t) {
+        let priorApp = NSWorkspace.shared.frontmostApplication
+        let priorPointer = CGEvent(source: nil)?.location
+        defer {
+            if let priorPointer {
+                CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                        mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
+            }
+            priorApp?.activate()
+        }
+        NSRunningApplication(processIdentifier: pid)?.activate()
+        for _ in 0..<2 {
+            usleep(300_000)
+            guard let layer = windowLayer(pid: pid, frame: axFrame(window)), layer > 0,
+                  let button = findElement(from: window, where: { axDomID($0) == pinButtonID })
+            else { return }
+            let (origin, size) = axFrame(button)
+            clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
+                                                 y: origin.y + size.height / 2))
+        }
+    }
+
+    /// Warn — at most every ten minutes — when the call timer has stopped,
+    /// which means Teams has parked the window and no captions are coming.
+    private func warnIfStalled(_ app: AXUIElement, now: Date) {
+        guard let window = standardWindow(app),
+              let clock = findElement(from: window, where: { axDomID($0) == "call-duration-custom" })
+        else { return }
+        let reading = axStaticTexts(clock).joined(separator: " ")
+        guard !reading.isEmpty else { return }
+        if reading != lastClock {
+            lastClock = reading
+            clockChangedAt = now
+            return
+        }
+        guard clockChangedAt != .distantPast,
+              now.timeIntervalSince(clockChangedAt) > 10,
+              now.timeIntervalSince(warnedStalledAt) > 600 else { return }
+        warnedStalledAt = now
+        status("Microsoft Teams has stopped updating its meeting window because another window covers it completely; captions are paused until part of it shows again. --popout-captions avoids this.")
+    }
+
+    func resetCaptureState() {
+        lastClock = ""
+        clockChangedAt = .distantPast
+        warnedStalledAt = .distantPast
+        popOutAttempts = 0
+        nextPopOutAttempt = .distantPast
+        handledCaptionsWindow = false
     }
 
     /// Teams' own shortcut (⇧⌘A), delivered straight to the process so it
@@ -1870,6 +2151,7 @@ final class Session {
         }
 
         if options.autoCaptions { ensureCaptionsOn(app: app, pid: pid, now: now) }
+        meetingApp.maintainCaptionSurface(app, pid: pid, now: now, popOut: options.popOutCaptions)
         if options.captureCaptions { pollCaptions(now: now) }
         if options.captureChat { pollChat(now: now) }
     }
