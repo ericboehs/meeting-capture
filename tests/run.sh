@@ -30,3 +30,7 @@ swiftc -o "$out/entry-check" "$out/entry.swift"
 
 chmod +x tests/installer.sh 2>/dev/null || true
 tests/installer.sh
+
+# Merge tool: the collapse rules that repair a split or flooded transcript.
+chmod +x tests/merge.sh 2>/dev/null || true
+tests/merge.sh

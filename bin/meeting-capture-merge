@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Merge meeting-capture transcripts into one clean pair of files.
+
+Two situations produce a split or dirty record of a single conversation, and
+this repairs both:
+
+  SPLIT. The daemon opens a new transcript every time it starts, so restarting
+  it mid-meeting (a rebuild, a crash, launchd relaunching it) leaves one
+  meeting spread over several files. Worse, at restart the app's caption panel
+  still shows the last few utterances, and the fresh session reads them as new
+  — so the seam between two files repeats itself.
+
+  GROWTH FLOOD. Captions grow in place. A daemon that finalized a row too
+  eagerly wrote it once per growth tick, each line repeating the last with a
+  few words added:
+
+      [11:48:15] Alex Teal: Yeah, I told him about Wilson. So, like, that's
+      [11:48:16] Alex Teal: Yeah, I told him about Wilson. So, like, that's how this all
+
+Both are the same shape — an utterance recorded several times, each recording
+a prefix of the next — so one collapse pass fixes both. The rule mirrors the
+daemon's own: when one line is a prefix of another from the same speaker, the
+longer one is the utterance and the shorter one was a snapshot of it being
+spoken. Continuation events (the daemon's "continues": true tails) are stitched
+back onto the row they extend.
+
+Prefix collapsing only applies to lines that are NEARBY — within a few of that
+speaker's own lines, and within a time window — so genuine repetition later in
+the meeting survives ("All right." is a prefix of a great many sentences).
+
+Inputs are never modified; the merged pair is written alongside them.
+
+  meeting-capture-merge FIRST.jsonl SECOND.jsonl [...]
+  meeting-capture-merge -o ~/merged/standup *.jsonl
+
+Either half of a pair may be named: FILE.txt resolves to FILE.jsonl, which is
+the file that carries the structure this needs.
+"""
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# How far back a prefix can reach when collapsing. Both limits must hold: a
+# handful of that speaker's most recent lines, and a time window. The flood
+# writes a row's snapshots back to back seconds apart, so these are generous
+# for the repair while keeping genuine repetition later in the call intact.
+DEFAULT_LOOKBACK = 4
+DEFAULT_WINDOW = 180.0
+
+
+def parse_ts(value):
+    """ISO-8601 with offset, as the daemon writes it."""
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def jsonl_path(raw):
+    path = Path(raw).expanduser()
+    if path.suffix == ".txt":
+        path = path.with_suffix(".jsonl")
+    if not path.exists():
+        sys.exit(f"no such transcript: {path}")
+    return path
+
+
+def read_source(path):
+    """Split one transcript into (metadata, stopped, events)."""
+    metadata, stopped, events = None, None, []
+    for number, line in enumerate(path.open(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            # A killed daemon can leave a half-written final line. Everything
+            # before it is still good, and dropping the whole file over one
+            # torn line would lose the meeting.
+            print(f"{path}:{number}: skipping unreadable line ({error})", file=sys.stderr)
+            continue
+        if event.get("type") == "metadata":
+            if event.get("event") == "stopped":
+                stopped = event
+            elif metadata is None:
+                metadata = event
+            continue
+        events.append(event)
+    return metadata, stopped, events
+
+
+def sort_key(source):
+    """Order sources by when they began, not by the order given."""
+    _, (metadata, _, events) = source
+    for candidate in (
+        (metadata or {}).get("recorded_at"),
+        events[0].get("ts") if events else None,
+    ):
+        stamp = parse_ts(candidate)
+        if stamp:
+            return stamp
+    return datetime.max
+
+
+def within(event, other, window):
+    left, right = parse_ts(event.get("ts")), parse_ts(other.get("ts"))
+    if left is None or right is None:
+        return True  # no clock to judge by: fall back to the lookback limit
+    return abs((left - right).total_seconds()) <= window
+
+
+def stitch_continuation(event, kept, origin):
+    """Fold a "continues" tail back into the row it extends.
+
+    The daemon emits only the words a row added after it was already written,
+    so the tail is meaningless on its own. Rejoin them and the row reads as the
+    one utterance it was.
+    """
+    node = event.get("node_id")
+    if node is None:
+        return False
+    for index in reversed(range(len(kept))):
+        candidate = kept[index]
+        if candidate["_origin"] != origin or candidate.get("node_id") != node:
+            continue
+        if candidate.get("speaker") != event.get("speaker"):
+            return False
+        candidate["text"] = f"{candidate['text']} {event['text']}".strip()
+        candidate["ended_at"] = event.get("ended_at", candidate.get("ended_at"))
+        return True
+    return False
+
+
+def collapse(events, lookback, window):
+    """Drop snapshots of an utterance, keeping the fullest form of each.
+
+    Returns (kept, dropped, absorbed): dropped counts lines removed because a
+    longer form of them survives; absorbed counts lines folded into another.
+    """
+    kept, dropped, absorbed = [], 0, 0
+    for event in events:
+        if event.get("type") != "caption":
+            kept.append(event)
+            continue
+        if event.get("continues") and stitch_continuation(event, kept, event["_origin"]):
+            absorbed += 1
+            continue
+        text, speaker = event.get("text", ""), event.get("speaker")
+        seen, replaced, superseded = 0, False, False
+        for index in reversed(range(len(kept))):
+            candidate = kept[index]
+            if candidate.get("type") != "caption" or candidate.get("speaker") != speaker:
+                continue
+            seen += 1
+            if seen > lookback or not within(event, candidate, window):
+                break
+            other = candidate.get("text", "")
+            if other.startswith(text):
+                # The file already holds this utterance, in full or fuller.
+                superseded = True
+                break
+            if text.startswith(other):
+                # Same words, further along: this IS that line, later.
+                candidate["text"] = text
+                candidate["ended_at"] = event.get("ended_at", candidate.get("ended_at"))
+                replaced = True
+                break
+        if superseded or replaced:
+            dropped += 1
+            continue
+        kept.append(event)
+    return kept, dropped, absorbed
+
+
+def text_line(event):
+    stamp = parse_ts(event.get("ts"))
+    clock = stamp.strftime("%H:%M:%S") if stamp else "??:??:??"
+    tag = "(chat) " if event.get("type") == "chat" else ""
+    return f"[{clock}] {tag}{event.get('speaker', '')}: {event.get('text', '')}"
+
+
+def merged_metadata(sources, names):
+    """One header for the whole conversation, honest about its provenance."""
+    first = next((metadata for _, (metadata, _, _) in sources if metadata), {})
+    merged = dict(first)
+    merged["merged_from"] = names
+    return merged
+
+
+def merged_stopped(sources):
+    """The last stop wins, with losses summed across every session."""
+    stops = [stopped for _, (_, stopped, _) in sources if stopped]
+    if not stops:
+        return None
+    merged = dict(stops[-1])
+    merged["lost_events"] = sum(int(stop.get("lost_events", 0)) for stop in stops)
+    starts = [parse_ts((metadata or {}).get("recorded_at")) for _, (metadata, _, _) in sources]
+    started = next((stamp for stamp in starts if stamp), None)
+    ended = parse_ts(merged.get("stopped_at"))
+    if started and ended:
+        total = max(0, int((ended - started).total_seconds()))
+        merged["duration"] = f"{total // 3600:02d}:{total // 60 % 60:02d}:{total % 60:02d}"
+    return merged
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Merge meeting-capture transcripts, collapsing repeated utterances.")
+    parser.add_argument("files", nargs="+", metavar="FILE",
+                        help=".jsonl (or .txt) transcripts of the same meeting")
+    parser.add_argument("-o", "--output", metavar="BASE",
+                        help="write BASE.jsonl and BASE.txt (default: FIRST-merged)")
+    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK, metavar="N",
+                        help=f"how many of a speaker's own lines a prefix may reach back "
+                             f"(default {DEFAULT_LOOKBACK})")
+    parser.add_argument("--window", type=float, default=DEFAULT_WINDOW, metavar="SECONDS",
+                        help=f"how far back in time a prefix may reach (default {DEFAULT_WINDOW:g})")
+    parser.add_argument("--quiet", action="store_true", help="print nothing on success")
+    args = parser.parse_args()
+
+    paths = [jsonl_path(raw) for raw in args.files]
+    sources = [(path, read_source(path)) for path in paths]
+    sources.sort(key=sort_key)
+
+    events = []
+    for origin, (path, (_, _, source_events)) in enumerate(sources):
+        for event in source_events:
+            # Continuation tails and node ids only mean anything within the
+            # session that wrote them: a native app's row ids are memory
+            # addresses, and a restart reuses them for unrelated rows.
+            event["_origin"] = origin
+            events.append(event)
+
+    kept, dropped, absorbed = collapse(events, args.lookback, args.window)
+    for event in kept:
+        event.pop("_origin", None)
+
+    base = Path(args.output).expanduser() if args.output else \
+        paths[0].with_name(paths[0].stem + "-merged")
+    base.parent.mkdir(parents=True, exist_ok=True)
+    names = [path.name for path, _ in sources]
+
+    metadata = merged_metadata(sources, names)
+    stopped = merged_stopped(sources)
+    with base.with_suffix(".jsonl").open("w") as out:
+        for event in [metadata] + kept + ([stopped] if stopped else []):
+            # Compact, sorted keys: byte-for-byte the shape the daemon writes,
+            # so anything that reads its jsonl reads a merged file unchanged.
+            out.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+
+    header = [f"{metadata.get('meeting', 'meeting')} ({metadata.get('app', '')})".strip()]
+    if metadata.get("recorded_at"):
+        header.append(f"recording started {metadata['recorded_at']}")
+    if metadata.get("meeting_started_at"):
+        header.append(f"meeting started   {metadata['meeting_started_at']}")
+    header.append("[hh:mm:ss] is the time of day")
+    header.append("merged from " + ", ".join(names))
+    with base.with_suffix(".txt").open("w") as out:
+        out.write("".join(f"# {line}\n" for line in header) + "\n")
+        for event in kept:
+            out.write(text_line(event) + "\n")
+
+    if not args.quiet:
+        spoken = sum(1 for event in kept if event.get("type") == "caption")
+        print(f"merged {len(sources)} transcript(s) -> {base.with_suffix('.txt')}")
+        print(f"  {spoken} line(s) kept, {dropped} snapshot(s) collapsed, "
+              f"{absorbed} continuation(s) rejoined")
+
+
+if __name__ == "__main__":
+    main()

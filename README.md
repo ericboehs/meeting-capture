@@ -199,6 +199,28 @@ Wall-clock `ts` and `ended_at` on every caption make this useful beyond reading:
 align the timestamps against a Whisper transcript of the same meeting and you
 can attribute diarised audio to real names.
 
+### Merging a split meeting
+
+The daemon opens a new transcript every time it starts, so restarting it
+mid-meeting (a rebuild, a crash, launchd relaunching it) leaves one
+conversation spread over two files. The seam repeats itself, too: the app's
+caption panel still shows the last few utterances, and the fresh session reads
+them as new.
+
+```sh
+bin/meeting-capture-merge ~/.local/share/meeting-capture/20260826_11{4653,5435}-zoom-*.jsonl
+# merged 2 transcript(s) -> …/20260826_114653-zoom-meeting-40-minutes-merged.txt
+#   204 line(s) kept, 94 snapshot(s) collapsed, 0 continuation(s) rejoined
+```
+
+It writes a new `.jsonl`/`.txt` pair (`-o BASE` to choose where) and never
+touches the originals. Along the way it collapses lines that are snapshots of
+one utterance being spoken — where one is a prefix of another from the same
+speaker, close by — which also cleans up transcripts recorded before the
+growth-flood fixes, and rejoins `"continues": true` tails to the row they
+extend. The rule stays local (`--lookback`, `--window`) so that genuine
+repetition later in the meeting survives.
+
 ## How it works
 
 The daemon polls the accessibility tree of each supported app:
@@ -266,7 +288,9 @@ tests/run.sh
 
 They compile the daemon with its entry point stripped and drive the rest.
 The accessibility-facing code needs a real meeting to reason about, so it is
-not covered here.
+not covered here. The same run also covers the installer's signing tri-state
+and agent restart (`tests/installer.sh`) and the merge tool's collapse rules
+(`tests/merge.sh`); both can be run on their own.
 
 ## Privacy
 
