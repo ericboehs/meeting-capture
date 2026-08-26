@@ -557,6 +557,48 @@ do {
     expectEqual(ledger.isPopulated(pid: 20), false, "populated drops with its dead pid")
 }
 
+// --- Re-opening a finalized caption row only on genuine growth ----------
+//
+// Regression: a Teams row frozen mid-revision ("...via CPRS. The") sat on
+// screen for four minutes and was written eight times, ~33s apart. The old
+// growth check scanned the `written` buffer for anything the current text
+// extended, so the row's OWN earlier, shorter write ("...via CPRS.") made it
+// look like it was still growing on every poll — re-opening it forever, paced
+// only by alreadyWritten's 30s TTL.
+
+do {
+    let clock = FakeClock(start: epoch, step: 0.5)
+    let s = injectedSession(clock: clock)
+
+    expectEqual(s.reopensAfterGrowth(id: "3570", text: "anything"), false,
+                "a row we never finalized is not a re-open candidate")
+
+    // Teams' real sequence: the row is finalized short, then genuinely grows.
+    let short = "...enter patient vitals via CPRS."
+    let grown = "...enter patient vitals via CPRS. The"
+    s.finalizedText["3570"] = short
+    expectTrue(s.reopensAfterGrowth(id: "3570", text: grown),
+               "a row that genuinely extended its own finalized text re-opens")
+
+    // ...and then freezes there. THIS is the case that used to loop forever:
+    // `grown` is still a strict extension of `short`, which remains in the
+    // written buffer, but the row itself has not moved since we finalized it.
+    s.finalizedText["3570"] = grown
+    expectEqual(s.reopensAfterGrowth(id: "3570", text: grown), false,
+                "a row frozen at its finalized text never re-opens, however long it lingers")
+
+    // A different sentence under a recycled id is not growth either; that path
+    // belongs to the normal new-utterance branch.
+    expectEqual(s.reopensAfterGrowth(id: "3570", text: "A completely different sentence."), false,
+                "replacement text is not growth")
+    expectEqual(s.reopensAfterGrowth(id: "3570", text: short), false,
+                "text shrinking back below the finalized form is not growth")
+
+    // Growth is per row: one row's history must not speak for another's.
+    expectEqual(s.reopensAfterGrowth(id: "4803", text: grown), false,
+                "another row's finalized text cannot re-open this one")
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")

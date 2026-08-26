@@ -1610,6 +1610,11 @@ final class Session {
     private var written: [(speaker: String, text: String, at: Date)] = []
     /// Ids already written but still on screen.
     private var finalized = Set<String>()
+    /// What each finalized id's text was AT THE MOMENT WE FINALIZED IT. Growth
+    /// has to be judged per row against its own last state: scanning `written`
+    /// instead lets an earlier, shorter write OF THE SAME ROW masquerade as
+    /// growth forever, re-opening a row that is actually frozen.
+    var finalizedText: [String: String] = [:]
     var ledger = WakeLedger()
     /// What `[HH:MM:SS]` counts from: the app's clock (connection time) once
     /// it tells us, otherwise the moment we attached.
@@ -1941,13 +1946,15 @@ final class Session {
         }
         let visible = Set(entries.map(\.id))
         finalized.formIntersection(visible) // let ids be reused once they are gone
+        finalizedText = finalizedText.filter { visible.contains($0.key) }
         for entry in entries {
             if finalized.contains(entry.id) {
                 // Same row kept growing after we idle-finalized it (Zoom).
-                let grew = written.contains {
-                    $0.speaker == entry.speaker && entry.text.hasPrefix($0.text) && entry.text != $0.text
+                if reopensAfterGrowth(id: entry.id, text: entry.text) {
+                    finalized.remove(entry.id)
+                } else {
+                    continue
                 }
-                if grew { finalized.remove(entry.id) } else { continue }
             }
             if var utterance = activeCaptions[entry.id] {
                 if utterance.text != entry.text {
@@ -2061,10 +2068,27 @@ final class Session {
         }
     }
 
+    /// Whether a row we already finalized has GENUINELY grown since, and so
+    /// must be re-opened rather than skipped (Zoom keeps extending a row after
+    /// it has gone idle).
+    ///
+    /// Judged against this row's own text at finalize time. The older form of
+    /// this check scanned `written` for anything the current text extends,
+    /// which meant a row that Teams froze mid-revision — leaving it a strict
+    /// extension of its own earlier, shorter write — looked like it was still
+    /// growing on every single poll. That re-opened it forever, and the only
+    /// brake was alreadyWritten's 30s TTL, so the frozen row was re-emitted
+    /// every ~33s for as long as it stayed on screen.
+    func reopensAfterGrowth(id: String, text: String) -> Bool {
+        guard let atFinalize = finalizedText[id] else { return false }
+        return text != atFinalize && text.hasPrefix(atFinalize)
+    }
+
     private func finalizeCaption(_ id: String, at date: Date) {
         guard let utterance = activeCaptions.removeValue(forKey: id) else { return }
         captionOrder.removeAll { $0 == id }
         finalized.insert(id)
+        finalizedText[id] = utterance.text
         guard !utterance.text.isEmpty else { return }
         guard !supersededByActive(utterance, id: id), !alreadyWritten(utterance, id: id, now: date) else { return }
         // emit queues failed writes onto the ordered backlog, which finish()
