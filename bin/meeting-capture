@@ -1149,10 +1149,37 @@ final class TeamsApp: MeetingApp {
         var title = ""
         if let anchor, let windowTitle = windowTitle(containing: anchor) { title = windowTitle }
         if title.isEmpty { title = firstWindowTitle(app) }
-        title = title
-            .replacingOccurrences(of: "| Microsoft Teams", with: "")
-            .trimmingCharacters(in: .whitespaces)
+        title = TeamsApp.stripChrome(title, siblings: axWindows(app).map { axString($0, kAXTitleAttribute) })
         return title.isEmpty ? "Teams meeting" : title
+    }
+
+    /// The meeting's own name, given one window's title and every other Teams
+    /// window's.
+    ///
+    /// Teams' side windows label themselves by putting a word in FRONT of the
+    /// meeting title: "Meeting compact view | Standup | Microsoft Teams",
+    /// "Captions | Standup | Microsoft Teams". That matters because when the
+    /// meeting window is covered the anchor is found in the compact view, and
+    /// its label would become the transcript's name.
+    ///
+    /// The label is localized, so it can't be matched by name, and splitting
+    /// on " | " is wrong for a meeting called "Roadmap | Q3". Instead: the
+    /// meeting window titles itself with the bare meeting name, so among the
+    /// sibling titles the shortest one that is a suffix of this one is it.
+    static func stripChrome(_ title: String, siblings: [String]) -> String {
+        func cleaned(_ text: String) -> String {
+            text.replacingOccurrences(of: "| Microsoft Teams", with: "")
+                .trimmingCharacters(in: .whitespaces)
+        }
+        let base = cleaned(title)
+        var shortest = base
+        for sibling in siblings {
+            let candidate = cleaned(sibling)
+            guard !candidate.isEmpty, candidate.count < shortest.count,
+                  base.hasSuffix(candidate) else { continue }
+            shortest = candidate
+        }
+        return shortest
     }
 
     private func isCaptionEntry(_ element: AXUIElement) -> Bool {

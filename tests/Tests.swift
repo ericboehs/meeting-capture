@@ -67,6 +67,35 @@ expectEqual(Recorder.slugify("Weekly Sync | Microsoft Teams"), "weekly-sync", "s
 expectEqual(Recorder.slugify("!!!"), "meeting", "all-punctuation title falls back to 'meeting'")
 expectEqual(Recorder.slugify("Ada's 2nd standup!"), "ada-s-2nd-standup", "slug keeps letters and digits")
 
+// --- Naming a Teams meeting ---------------------------------------------
+// Teams' side windows put a label in FRONT of the meeting's own title. When
+// the meeting window is covered, the meeting is found in the compact view,
+// and the label would otherwise end up naming the transcript. The label is
+// localized, so it is spotted structurally: the meeting window titles itself
+// with the bare name, so the shortest sibling title that is a suffix wins.
+do {
+    let meeting = "Standup | Microsoft Teams"
+    let compact = "Meeting compact view | Standup | Microsoft Teams"
+    let captions = "Captions | Standup | Microsoft Teams"
+
+    expectEqual(TeamsApp.stripChrome(compact, siblings: [meeting, compact, captions]), "Standup",
+                "the compact view's label does not become the meeting's name")
+    expectEqual(TeamsApp.stripChrome(captions, siblings: [meeting, compact, captions]), "Standup",
+                "nor does the captions window's")
+    expectEqual(TeamsApp.stripChrome(meeting, siblings: [meeting, compact, captions]), "Standup",
+                "the meeting window's own title is already right")
+    expectEqual(TeamsApp.stripChrome(compact, siblings: [compact]), "Meeting compact view | Standup",
+                "with no meeting window to compare against, keep every word: a\n"
+                + "      label cannot be told from a name by punctuation alone")
+    expectEqual(TeamsApp.stripChrome("Meeting compact view | Roadmap | Q3 | Microsoft Teams",
+                                     siblings: ["Roadmap | Q3 | Microsoft Teams"]),
+                "Roadmap | Q3",
+                "a meeting whose name contains a pipe survives")
+    expectEqual(TeamsApp.stripChrome("Standup | Microsoft Teams", siblings: ["Chat | Microsoft Teams"]),
+                "Standup",
+                "a sibling that is not a suffix is not a chrome label")
+}
+
 // --- SegmentHistory -----------------------------------------------------
 // Caption surfaces without ids (Meet blocks, Slack overlay events) get their
 // identity from position in the conversation. Repeated utterances must stay
