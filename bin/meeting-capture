@@ -330,9 +330,13 @@ func parseMeetingClock(_ raw: String) -> TimeInterval? {
     }
 }
 
-/// How `[HH:MM:SS]` stamps are rendered. Chosen once, when the first line is
-/// written: the header documents what the stamps mean, so switching the
+/// How the jsonl `elapsed` field is rendered. Chosen once, when the first
+/// line is written: the metadata documents what it means, so switching the
 /// reference halfway through a file would make it contradict itself.
+///
+/// The .txt transcript does NOT use this — its stamps are always the time of
+/// day (see Recorder.record), which is what makes a line findable in a
+/// calendar, a chat log, or someone else's recording.
 enum TimestampMode {
     /// Counting from a reference point — the app's connection clock when it
     /// displays a call clock, otherwise the moment recording began.
@@ -490,9 +494,9 @@ final class Recorder {
         return true
     }
 
-    /// Head the transcript with what the bracketed times mean. Without it a
-    /// file of relative stamps can't be placed in time at all, and one of
-    /// wall-clock stamps doesn't say which day. Best-effort: a failure here
+    /// Head the transcript with what the bracketed times mean. Stamps are
+    /// wall-clock, so the header is what says which DAY they belong to, and
+    /// (when known) when the meeting itself began. Best-effort: a failure here
     /// is logged and otherwise ignored — losing the header must never cost
     /// transcript lines.
     func writeHeader(_ lines: [String]) {
@@ -509,7 +513,12 @@ final class Recorder {
     /// happened; a text write that fails after jsonl succeeded cannot be
     /// undone, so the caller gets .jsonOnly(line) to retry text-only.
     func record(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any] = [:]) -> WriteOutcome {
+        // Two renderings of one instant. The jsonl keeps the meeting-relative
+        // `elapsed` field for anyone reasoning about position within the call;
+        // the transcript gets the time of day, which is what you actually need
+        // to line a quote up against a calendar or a chat message.
         let stamped = elapsed(date)
+        let clock = Recorder.clockText(from: date)
         var payload: [String: Any] = [
             "type": kind,
             "speaker": speaker,
@@ -520,7 +529,7 @@ final class Recorder {
         payload.merge(extra) { current, _ in current }
         guard writeJSON(payload) else { return .failed }
         let tag = kind == "chat" ? "(chat) " : ""
-        let line = "[\(stamped)] \(tag)\(speaker): \(body)"
+        let line = "[\(clock)] \(tag)\(speaker): \(body)"
         do {
             try text.append(Data((line + "\n").utf8))
         } catch {
@@ -1684,12 +1693,8 @@ final class Session {
                       "recording started \(Recorder.isoFormatter.string(from: startedAt))"]
         if timelineResolved {
             header.append("meeting started   \(Recorder.isoFormatter.string(from: timelineStart))")
-            header.append("[hh:mm:ss] counts from the app's connection clock")
-        } else if meetingApp.reportsMeetingClock {
-            header.append("[hh:mm:ss] counts from when recording started")
-        } else {
-            header.append("[hh:mm:ss] is the time of day")
         }
+        header.append("[hh:mm:ss] is the time of day")
         created.writeHeader(header)
         recorder = created
         let pointer = options.stateDirectory + "/current"
@@ -1801,11 +1806,9 @@ final class Session {
     }
 
     /// Matches how the recorder stamps finished lines, so the live region and
-    /// the transcript above it read the same way.
+    /// the transcript above it read the same way — both are the time of day.
     private func stamp(_ date: Date) -> String {
-        meetingApp.reportsMeetingClock
-            ? elapsedString(from: timelineStart, to: date)
-            : Recorder.clockText(from: date)
+        Recorder.clockText(from: date)
     }
 
     func tick(app: AXUIElement, pid: pid_t, now: Date) {

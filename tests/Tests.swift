@@ -258,7 +258,9 @@ final class FailOnceSink: TranscriptSink {
 func injectedRecorder(jsonl: TranscriptSink, text: TranscriptSink) -> Recorder {
     var opts = Options()
     opts.quiet = true
-    // .elapsed makes stamps deterministic ([00:00:00] from the epoch start).
+    // .elapsed keeps the jsonl `elapsed` field deterministic (00:00:00 from the
+    // epoch start). Transcript stamps are wall-clock and therefore timezone
+    // dependent, so tests compare against clockText rather than a literal.
     // URLs are unique per call so a future real-sink test can't collide.
     let dir = URL(fileURLWithPath: NSTemporaryDirectory())
     return Recorder(options: opts, startedAt: epoch, mode: .elapsed(from: epoch),
@@ -267,12 +269,29 @@ func injectedRecorder(jsonl: TranscriptSink, text: TranscriptSink) -> Recorder {
                     jsonl: jsonl, text: text)
 }
 
+/// The wall-clock stamp the transcript uses for `date`.
+func clockStamp(_ date: Date) -> String { Recorder.clockText(from: date) }
+
+// The two files stamp the same instant differently on purpose: the jsonl keeps
+// meeting-relative `elapsed`, the transcript carries the time of day.
+do {
+    let jsonl = MemorySink(path: "/tmp/j.jsonl"), text = MemorySink(path: "/tmp/t.txt")
+    let r = injectedRecorder(jsonl: jsonl, text: text)
+    _ = r.record(kind: "caption", speaker: "A", body: "split", at: epoch.addingTimeInterval(3661))
+    expectTrue(jsonl.string.contains("\"elapsed\":\"01:01:01\""),
+               "jsonl keeps the meeting-relative elapsed field")
+    expectTrue(text.string.contains("[\(clockStamp(epoch.addingTimeInterval(3661)))] A: split"),
+               "transcript stamps the time of day, not the elapsed offset")
+    expectTrue(!text.string.contains("[01:01:01]"),
+               "transcript does not carry the elapsed offset at all")
+}
+
 // All-paths-succeed: both files carry the line.
 do {
     let jsonl = MemorySink(path: "/tmp/j.jsonl"), text = MemorySink(path: "/tmp/t.txt")
     let r = injectedRecorder(jsonl: jsonl, text: text)
     expectEqual(r.record(kind: "caption", speaker: "A", body: "hello", at: epoch),
-                WriteOutcome.written("[00:00:00] A: hello"),
+                WriteOutcome.written("[\(clockStamp(epoch))] A: hello"),
                 "record returns .written when both sinks accept")
     expectTrue(jsonl.string.contains("\"text\":\"hello\""), "jsonl sink got the event JSON")
     expectTrue(text.string.contains("A: hello"), "text sink got the transcript line")
@@ -293,7 +312,7 @@ do {
     let jsonl = MemorySink(path: "/tmp/j.jsonl"), text = ClosedSink(path: "/tmp/t.txt")
     let r = injectedRecorder(jsonl: jsonl, text: text)
     expectEqual(r.record(kind: "caption", speaker: "B", body: "owed", at: epoch),
-                WriteOutcome.jsonOnly("[00:00:00] B: owed"),
+                WriteOutcome.jsonOnly("[\(clockStamp(epoch))] B: owed"),
                 "record returns .jsonOnly when only the text sink rejects")
     expectEqual(jsonl.string.components(separatedBy: "\n").filter { $0.contains("\"owed\"") }.count,
                 1, "jsonl carries the event exactly once despite the text failure")
@@ -306,7 +325,7 @@ do {
     let jsonl = FailOnceSink(path: "/tmp/j.jsonl", failAt: 2), text = MemorySink(path: "/tmp/t.txt")
     let r = injectedRecorder(jsonl: jsonl, text: text)
     expectEqual(r.record(kind: "caption", speaker: "C", body: "one", at: epoch),
-                WriteOutcome.written("[00:00:00] C: one"), "first write lands")
+                WriteOutcome.written("[\(clockStamp(epoch))] C: one"), "first write lands")
     expectEqual(r.record(kind: "caption", speaker: "C", body: "two", at: epoch),
                 WriteOutcome.failed, "flaky sink rejects the second event")
     expectEqual(r.writeJSON(["type": "retry"]), true, "third attempt succeeds after transient failure")

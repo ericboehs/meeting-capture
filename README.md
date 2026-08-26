@@ -15,9 +15,9 @@ closes the file. Nothing to remember, no button to press.
 ```
 $ meeting-capture
 [2026-08-24T14:40:24-05:00] meeting-capture: joined "Weekly Sync" in Microsoft Teams (pid 32731)
-[00:00:04] Ada Lovelace: Morning everyone, let's get started.
-[00:00:11] Grace Hopper: I pushed the caching fix last night.
-[00:00:19] Ada Lovelace: Nice, did the p99 move? ▍
+[14:40:28] Ada Lovelace: Morning everyone, let's get started.
+[14:40:35] Grace Hopper: I pushed the caching fix last night.
+[14:40:43] Ada Lovelace: Nice, did the p99 move? ▍
 ```
 
 The last line updates in place as the sentence is spoken, then scrolls up when
@@ -154,14 +154,15 @@ still readable years later on its own:
 # Weekly Sync (Microsoft Teams)
 # recording started 2026-08-24T14:05:10-05:00
 # meeting started   2026-08-24T13:28:15-05:00
-# [hh:mm:ss] counts from the app's connection clock
+# [hh:mm:ss] is the time of day
 
-[00:37:33] Grace Hopper: Mic check 1-2.
+[14:05:48] Grace Hopper: Mic check 1-2.
 ```
 
-Join an hour into a call and the first line reads `[01:02:11]`; the header is
-what turns that back into a time of day. Where the app publishes no clock the
-lines are stamped with the time of day already, and the header says so.
+Transcript stamps are always the time of day, so a quote can be lined up
+against a calendar entry, a chat message, or someone else's recording without
+arithmetic. The header supplies the date, and — where the app publishes a call
+clock — when the meeting was already running.
 (One naming caveat: the header line "meeting started" and the jsonl field
 `meeting_started_at` are historical names — they record when this *participant*
 connected per the app's own clock, not when the meeting was convened.)
@@ -177,23 +178,22 @@ Files are created on the first line written, so a meeting nobody speaks in
 leaves nothing behind. Ctrl-C or leaving the meeting flushes whatever was
 mid-sentence.
 
-`elapsed` counts from the app's own clock (when this participant connected),
-not from when recording began,
+The jsonl keeps a meeting-relative `elapsed` field for reasoning about position
+within a call. It counts from the app's own clock (when this participant
+connected), not from when recording began,
 where the app will say how long the call has been running. Zoom keeps such a
 clock in its title bar — though note it reads "My connected time", so it is
 when *you* joined the call rather than when the meeting was convened; Teams'
 call timer behaves likewise. That is still far better than counting from zero:
-attach an hour in and the first line reads `[00:36:41]` instead of
-`[00:00:00]`, with `meeting_started_at` recording what the stamps were
-measured against. The reference is picked once, before the first line is
-written, so a file never changes its story halfway through; if the clock only
-becomes visible after capture has begun writing, the whole file counts from
-when recording began instead.
+attach an hour in and `elapsed` reads `00:36:41` instead of `00:00:00`, with
+`meeting_started_at` recording what it was measured against. The reference is
+picked once, before the first line is written, so a file never changes its
+story halfway through; if the clock only becomes visible after capture has
+begun writing, `elapsed` counts from when recording began instead.
 
-Slack publishes no such clock, so a huddle is stamped with the time of day
-instead. Counting from zero there would claim the huddle began when the capture
-did, which is only true if you opened it; the time of day is true whenever you
-joined, and lines up with the channel it happened in.
+Slack publishes no such clock, so a huddle's `elapsed` counts from when the
+capture attached and `timestamps` reads `time-of-day`. Either way the .txt is
+unaffected — it is wall-clock in every app.
 
 Wall-clock `ts` and `ended_at` on every caption make this useful beyond reading:
 align the timestamps against a Whisper transcript of the same meeting and you
