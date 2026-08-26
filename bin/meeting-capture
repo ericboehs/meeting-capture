@@ -1616,7 +1616,7 @@ final class Session {
     private var nextCaptionCheck = Date.distantPast
     private var sawCaptions = false
     /// Recently written utterances, to catch an app re-rendering a finished one.
-    private var written: [(speaker: String, text: String, at: Date)] = []
+    var written: [(speaker: String, text: String, at: Date)] = []
     /// Ids already written but still on screen.
     private var finalized = Set<String>()
     /// What each finalized id's text was AT THE MOMENT WE FINALIZED IT. Growth
@@ -2063,11 +2063,31 @@ final class Session {
         }
     }
 
-    private func alreadyWritten(_ utterance: Utterance, id: String, now: Date) -> Bool {
+    /// How long a written line keeps suppressing re-renders of itself. Genuine
+    /// repetition ("Yes." ... "Yes.") has to survive, so this cannot be
+    /// unbounded — it is a heuristic window, not a correctness guarantee.
+    static let rewriteWindow: TimeInterval = 30
+
+    /// Whether this utterance duplicates something already on disk.
+    ///
+    /// Matching is deliberately ASYMMETRIC. A written line suppresses the
+    /// incoming one when the incoming text is a PREFIX of it (equality
+    /// included) — the transcript already holds a superset, so skipping loses
+    /// nothing. That covers a row re-read while only partly rendered, which
+    /// exact-equality matching let straight through.
+    ///
+    /// The reverse is NOT suppressed. When the incoming text EXTENDS something
+    /// written, the extension is content we do not have yet; dropping it to
+    /// avoid a near-duplicate would trade a cosmetic problem for real data
+    /// loss ("Okay" written, then the row grows to "Okay, and the other
+    /// thing..."). Append-only files cannot amend the earlier line, so the
+    /// pair is emitted and the fuller text wins on read.
+    func alreadyWritten(_ utterance: Utterance, id: String, now: Date) -> Bool {
         guard !meetingApp.hasStableIdentity(id) else { return false }
         return written.contains {
-            $0.speaker == utterance.speaker && $0.text == utterance.text
-                && now.timeIntervalSince($0.at) < 30
+            $0.speaker == utterance.speaker
+                && $0.text.hasPrefix(utterance.text)
+                && now.timeIntervalSince($0.at) < Session.rewriteWindow
         }
     }
 

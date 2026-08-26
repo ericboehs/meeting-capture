@@ -624,6 +624,61 @@ do {
                 "another row's finalized text cannot re-open this one")
 }
 
+// --- alreadyWritten: prefix-aware, and asymmetric on purpose -------------
+//
+// Exact-equality matching let a partly-rendered re-read of an already-written
+// row through. Prefix matching closes that, but only in the safe direction:
+// suppress when the transcript already holds a SUPERSET of the incoming text,
+// never when the incoming text carries content the file does not have.
+
+func utterance(_ speaker: String, _ text: String) -> Utterance {
+    Utterance(speaker: speaker, text: text, startedAt: epoch, changedAt: epoch)
+}
+
+do {
+    let clock = FakeClock(start: epoch, step: 0)
+    let s = injectedSession(clock: clock)
+    let now = epoch.addingTimeInterval(10)
+
+    // Real text from the duplicated stand-up row (node 3570), truncated.
+    let full  = "users at North Port reported issues entering patient vitals via CPRS."
+    let part  = "users at North Port reported issues entering"
+    let extra = full + " The"
+    s.written = [(speaker: "Dalton, Belinda J.", text: full, at: epoch)]
+
+    expectTrue(s.alreadyWritten(utterance("Dalton, Belinda J.", full), id: "n1", now: now),
+               "an identical re-render is still suppressed")
+    expectTrue(s.alreadyWritten(utterance("Dalton, Belinda J.", part), id: "n1", now: now),
+               "a partly-rendered re-read is suppressed: the file already holds a superset")
+    expectEqual(s.alreadyWritten(utterance("Dalton, Belinda J.", extra), id: "n1", now: now), false,
+                "text that EXTENDS a written line is never suppressed — the extension is new content")
+    expectEqual(s.alreadyWritten(utterance("Krebs, Kendall N.", full), id: "n1", now: now), false,
+                "another speaker saying the same words is a real utterance")
+
+    // The window is a heuristic, so genuine repetition survives it.
+    let later = epoch.addingTimeInterval(Session.rewriteWindow + 1)
+    expectEqual(s.alreadyWritten(utterance("Dalton, Belinda J.", full), id: "n1", now: later), false,
+                "past the rewrite window, repeated speech is written again")
+
+    // Suppression is unrelated to how short the incoming text is: a genuinely
+    // brief utterance that happens to prefix a longer written one is the
+    // acknowledged cost of the safe direction.
+    expectTrue(s.alreadyWritten(utterance("Dalton, Belinda J.", "users"), id: "n1", now: now),
+               "a short prefix of a written line is treated as a re-read")
+}
+
+// Apps with stable caption ids opt out of content matching entirely: their ids
+// already name one logical utterance, so identical text is genuine repetition.
+do {
+    let clock = FakeClock(start: epoch, step: 0)
+    let s = injectedSession(clock: clock)
+    s.written = [(speaker: "A", text: "same words", at: epoch)]
+    expectTrue(s.alreadyWritten(utterance("A", "same words"), id: "unstable", now: epoch),
+               "unstable ids fall back to content matching")
+    expectEqual(StubMeetingApp().hasStableIdentity("seg:1"), false,
+                "the stub models an unstable-id app")
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")
