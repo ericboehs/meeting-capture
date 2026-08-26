@@ -644,7 +644,7 @@ do {
     let full  = "users at North Port reported issues entering patient vitals via CPRS."
     let part  = "users at North Port reported issues entering"
     let extra = full + " The"
-    s.written = [(speaker: "Dalton, Belinda J.", text: full, at: epoch)]
+    s.written = [Session.WrittenLine(speaker: "Dalton, Belinda J.", text: full, at: epoch)]
 
     expectTrue(s.alreadyWritten(utterance("Dalton, Belinda J.", full), id: "n1", now: now),
                "an identical re-render is still suppressed")
@@ -667,12 +667,90 @@ do {
                "a short prefix of a written line is treated as a re-read")
 }
 
+// --- Node-id churn: the suppressor lives as long as the row is on screen ---
+//
+// Regression: Teams re-creates a finished caption row with a fresh
+// ChromeAXNodeId while it lingers on screen, so every churn reads as a new
+// utterance. With the window counted from write time, the row was written
+// again the moment 30s lapsed — "All right, so this is sprint planning for
+// Sprint 23." landed at 00:04:49 and then AGAIN at 00:05:22, mid-conversation.
+
+do {
+    let clock = FakeClock(start: epoch, step: 0)
+    let s = injectedSession(clock: clock)
+    let speaker = "Dehaan, Jason R."
+    let line = "All right, so this is sprint planning for Sprint 23."
+    s.written = [Session.WrittenLine(speaker: speaker, text: line, at: epoch)]
+
+    let lapsed = epoch.addingTimeInterval(Session.rewriteWindow + 3)
+    expectEqual(s.alreadyWritten(utterance(speaker, line), id: "3570", now: lapsed), false,
+                "a row that left the screen may be said again after the window")
+
+    // Same poll, but the row is still up: every poll refreshes the suppressor,
+    // so the recycled node never re-emits however long the row lingers.
+    for tick in stride(from: 0.0, through: Session.rewriteWindow + 3, by: 5) {
+        s.refreshWrittenLines(
+            visibleIn: [CaptionEntry(id: "churn-\(tick)", speaker: speaker, text: line)],
+            now: epoch.addingTimeInterval(tick))
+    }
+    expectTrue(s.alreadyWritten(utterance(speaker, line), id: "9901", now: lapsed),
+               "a row still on screen keeps suppressing its own re-render under a new node id")
+
+    // Only EXACT text holds a suppressor open. A genuinely short utterance that
+    // happens to prefix a lingering longer one must still get through once the
+    // window from WRITE time has passed.
+    expectEqual(s.alreadyWritten(utterance(speaker, "All right."), id: "9902", now: lapsed), false,
+                "a lingering longer line does not swallow a later short utterance")
+
+    // ...and a row that is no longer visible stops being refreshed, so genuine
+    // repetition returns to the plain 30s window.
+    s.refreshWrittenLines(
+        visibleIn: [CaptionEntry(id: "other", speaker: speaker, text: "Something else entirely.")],
+        now: lapsed)
+    expectEqual(s.alreadyWritten(utterance(speaker, line), id: "9903",
+                                 now: lapsed.addingTimeInterval(Session.rewriteWindow + 1)), false,
+                "once the row scrolls away the suppressor expires again")
+}
+
+// --- Live-region stamps never precede what is already in the transcript ----
+//
+// Regression: the live block stamped each pending line with when it BEGAN,
+// while finished lines are clamped to the transcript's high-water mark. A long
+// sentence still being spoken therefore appeared under a later line that had
+// already landed, reading as though the clock ran backwards.
+
+do {
+    func pending(_ speaker: String, _ text: String, at offset: TimeInterval) -> Utterance {
+        let at = epoch.addingTimeInterval(offset)
+        return Utterance(speaker: speaker, text: text, startedAt: at, changedAt: at)
+    }
+    let clockText = { (offset: TimeInterval) in
+        Recorder.clockText(from: epoch.addingTimeInterval(offset))
+    }
+
+    let lines = Session.liveLines(
+        [pending("Dehaan", "All right.", at: 33), pending("Smith", "He's still waiting", at: 37)],
+        after: epoch.addingTimeInterval(36))
+    expectEqual(lines, ["[\(clockText(36))] Dehaan: All right.",
+                        "[\(clockText(37))] Smith: He's still waiting"],
+                "a pending line older than the last written one is clamped up to it")
+
+    let unclamped = Session.liveLines([pending("Dehaan", "All right.", at: 33)], after: nil)
+    expectEqual(unclamped, ["[\(clockText(33))] Dehaan: All right."],
+                "with nothing written yet the line keeps its own start time")
+
+    let cumulative = Session.liveLines(
+        [pending("A", "one", at: 50), pending("B", "two", at: 40)], after: nil)
+    expectEqual(cumulative, ["[\(clockText(50))] A: one", "[\(clockText(50))] B: two"],
+                "the clamp is cumulative, so the pending block reads in order within itself")
+}
+
 // Apps with stable caption ids opt out of content matching entirely: their ids
 // already name one logical utterance, so identical text is genuine repetition.
 do {
     let clock = FakeClock(start: epoch, step: 0)
     let s = injectedSession(clock: clock)
-    s.written = [(speaker: "A", text: "same words", at: epoch)]
+    s.written = [Session.WrittenLine(speaker: "A", text: "same words", at: epoch)]
     expectTrue(s.alreadyWritten(utterance("A", "same words"), id: "unstable", now: epoch),
                "unstable ids fall back to content matching")
     expectEqual(StubMeetingApp().hasStableIdentity("seg:1"), false,

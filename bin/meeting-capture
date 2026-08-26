@@ -1615,8 +1615,27 @@ final class Session {
     var retryDelay: TimeInterval = 1
     private var nextCaptionCheck = Date.distantPast
     private var sawCaptions = false
+    /// One line already on disk, kept around to recognise the app re-rendering
+    /// it. `lastSeen` is refreshed for as long as a row on screen still shows
+    /// exactly this text, which is what keeps the suppressor alive through
+    /// node-id churn (see alreadyWritten).
+    struct WrittenLine {
+        let speaker: String
+        let text: String
+        /// When the line was written.
+        let at: Date
+        /// Last poll at which this exact text was still on screen.
+        var lastSeen: Date
+
+        init(speaker: String, text: String, at: Date, lastSeen: Date? = nil) {
+            self.speaker = speaker
+            self.text = text
+            self.at = at
+            self.lastSeen = lastSeen ?? at
+        }
+    }
     /// Recently written utterances, to catch an app re-rendering a finished one.
-    var written: [(speaker: String, text: String, at: Date)] = []
+    var written: [WrittenLine] = []
     /// Ids already written but still on screen.
     private var finalized = Set<String>()
     /// What each finalized id's text was AT THE MOMENT WE FINALIZED IT. Growth
@@ -1805,10 +1824,25 @@ final class Session {
         }
     }
 
-    /// Matches how the recorder stamps finished lines, so the live region and
-    /// the transcript above it read the same way — both are the time of day.
-    private func stamp(_ date: Date) -> String {
-        Recorder.clockText(from: date)
+    /// Render in-progress utterances for the live region. Stamps match how the
+    /// recorder stamps finished lines, so the live region and the transcript
+    /// above it read the same way — both are the time of day.
+    ///
+    /// Stamps get the SAME high-water clamp attemptEventWrite applies when the
+    /// line eventually lands (`after` is the last stamp written). Without it
+    /// the live region shows a line stamped EARLIER than the finished line
+    /// printed above it: a long sentence that began first is still being
+    /// spoken when a shorter one that began later finishes and is written. The
+    /// clamp is cumulative so the pending block reads in order within itself
+    /// too, and because it mirrors the writer's clamp, a line's stamp does not
+    /// jump when it graduates from live to transcript.
+    static func liveLines(_ pending: [Utterance], after floor: Date?) -> [String] {
+        var floor = floor
+        return pending.map { utterance in
+            let at = max(utterance.startedAt, floor ?? utterance.startedAt)
+            floor = at
+            return "[\(Recorder.clockText(from: at))] \(utterance.speaker): \(utterance.text)"
+        }
     }
 
     func tick(app: AXUIElement, pid: pid_t, now: Date) {
@@ -1944,6 +1978,7 @@ final class Session {
         guard let container = captionsContainer else { return }
         let entries = meetingApp.captionEntries(in: container)
         if !entries.isEmpty { sawCaptions = true }
+        refreshWrittenLines(visibleIn: entries, now: now)
         if entries.isEmpty && axChildren(container).isEmpty {
             captionsContainer = nil // panel closed or re-rendered
         }
@@ -2002,11 +2037,11 @@ final class Session {
         }
         guard recorder != nil || !captionOrder.isEmpty else { return }
         // Mirror every in-progress utterance; finished lines scroll above.
-        let pending = captionOrder.compactMap { id -> String? in
+        let pending = Session.liveLines(captionOrder.compactMap { id -> Utterance? in
             guard let utterance = activeCaptions[id],
                   !supersededByActive(utterance, id: id) else { return nil }
-            return "[\(stamp(utterance.startedAt))] \(utterance.speaker): \(utterance.text)"
-        }
+            return utterance
+        }, after: lastStamp)
         let shown = pending.enumerated().map { $0.offset == pending.count - 1 ? "\($0.element) ▍" : $0.element }
         live.set(shown)
         publishLive(shown)
@@ -2082,12 +2117,41 @@ final class Session {
     /// loss ("Okay" written, then the row grows to "Okay, and the other
     /// thing..."). Append-only files cannot amend the earlier line, so the
     /// pair is emitted and the fuller text wins on read.
+    ///
+    /// The window is measured from two different clocks on purpose:
+    ///
+    ///  - IDENTICAL text counts from `lastSeen`, which refreshWrittenLines
+    ///    pushes forward for as long as the very same words are still on
+    ///    screen. Teams re-creates finished rows with fresh ChromeAXNodeIds
+    ///    while they linger, so each churn looks like a brand-new utterance;
+    ///    counting from write time meant the row was re-emitted the moment the
+    ///    30s window lapsed (~33s after the original, and again after that).
+    ///  - A SHORTER PREFIX counts from write time, and so still expires. That
+    ///    branch exists for partly-rendered re-reads, and letting an on-screen
+    ///    row extend it would swallow genuine short utterances forever ("All
+    ///    right." is a prefix of "All right, so this is sprint planning...").
     func alreadyWritten(_ utterance: Utterance, id: String, now: Date) -> Bool {
         guard !meetingApp.hasStableIdentity(id) else { return false }
         return written.contains {
-            $0.speaker == utterance.speaker
-                && $0.text.hasPrefix(utterance.text)
+            guard $0.speaker == utterance.speaker else { return false }
+            if $0.text == utterance.text {
+                return now.timeIntervalSince($0.lastSeen) < Session.rewriteWindow
+            }
+            return $0.text.hasPrefix(utterance.text)
                 && now.timeIntervalSince($0.at) < Session.rewriteWindow
+        }
+    }
+
+    /// Keep a written line's suppressor alive while the app is still showing
+    /// it. Exact matches only: a row that merely starts with the written text
+    /// may be a different, genuinely shorter utterance (see alreadyWritten).
+    func refreshWrittenLines(visibleIn entries: [CaptionEntry], now: Date) {
+        guard !written.isEmpty, !entries.isEmpty else { return }
+        for index in written.indices {
+            let line = written[index]
+            guard entries.contains(where: { $0.speaker == line.speaker && $0.text == line.text })
+            else { continue }
+            written[index].lastSeen = now
         }
     }
 
@@ -2124,7 +2188,7 @@ final class Session {
             at: utterance.startedAt,
             extra: ["node_id": id, "ended_at": Recorder.isoFormatter.string(from: date)]
         )
-        written.append((utterance.speaker, utterance.text, date))
+        written.append(WrittenLine(speaker: utterance.speaker, text: utterance.text, at: date))
         if written.count > 40 { written.removeFirst(written.count - 40) }
     }
 
