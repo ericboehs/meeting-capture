@@ -274,15 +274,21 @@ func clockStamp(_ date: Date) -> String { Recorder.clockText(from: date) }
 
 // The two files stamp the same instant differently on purpose: the jsonl keeps
 // meeting-relative `elapsed`, the transcript carries the time of day.
+//
+// The offset is deliberately over 24h. elapsedString does not wrap hours, so
+// "30:01:01" cannot collide with a wall-clock stamp in ANY timezone — whereas
+// a 1h offset from the epoch renders as "01:01:01" both ways under UTC, which
+// is exactly how the first version of this test passed locally and failed CI.
 do {
     let jsonl = MemorySink(path: "/tmp/j.jsonl"), text = MemorySink(path: "/tmp/t.txt")
     let r = injectedRecorder(jsonl: jsonl, text: text)
-    _ = r.record(kind: "caption", speaker: "A", body: "split", at: epoch.addingTimeInterval(3661))
-    expectTrue(jsonl.string.contains("\"elapsed\":\"01:01:01\""),
+    let at = epoch.addingTimeInterval(30 * 3600 + 61)
+    _ = r.record(kind: "caption", speaker: "A", body: "split", at: at)
+    expectTrue(jsonl.string.contains("\"elapsed\":\"30:01:01\""),
                "jsonl keeps the meeting-relative elapsed field")
-    expectTrue(text.string.contains("[\(clockStamp(epoch.addingTimeInterval(3661)))] A: split"),
+    expectTrue(text.string.contains("[\(clockStamp(at))] A: split"),
                "transcript stamps the time of day, not the elapsed offset")
-    expectTrue(!text.string.contains("[01:01:01]"),
+    expectTrue(!text.string.contains("30:01:01"),
                "transcript does not carry the elapsed offset at all")
 }
 
