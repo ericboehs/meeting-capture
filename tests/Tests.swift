@@ -745,6 +745,38 @@ do {
                 "the clamp is cumulative, so the pending block reads in order within itself")
 }
 
+// --- A row that resumes after being written owes only its new tail --------
+//
+// Regression (Zoom): with two people talking, Zoom keeps a live, still-growing
+// row per speaker. finalizesWhenSuperseded called the older one finished on
+// every poll, and since text that EXTENDS a written line is never suppressed,
+// the row was written once per second, each line repeating the last:
+//   "Yeah, I told him about Wilson. So, like, that's"
+//   "Yeah, I told him about Wilson. So, like, that's how this all"
+// The app-side half is Zoom finalizing on idle only; this is the general half.
+
+do {
+    expectEqual(ZoomApp().finalizesWhenSuperseded, false,
+                "Zoom rows are not finished merely because someone else started talking")
+
+    let said = "Yeah, I told him about Wilson."
+    expectEqual(Session.unwrittenPart(of: said, alreadyEmitted: nil), said,
+                "a row nothing was written for owes all of it")
+    expectEqual(Session.unwrittenPart(of: said + " So, like, that's", alreadyEmitted: said),
+                "So, like, that's",
+                "a row that grew owes only the words added since it was written")
+    expectEqual(Session.unwrittenPart(of: said, alreadyEmitted: said), nil,
+                "a row frozen at what was already written owes nothing")
+    expectEqual(Session.unwrittenPart(of: said + "   ", alreadyEmitted: said), nil,
+                "trailing whitespace is not new content")
+    expectEqual(Session.unwrittenPart(of: "A completely different sentence.", alreadyEmitted: said),
+                "A completely different sentence.",
+                "a recycled row holding new text owes the whole thing")
+    expectEqual(Session.unwrittenPart(of: "Yeah, I told him", alreadyEmitted: said),
+                "Yeah, I told him",
+                "text shrinking below what was written is a replacement, not growth")
+}
+
 // Apps with stable caption ids opt out of content matching entirely: their ids
 // already name one logical utterance, so identical text is genuine repetition.
 do {

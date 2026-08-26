@@ -1431,9 +1431,14 @@ struct ZoomApp: MeetingApp {
     // Chat is skipped via the MeetingApp defaults: Zoom's chat panel is a
     // separate surface that has to be open to read; not wired up yet.
 
-    // Rows accumulate rather than being cleared, so finalize on being pushed
-    // up by a newer row, and give the newest row a few seconds to settle.
-    var finalizesWhenSuperseded: Bool { true }
+    // NOT finalizesWhenSuperseded, though rows do accumulate rather than being
+    // cleared. When two people talk at once Zoom keeps a LIVE, still-growing
+    // row per speaker, so "a newer row exists" does not mean the older one has
+    // finished: it means someone else started. Finalizing on that wrote the
+    // older row on every growth tick — one line per second, each repeating the
+    // last ("Yeah, I told him" / "Yeah, I told him about Wilson" / ...). Going
+    // quiet is the only reliable end-of-utterance signal Zoom gives us, so
+    // rows finalize on idle alone.
     var idleFinalizeSeconds: TimeInterval? { 6 }
 }
 
@@ -1643,6 +1648,10 @@ final class Session {
     /// instead lets an earlier, shorter write OF THE SAME ROW masquerade as
     /// growth forever, re-opening a row that is actually frozen.
     var finalizedText: [String: String] = [:]
+    /// What each row has ALREADY CONTRIBUTED to the transcript. A row that goes
+    /// quiet, gets written, and then keeps growing (a speaker resuming after a
+    /// pause) must not repeat itself on disk; see unwrittenPart.
+    var emittedText: [String: String] = [:]
     var ledger = WakeLedger()
     /// What `[HH:MM:SS]` counts from: the app's clock (connection time) once
     /// it tells us, otherwise the moment we attached.
@@ -1985,6 +1994,7 @@ final class Session {
         let visible = Set(entries.map(\.id))
         finalized.formIntersection(visible) // let ids be reused once they are gone
         finalizedText = finalizedText.filter { visible.contains($0.key) }
+        emittedText = emittedText.filter { visible.contains($0.key) }
         for entry in entries {
             if finalized.contains(entry.id) {
                 // Same row kept growing after we idle-finalized it (Zoom).
@@ -2171,6 +2181,26 @@ final class Session {
         return text != atFinalize && text.hasPrefix(atFinalize)
     }
 
+    /// What a row still owes the transcript: the part of `text` that has not
+    /// been written for this row yet.
+    ///
+    /// Captions grow in place, and an append-only file cannot amend the line it
+    /// already wrote. When a row that was written keeps growing, writing the
+    /// whole row again repeats everything the reader has — the same sentence
+    /// three times with three words added. Writing only the new tail keeps the
+    /// file lossless and readable: the row's words appear exactly once, in
+    /// order, split across as many lines as it took the speaker to say them.
+    ///
+    /// Returns nil when the row has nothing new to say, and the whole text when
+    /// the row was REPLACED rather than extended (a recycled node holding a
+    /// different sentence owes all of it).
+    static func unwrittenPart(of text: String, alreadyEmitted: String?) -> String? {
+        guard let alreadyEmitted, text.hasPrefix(alreadyEmitted) else { return text }
+        let tail = String(text.dropFirst(alreadyEmitted.count))
+            .trimmingCharacters(in: .whitespaces)
+        return tail.isEmpty ? nil : tail
+    }
+
     private func finalizeCaption(_ id: String, at date: Date) {
         guard let utterance = activeCaptions.removeValue(forKey: id) else { return }
         captionOrder.removeAll { $0 == id }
@@ -2178,16 +2208,31 @@ final class Session {
         finalizedText[id] = utterance.text
         guard !utterance.text.isEmpty else { return }
         guard !supersededByActive(utterance, id: id), !alreadyWritten(utterance, id: id, now: date) else { return }
+        // A row picking up where it left off contributes only its new tail.
+        guard let body = Session.unwrittenPart(of: utterance.text, alreadyEmitted: emittedText[id])
+        else { return }
+        var extra: [String: Any] = [
+            "node_id": id,
+            "ended_at": Recorder.isoFormatter.string(from: date)
+        ]
+        if body != utterance.text {
+            // The jsonl says so explicitly; `text` is the tail, not the row.
+            extra["continues"] = true
+        }
         // emit queues failed writes onto the ordered backlog, which finish()
         // drains before declaring loss — so committing dedup state here is
         // always safe.
         emit(
             kind: "caption",
             speaker: utterance.speaker,
-            body: utterance.text,
+            body: body,
             at: utterance.startedAt,
-            extra: ["node_id": id, "ended_at": Recorder.isoFormatter.string(from: date)]
+            extra: extra
         )
+        emittedText[id] = utterance.text
+        // The dedup ledger holds the WHOLE row, not the tail we wrote: it
+        // answers "have we already heard these words", which is what a
+        // re-render under a fresh node id has to be matched against.
         written.append(WrittenLine(speaker: utterance.speaker, text: utterance.text, at: date))
         if written.count > 40 { written.removeFirst(written.count - 40) }
     }
