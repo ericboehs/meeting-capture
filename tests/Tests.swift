@@ -212,6 +212,28 @@ do {
 }
 
 do {
+    // A window that GROWS past what is retained. Meet's caption panel
+    // accumulates as a call goes on, and overlap matching compares the
+    // window's prefix against history's suffix — so the moment history holds
+    // less than a window, the two can never line up again. Every poll then
+    // looks entirely new and rewrites the whole panel at fresh positions.
+    //
+    // A 29-minute Meet call did exactly this: 882,307 caption events for 734
+    // distinct lines, a 199 MB transcript of the same sentences over and over.
+    let h = SegmentHistory()
+    var all = (0..<900).map { SegmentKey(speaker: "Speaker\($0 % 7)", text: "sentence \($0)") }
+    var anchored = true
+    for count in 1...all.count where h.absorb(Array(all.prefix(count))) != 0 { anchored = false }
+    expectTrue(anchored, "a window growing past the retained history keeps its anchor")
+
+    // Once it is that wide, the panel starts dropping its oldest blocks: the
+    // anchor has to move by exactly what left, not by a whole window.
+    expectEqual(h.absorb(Array(all.dropFirst(40))), 40, "dropping the oldest blocks shifts by what left")
+    all.append(SegmentKey(speaker: "Speaker0", text: "one more"))
+    expectEqual(h.absorb(Array(all.dropFirst(40))), 40, "and a new segment after that still appends")
+}
+
+do {
     let h = SegmentHistory()
     _ = h.absorb([
         SegmentKey(speaker: "A", text: "a"),

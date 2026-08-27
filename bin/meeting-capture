@@ -728,6 +728,8 @@ final class SegmentHistory {
     private var keys: [SegmentKey] = []
     /// Segments already dropped off the front of `keys`.
     private var dropped = 0
+    /// The widest window absorbed so far, which sets how much has to be kept.
+    private var widest = 0
 
     /// Fold the visible settled segments into the history; returns the absolute
     /// position of the first one. The rest number on from there, and the
@@ -739,6 +741,7 @@ final class SegmentHistory {
     /// several segments visible at once, which disambiguates in practice.
     func absorb(_ settled: [SegmentKey]) -> Int {
         guard !settled.isEmpty else { return dropped + keys.count }
+        widest = max(widest, settled.count)
         for overlap in stride(from: min(keys.count, settled.count), through: 1, by: -1)
         where Array(keys.suffix(overlap)) == Array(settled.prefix(overlap)) {
             keys.append(contentsOf: settled.dropFirst(overlap))
@@ -752,13 +755,22 @@ final class SegmentHistory {
     }
 
     /// A many-hour call produces thousands of segments; keep memory flat.
-    /// Retain far more than any real window holds (overlays show ~5, Meet's
-    /// blocks a handful): overlap matching compares the visible window against
-    /// retained history only, so a window wider than what was retained would
-    /// find no overlap and jump the numbering.
+    ///
+    /// What is retained must stay comfortably wider than the window, because
+    /// overlap matching compares the window's PREFIX against history's SUFFIX:
+    /// once history holds less than a window, the two can never line up, every
+    /// poll looks entirely new, and the same segments are written again and
+    /// again at fresh positions.
+    ///
+    /// That is not hypothetical. A 29-minute Google Meet call ended up showing
+    /// 436 segments at once against a fixed retention of 300, and wrote 882,307
+    /// caption events for 734 distinct lines — a 199 MB transcript of the same
+    /// sentences over and over. So the floor grows with the widest window seen,
+    /// and only the fixed part is a guess.
     private func trim() {
-        guard keys.count > 600 else { return }
-        let excess = keys.count - 300
+        let floor = max(600, widest * 3)
+        guard keys.count > floor * 2 else { return }
+        let excess = keys.count - floor
         keys.removeFirst(excess)
         dropped += excess
     }
@@ -767,6 +779,7 @@ final class SegmentHistory {
     func reset() {
         keys = []
         dropped = 0
+        widest = 0
     }
 }
 
