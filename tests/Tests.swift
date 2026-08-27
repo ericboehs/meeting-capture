@@ -67,6 +67,45 @@ expectEqual(Recorder.slugify("Weekly Sync | Microsoft Teams"), "weekly-sync", "s
 expectEqual(Recorder.slugify("!!!"), "meeting", "all-punctuation title falls back to 'meeting'")
 expectEqual(Recorder.slugify("Ada's 2nd standup!"), "ada-s-2nd-standup", "slug keeps letters and digits")
 
+// --- Reading Google Meet's chat -----------------------------------------
+// Meet gives chat messages no ids and no per-message grouping: the panel is a
+// flat run of lines reading author, time, text, time, text, with the author
+// named once however many messages they send in a row, and furniture mixed in.
+do {
+    let lines = [
+        "Ken Hughes", "3:02 PM", "first message",
+        "3:03 PM", "second message from the same person",
+        "Ada Lovelace", "3:04 PM", "a reply",
+        "Hover over a message to pin it",
+    ]
+    let messages = MeetApp.parseChat(lines)
+    expectEqual(messages.count, 3, "three messages, however the names are laid out")
+    expectEqual(messages.map { $0.author }, ["Ken Hughes", "Ken Hughes", "Ada Lovelace"],
+                "a name carries to every message under it")
+    expectEqual(messages.map { $0.text },
+                ["first message", "second message from the same person", "a reply"],
+                "timestamps and trailing furniture are not messages")
+    expectTrue(Set(messages.map { $0.id }).count == 3, "ids distinguish the messages")
+
+    expectEqual(MeetApp.parseChat(["Ken", "3:02 PM", "same words"]).first?.id,
+                MeetApp.parseChat(["Ken", "3:02 PM", "same words"]).first?.id,
+                "ids are stable across runs, so a restart mid-meeting does not repeat chat")
+    expectTrue(MeetApp.parseChat(["Ken", "3:02 PM", "same words"]).first?.id
+                 != MeetApp.parseChat(["Ken", "3:03 PM", "same words"]).first?.id,
+               "the same words a minute later is a new message")
+    expectEqual(MeetApp.parseChat(["3:02 PM", "no name yet"]).first?.author, "Unknown",
+                "a message with no name above it still gets recorded")
+
+    expectTrue(MeetApp.isTimestamp("3:02 PM"), "12-hour clock")
+    expectTrue(MeetApp.isTimestamp("15:02"), "24-hour clock")
+    expectTrue(MeetApp.isTimestamp("3:02\u{202f}PM"), "narrow no-break space, which macOS uses")
+    expectTrue(MeetApp.isTimestamp("12:00 a.m."), "lowercase suffix with stops")
+    expectTrue(!MeetApp.isTimestamp("Ken Hughes"), "a name is not a clock")
+    expectTrue(!MeetApp.isTimestamp("4:03 is an oddly specific time"),
+               "a sentence that opens with a clock is not a clock")
+    expectTrue(!MeetApp.isTimestamp("Hover over a message to pin it"), "furniture is not a clock")
+}
+
 // --- Tucking the popped-out captions window ------------------------------
 // The window has to stay OPEN (minimized, it receives nothing at all) but it
 // does not have to be visible, so it is pushed off the outside edge of the

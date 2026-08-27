@@ -39,8 +39,9 @@ struct Options {
     /// Teams only: move the captions panel into its own window at the start of
     /// a meeting, so a covered meeting window cannot stop the transcript.
     var popOutCaptions = false
-    /// Teams only: open the meeting chat and move it into its own window, for
-    /// the same reason, and because a chat panel nobody opened records nothing.
+    /// Open the meeting chat, which records nothing while its panel is shut.
+    /// In Teams the panel is also given a window of its own, so that a covered
+    /// meeting window cannot freeze it.
     var popOutChat = false
     var once = false
     var follow = false
@@ -71,8 +72,9 @@ func usage() -> String {
       --popout-captions    Teams: put captions in their own window, which
                            keeps running even when every Teams window is
                            covered
-      --popout-chat        Teams: open the meeting chat in its own window, so
-                           chat is recorded without opening the panel by hand
+      --popout-chat        open the meeting chat so it is recorded without
+                           anyone opening the panel by hand; in Teams it also
+                           gets a window of its own
       --interval <ms>      poll interval while in a meeting (default 250)
       --idle-interval <ms> poll interval while waiting for one (default 2000)
       --dir <path>         output directory (default $XDG_DATA_HOME/meeting-capture)
@@ -1992,6 +1994,14 @@ final class MeetApp: MeetingApp {
     private let captionsDescription = "Captions"
     private let captionsOnLabel = "Turn off captions"
     private let captionsOffLabel = "Turn on captions"
+    /// The chat composer, which is how the message list is found.
+    private let composerDescription = "Send a message"
+    /// Opens the chat panel. Its description gains " - New message" when
+    /// something is unread, so it is matched by prefix.
+    private let chatButtonDescription = "Chat with everyone"
+
+    private var chatOpenAttempts = 0
+    private var nextChatOpenAttempt = Date.distantPast
 
     /// Every caption segment reported so far, tracked by position in the whole
     /// conversation (see SegmentHistory). Meet exposes no DOM ids, and the text
@@ -2065,12 +2075,139 @@ final class MeetApp: MeetingApp {
         }
     }
 
-    func resetCaptureState() { history.reset() }
+    func resetCaptureState() {
+        history.reset()
+        chatOpenAttempts = 0
+        nextChatOpenAttempt = .distantPast
+    }
 
     func reportedElapsedSeconds(_ app: AXUIElement) -> TimeInterval? { nil }
-    // Meet's chat is a side panel that has to be open to exist; not wired up.
-    func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
-    func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
+    /// Meet's chat panel has to be open to exist in the tree at all, so an
+    /// unattended meeting records no chat unless something opens it. With
+    /// --popout-chat, this does — Meet answers AXPress, so unlike Teams there
+    /// is no clicking, no activating and no stealing of focus.
+    ///
+    /// Twice at most, a minute apart: closing the panel again is an answer,
+    /// and reopening it forever would be an argument.
+    func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
+                          popOutCaptions: Bool, popOutChat: Bool) {
+        guard popOutChat, !chatPanelOpen(app) else { return }
+        guard chatOpenAttempts < 2, now >= nextChatOpenAttempt else { return }
+        chatOpenAttempts += 1
+        nextChatOpenAttempt = now.addingTimeInterval(60)
+        guard let button = findElement(from: app, where: {
+            axDescription($0).hasPrefix(chatButtonDescription)
+        }) else { return }
+        guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else { return }
+        status("opened Google Meet's chat panel so chat is recorded")
+    }
+
+    private func chatPanelOpen(_ app: AXUIElement) -> Bool {
+        findElement(from: app) {
+            axString($0, kAXRoleAttribute) == "AXTextArea" && axDescription($0) == composerDescription
+        } != nil
+    }
+
+    /// Meet's chat: the message list beside the composer.
+    ///
+    /// The panel has to be open to exist — nothing here can be read from a
+    /// closed one — and it is found from the composer, which is the one part
+    /// of it that is reliably labelled. The list is the child of the panel
+    /// immediately before the composer's own group; picking it by position
+    /// rather than by label keeps it working when the notice above it ("chat
+    /// is turned off", "messages are only visible to people in the call")
+    /// changes or disappears.
+    func chatContainer(_ app: AXUIElement) -> AXUIElement? {
+        guard let composer = findElement(from: app, where: {
+            axString($0, kAXRoleAttribute) == "AXTextArea" && axDescription($0) == composerDescription
+        }) else { return nil }
+        // Climb until the composer's group is a direct child of the panel.
+        var child = composer
+        for _ in 0..<8 {
+            guard let parent = axParent(child) else { return nil }
+            let siblings = axChildren(parent)
+            if let index = siblings.firstIndex(where: { $0 == child }), index > 0 {
+                let previous = siblings[index - 1]
+                if axString(previous, kAXRoleAttribute) == "AXGroup", !axChildren(previous).isEmpty {
+                    return previous
+                }
+            }
+            child = parent
+        }
+        return nil
+    }
+
+    /// Meet gives messages no ids and no per-message grouping: the list is a
+    /// flat run of one-line groups reading author, time, text, time, text —
+    /// the author appearing once however many messages they send in a row.
+    /// See parseChat for how that is read back apart.
+    func chatMessages(in container: AXUIElement) -> [ChatMessage] {
+        let lines = axChildren(container).compactMap { child -> String? in
+            guard axString(child, kAXRoleAttribute) == "AXGroup" else { return nil }
+            let text = axText(child).trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty ? nil : text
+        }
+        return MeetApp.parseChat(lines).suffix(20)
+    }
+
+    /// Turn Meet's flat run of chat lines into messages.
+    ///
+    /// The shape is `author, time, text (, time, text)*`, repeating for each
+    /// author who speaks in turn, with stray furniture ("Hover over a message
+    /// to pin it") mixed in. A timestamp is the only thing here with a
+    /// recognisable shape, so it is the hinge: the line after one is a
+    /// message, and a line that is neither is the name of whoever sends the
+    /// messages that follow.
+    ///
+    /// A message consisting of nothing but a timestamp ("3:02") is therefore
+    /// read as furniture and skipped. That is the price of a panel with no
+    /// ids; it costs one line rather than derailing the rest.
+    ///
+    /// Ids have to be made up too, and are hashed from time, author and text
+    /// so that the same words sent twice in one minute count once while the
+    /// same words tomorrow count again. FNV-1a rather than Hasher, whose seed
+    /// changes every run: ids must survive a restart mid-meeting.
+    static func parseChat(_ lines: [String]) -> [ChatMessage] {
+        var messages: [ChatMessage] = []
+        var author = ""
+        var time = ""
+        var expectingText = false
+        for line in lines {
+            if isTimestamp(line) {
+                time = line
+                expectingText = true
+                continue
+            }
+            guard expectingText else {
+                author = line // a line before any timestamp names the sender
+                continue
+            }
+            expectingText = false
+            let id = String(fnv1a("\(time)|\(author)|\(line)"), radix: 36)
+            messages.append(ChatMessage(id: id, author: author.isEmpty ? "Unknown" : author, text: line))
+        }
+        return messages
+    }
+
+    /// "3:02 PM", "15:02", "3:02\u{202f}PM" — a clock, whatever the locale's
+    /// separator and suffix, but never a sentence.
+    static func isTimestamp(_ line: String) -> Bool {
+        guard line.count <= 12 else { return false }
+        let digitsAndColon = line.prefix { $0.isNumber || $0 == ":" }
+        guard digitsAndColon.contains(":"), digitsAndColon.count >= 3 else { return false }
+        let rest = line.dropFirst(digitsAndColon.count)
+        return rest.allSatisfy { $0.isLetter || $0.isWhitespace || $0 == "." }
+    }
+
+    /// FNV-1a, for ids that are the same in every process.
+    static func fnv1a(_ text: String) -> UInt64 {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in text.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100_0000_01b3
+        }
+        return hash
+    }
 }
 
 let supportedApps: [MeetingApp] = [TeamsApp(), ZoomApp(), SlackApp(), MeetApp()]

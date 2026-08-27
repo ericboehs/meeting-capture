@@ -98,7 +98,7 @@ write a second transcript of the same meeting.
 | `--app <name>` | Only watch one app (`teams`, `zoom`, `slack`, `meet`) |
 | `--auto-captions` | Turn live captions on when a meeting starts |
 | `--popout-captions` | Teams: move captions into their own window, which a covered window can't pause |
-| `--popout-chat` | Teams: open the meeting chat in its own window, so chat is recorded unattended |
+| `--popout-chat` | Open the meeting chat so it is recorded unattended; in Teams it also gets its own window |
 | `--dir <path>` | Output directory |
 | `--follow`, `--watch` | Watch whatever the running daemon is recording, never record |
 | `--interval <ms>` | Poll interval during a meeting (default 250) |
@@ -187,6 +187,14 @@ completely covered chat window the way it parks the meeting window has not been
 measured (it needs someone to post while it is buried); if chat ever goes quiet
 in a transcript while the window was covered, that is the first thing to
 suspect.
+
+The same flag opens Google Meet's chat panel, which has the same all-or-nothing
+problem: closed, it is not in the accessibility tree at all, so an unattended
+meeting records no chat. Meet answers `AXPress`, so there is no clicking, no
+activating its window and no stealing of focus — and no pop-out either, since
+Meet has nothing to pop out to. Either panel is only opened twice, a minute
+apart: closing it again is an answer, and reopening it forever would be an
+argument.
 
 Popping out costs a couple of seconds of focus: Teams' WebView ignores both
 `AXPress` and mouse events posted to the process — they report success and do
@@ -323,7 +331,16 @@ The daemon polls the accessibility tree of each supported app:
      as one.
 3. **Read the chat.** In Teams, message ids are epoch milliseconds, which double
    as timestamps; anything already on screen when you join is treated as seen.
-   Zoom, Slack and Meet chat are not wired up yet.
+   Google Meet gives chat no ids and no per-message grouping at all — the panel
+   is a flat run of lines reading author, time, text, time, text, with a name
+   appearing once however many messages that person sends in a row. Timestamps
+   are the only part with a recognisable shape, so they are the hinge: the line
+   after one is a message, and a line that is neither is a name. Ids are hashed
+   (FNV-1a, not `Hasher`, whose seed changes every run) from time, author and
+   text, so the same words twice in a minute count once and the same words
+   tomorrow count again. A message consisting only of a clock ("3:02") reads as
+   furniture and is skipped, which is the price of a panel with no ids. Zoom
+   chat is not wired up yet.
 
 Google Meet has no desktop app, so the target here is the Safari web app — Meet
 added to the Dock from Safari, which macOS runs as its own process. A Meet tab
