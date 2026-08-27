@@ -234,6 +234,39 @@ do {
 }
 
 do {
+    // Speech recognition revises what it already put on screen. Meet was
+    // caught correcting a segment 33 places back — 43 characters becoming 45 —
+    // and an exact prefix match cannot survive that: every segment around the
+    // change looked new, and a six-minute call wrote 128 utterances as 2,110
+    // lines.
+    let h = SegmentHistory()
+    let window = (0..<20).map { SegmentKey(speaker: "Speaker\($0 % 3)", text: "sentence \($0)") }
+    let base = h.absorb(window)
+    var revised = window
+    revised[7] = SegmentKey(speaker: revised[7].speaker, text: "sentence 7, corrected")
+    expectEqual(h.absorb(revised), base, "a corrected segment keeps the position it was written at")
+    expectEqual(h.absorb(revised), base, "and the correction is what is remembered from then on")
+
+    // A correction and a new sentence in the same poll: still one new position.
+    var grown = revised
+    grown[7] = SegmentKey(speaker: grown[7].speaker, text: "sentence 7, corrected again")
+    grown.append(SegmentKey(speaker: "Speaker1", text: "sentence 20"))
+    expectEqual(h.absorb(grown), base, "a correction alongside a new segment still anchors")
+    expectEqual(h.absorb(Array(grown.dropFirst(3))), base + 3, "and scrolling after that shifts by what left")
+}
+
+do {
+    // The anchor must not be so eager that a repeated line is stapled onto the
+    // one before it — people do say the same short thing twice.
+    let h = SegmentHistory()
+    _ = h.absorb([SegmentKey(speaker: "Grace", text: "Yeah."),
+                  SegmentKey(speaker: "Alan", text: "Right.")])
+    expectEqual(h.absorb([SegmentKey(speaker: "Grace", text: "Yeah."),
+                          SegmentKey(speaker: "Bo", text: "Different.")]), 2,
+                "a window that only agrees on its first line counts as new")
+}
+
+do {
     let h = SegmentHistory()
     _ = h.absorb([
         SegmentKey(speaker: "A", text: "a"),

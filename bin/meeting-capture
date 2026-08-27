@@ -748,10 +748,48 @@ final class SegmentHistory {
             trim()
             return dropped + keys.count - settled.count
         }
+        // Nothing lines up exactly. Before calling a whole screenful new, look
+        // for where the window sits despite the difference: what changed is
+        // usually a revision of something already written, and it keeps its
+        // position rather than arriving again under a new one.
+        if let anchor = anchor(for: settled) {
+            let base = dropped + anchor
+            let overlap = min(keys.count - anchor, settled.count)
+            keys.replaceSubrange(anchor..<(anchor + overlap), with: settled.prefix(overlap))
+            keys.append(contentsOf: settled.dropFirst(overlap))
+            trim()
+            return base
+        }
         // No overlap with anything remembered: all of these are new.
         keys.append(contentsOf: settled)
         trim()
         return dropped + keys.count - settled.count
+    }
+
+    /// Where this window most likely sits in the history.
+    ///
+    /// Speech recognition revises what it has already put on screen — Meet was
+    /// caught correcting a segment 33 places back, 43 characters becoming 45 —
+    /// and an exact prefix match cannot survive that: one changed word in the
+    /// middle made every segment around it look new, and the whole panel was
+    /// written again. Over six minutes that turned 128 utterances into 2,110
+    /// lines.
+    ///
+    /// So anchor on the oldest visible segment, the one least likely to still
+    /// be changing, and only accept a position most of the window agrees with.
+    /// Without that agreement a call where someone says "Yeah." twice would
+    /// staple the second one over the first.
+    private func anchor(for settled: [SegmentKey]) -> Int? {
+        var best: (index: Int, matches: Int)?
+        for index in stride(from: keys.count - 1, through: 0, by: -1) where keys[index] == settled[0] {
+            let overlap = min(keys.count - index, settled.count)
+            guard overlap > 1 else { continue }
+            let matches = zip(keys[index...], settled.prefix(overlap))
+                .reduce(0) { $0 + ($1.0 == $1.1 ? 1 : 0) }
+            guard matches * 2 > overlap else { continue }
+            if best == nil || matches > best!.matches { best = (index, matches) }
+        }
+        return best?.index
     }
 
     /// A many-hour call produces thousands of segments; keep memory flat.
