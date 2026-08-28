@@ -942,6 +942,57 @@ do {
                 "the stub models an unstable-id app")
 }
 
+// --- processMatches -----------------------------------------------------
+//
+// Replaces pgrep -f. Four process spawns every two seconds were 10% of a
+// core all evening with no meeting happening. The patterns are the same
+// strings; they now match executable path + bundle path.
+
+do {
+    let teams = "Microsoft Teams.app/Contents/MacOS/MSTeams"
+    expectTrue(processMatches(pattern: teams,
+                              executable: "/Applications/Microsoft Teams.app/Contents/MacOS/MSTeams",
+                              bundle: "/Applications/Microsoft Teams.app"),
+               "Teams main binary matches")
+    expectTrue(!processMatches(pattern: teams,
+                               executable: "/Library/Audio/Plug-Ins/HAL/MSTeamsAudioDevice.driver/Contents/MacOS/MSTeamsAudioDevice",
+                               bundle: ""),
+               "Teams audio driver does not steal the pid")
+
+    let slack = "Slack.app/Contents/MacOS/Slack"
+    expectTrue(processMatches(pattern: slack,
+                              executable: "/Applications/Slack.app/Contents/MacOS/Slack",
+                              bundle: "/Applications/Slack.app"),
+               "Slack main binary matches")
+    expectTrue(!processMatches(pattern: slack,
+                               executable: "/Applications/Slack.app/Contents/Frameworks/Slack Helper.app/Contents/MacOS/Slack Helper",
+                               bundle: "/Applications/Slack.app/Contents/Frameworks/Slack Helper.app"),
+               "Slack Helper is not the meeting UI")
+
+    let zoom = "zoom.us.app/Contents/MacOS/zoom.us"
+    expectTrue(processMatches(pattern: zoom,
+                              executable: "/Applications/zoom.us.app/Contents/MacOS/zoom.us",
+                              bundle: "/Applications/zoom.us.app"),
+               "Zoom main binary matches")
+
+    // Safari web apps: executable is "Web App", bundle is "Google Meet.app".
+    // Neither half matches the pattern alone the way pgrep -f saw the command
+    // line (`Web App --bundlepath .../Google Meet.app`), so both are searched.
+    let meet = "Web App .*Google Meet.app"
+    expectTrue(processMatches(pattern: meet,
+                              executable: "/Users/eric/Applications/Google Meet.app/Contents/MacOS/Web App",
+                              bundle: "/Users/eric/Applications/Google Meet.app"),
+               "Meet web app matches executable + bundle")
+    expectTrue(!processMatches(pattern: meet,
+                               executable: "/Applications/Safari.app/Contents/MacOS/Safari",
+                               bundle: "/Applications/Safari.app"),
+               "Safari itself is not Meet")
+    expectTrue(!processMatches(pattern: meet,
+                               executable: "/Users/eric/Applications/Some Other.app/Contents/MacOS/Web App",
+                               bundle: "/Users/eric/Applications/Some Other.app"),
+               "a different Safari web app is not Meet")
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")

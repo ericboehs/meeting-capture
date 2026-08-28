@@ -853,7 +853,9 @@ protocol MeetingApp {
     /// Short name used for --app and in metadata.
     var id: String { get }
     var displayName: String { get }
-    /// pgrep -f pattern matching the process that owns the meeting UI.
+    /// Regex matched against a process's executable path and bundle path,
+    /// the same string pgrep -f used to see. NSWorkspace is the lookup now:
+    /// four pgrep spawns every two seconds were 10% of a core while idle.
     var processPattern: String { get }
 
     /// Non-nil while a call is up. The element is also a hint for the title.
@@ -980,59 +982,37 @@ func firstWindowTitle(_ app: AXUIElement) -> String {
     return windows.map { axString($0, kAXTitleAttribute) }.first { !$0.isEmpty } ?? ""
 }
 
+/// Whether this process is the meeting UI for `pattern`.
+///
+/// `pattern` is the same regex pgrep -f used: a path fragment for the native
+/// apps, and `Web App .*Google Meet.app` for Meet, whose executable is named
+/// "Web App" and whose bundle is "Google Meet.app". Matching the two together
+/// covers both. Helpers (Slack Helper, Teams audio driver) do not match.
+func processMatches(pattern: String, executable: String, bundle: String) -> Bool {
+    let haystack = executable + " " + bundle
+    return haystack.range(of: pattern, options: .regularExpression) != nil
+}
+
 func queryProcess(matching pattern: String) -> ProcessQuery {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-    process.arguments = ["-f", pattern]
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    // Pipe does not reliably release its descriptors on deinit once the
-    // handles have been accessed — without these closes every pgrep call
-    // leaks a pair, and ~2,500 leaked fds broke all lookups live on 2026-08-25.
-    defer {
-        try? pipe.fileHandleForReading.close()
-        try? pipe.fileHandleForWriting.close()
+    // NSWorkspace is a list the system already keeps; pgrep was a process
+    // spawn (and, for a while, an fd leak) every time we wondered whether
+    // Teams was still open. Four of those every two seconds was 10% of a
+    // core all evening, with no meeting happening.
+    let match = NSWorkspace.shared.runningApplications.first {
+        processMatches(pattern: pattern,
+                       executable: $0.executableURL?.path ?? "",
+                       bundle: $0.bundleURL?.path ?? "")
     }
-    do {
-        try process.run()
-    } catch {
-        return .failed("cannot run pgrep: \(error.localizedDescription)")
-    }
-    process.waitUntilExit()
-    switch process.terminationStatus {
-    case 0: break
-    case 1: return .notRunning
-    default: return .failed("pgrep exited \(process.terminationStatus)")
-    }
-    // Exit 0 with unusable output is pgrep misbehaving, not proof the app is
-    // gone — treating it as notRunning would end an active meeting.
-    guard let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
-          let pid = output.split(separator: "\n").first.flatMap({ pid_t($0) }) else {
-        return .failed("pgrep produced no usable pid")
-    }
-    return .running(pid)
+    return match.map { .running($0.processIdentifier) } ?? .notRunning
 }
 
 enum ProcessQuery {
     case running(pid_t)
-    /// pgrep confirmed no matching process (exit 1) — and only that.
     case notRunning
-    /// The lookup itself failed (launch error, nonzero exit, unusable output);
-    /// this says nothing about whether the app is running. Carries the reason.
+    /// Kept so a lookup that cannot answer (as pgrep launch failures used to)
+    /// never looks like the app having quit. NSWorkspace does not fail that
+    /// way, but the session loop still distinguishes the two.
     case failed(String)
-}
-
-var lastProcessLookupNote = ""
-var lastProcessLookupAt = Date.distantPast
-
-/// Process lookups failing is worth knowing even under --quiet, but not once
-/// per poll.
-func noteProcessLookupFailure(_ message: String) {
-    let now = Date()
-    guard !(message == lastProcessLookupNote && now.timeIntervalSince(lastProcessLookupAt) < 60) else { return }
-    lastProcessLookupNote = message
-    lastProcessLookupAt = now
-    status(message)
 }
 
 /// True once a Chromium/WebKit tree is serving real content (DOM ids), as
@@ -1100,9 +1080,9 @@ struct WakeLedger {
 
     /// Drop bookkeeping for pids no longer running, so restarts start fresh
     /// instead of inheriting a stale cooldown/count. Callers MUST include any
-    /// attached session's pid in `alive` unconditionally: pgrep can miss it
-    /// transiently, and pruning its entry mid-hollow-period would reset the
-    /// attempt-count math the "hollow for Ns" warnings depend on.
+    /// attached session's pid in `alive` unconditionally: a pid lookup can
+    /// miss it transiently, and pruning its entry mid-hollow-period would
+    /// reset the attempt-count math the "hollow for Ns" warnings depend on.
     mutating func prune(alive: Set<pid_t>) {
         attempts = attempts.filter { alive.contains($0.key) }
         nextAttempt = nextAttempt.filter { alive.contains($0.key) }
@@ -1131,7 +1111,17 @@ struct TreeWaker {
         guard attachment.meetingApp.rendersWebContent else {
             return attachment.meetingApp.treeReadiness(app) != .unreadable
         }
-        let awake = webTreeAwake(app)
+        // Once a pid's WebView has populated, it does not go hollow without
+        // the process restarting (which prunes this entry). Re-scanning every
+        // node Slack or Teams has ever rendered, every two seconds, was the
+        // other half of the idle CPU — the DOM-id probe is a full walk.
+        let awake: Bool
+        if ledger.isPopulated(pid: attachment.pid) {
+            awake = true
+        } else {
+            awake = webTreeAwake(app)
+            if awake { ledger.markPopulated(pid: attachment.pid) }
+        }
         let (poke, attempt) = pokeDecision(pid: attachment.pid, awake: awake, now: now)
         if poke {
             pokeWebTree(app)
@@ -1141,6 +1131,9 @@ struct TreeWaker {
                 status("\(attachment.meetingApp.displayName)'s accessibility tree has stayed hollow for \(attempt * 5)s; captions cannot be read. Check Accessibility permission for meeting-capture-daemon, or restart \(attachment.meetingApp.displayName)")
             }
         }
+        if awake { return true }
+        // Hollow WebView: Teams can still detect a meeting from the native
+        // window title; everyone else is unreadable until the tree fills in.
         return attachment.meetingApp.treeReadiness(app) != .unreadable
     }
 
@@ -1720,9 +1713,12 @@ final class SlackApp: MeetingApp {
     private var history = SegmentHistory()
 
     /// A huddle gets its own window, and the Leave button only exists while
-    /// one is up.
+    /// one is up. Search that window only: walking the whole Slack workspace
+    /// every two seconds, looking for a huddle that is not happening, is why
+    /// a sitting-open Slack showed up as 10–27% of a core.
     func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
-        findElement(from: app) {
+        guard let window = huddleWindow(app) else { return nil }
+        return findElement(from: window) {
             axString($0, kAXRoleAttribute) == kAXButtonRole
                 && axDescription($0) == leaveDescription
         }
@@ -3294,23 +3290,19 @@ func attach(_ meetingApp: MeetingApp, pid: pid_t) -> Attachment {
 
 /// Every wanted app that is currently running.
 func runningApps() -> [Attachment] {
-    wanted.compactMap { meetingApp in
-        let pid: pid_t?
-        if let forced = options.pid {
-            pid = forced
-        } else {
-            switch queryProcess(matching: meetingApp.processPattern) {
-            case .running(let found):
-                pid = found
-            case .notRunning:
-                // Confirmed gone; nothing to attach to.
-                pid = nil
-            case .failed(let why):
-                noteProcessLookupFailure("cannot look up \(meetingApp.displayName): \(why)")
-                pid = nil
-            }
+    if let forced = options.pid {
+        return wanted.map { attach($0, pid: forced) }
+    }
+    // One snapshot, four patterns: four separate lookups used to mean four
+    // process spawns, and the list does not change in the time between them.
+    let running = NSWorkspace.shared.runningApplications
+    return wanted.compactMap { meetingApp in
+        let match = running.first {
+            processMatches(pattern: meetingApp.processPattern,
+                           executable: $0.executableURL?.path ?? "",
+                           bundle: $0.bundleURL?.path ?? "")
         }
-        return pid.map { attach(meetingApp, pid: $0) }
+        return match.map { attach(meetingApp, pid: $0.processIdentifier) }
     }
 }
 
@@ -3368,7 +3360,7 @@ while !stopRequested {
             let candidates = runningApps()
             // Drop wake bookkeeping for pids that no longer exist so app
             // restarts start fresh. LOAD-BEARING: the attached session's pid
-            // rides along unconditionally — pgrep can miss it transiently, and
+            // rides along unconditionally — a pid lookup can miss it transiently, and
             // pruning its entry mid-hollow-period would reset the attempt
             // counts the "hollow for Ns" warnings count on.
             let alive = Set(candidates.map(\.pid)).union(attachment.map { [$0.pid] } ?? [])
