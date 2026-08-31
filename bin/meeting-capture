@@ -49,6 +49,9 @@ struct Options {
     var quiet = false
     var pid: pid_t?
     var app: String?
+    /// A positional first argument selects a one-shot subcommand instead of
+    /// the daemon's watch loop ("people-snapshot").
+    var subcommand: String?
     var stateDirectory: String = {
         let base = ProcessInfo.processInfo.environment["XDG_STATE_HOME"]
             ?? NSHomeDirectory() + "/.local/state"
@@ -84,6 +87,11 @@ func usage() -> String {
       --json               print JSONL to stdout instead of pretty lines
       --quiet              no stdout output
       --pid <pid>          app pid (default: autodetect, refreshed as needed)
+
+    people-snapshot      Teams only: open the People panel, expand the list,
+                         and print everyone in the meeting, confirmed against
+                         the panel's own head count. --json for machine output.
+
       -h, --help           this help
 
     Files are only created once there is something to write. Ctrl-C flushes
@@ -99,6 +107,11 @@ func fail(_ message: String) -> Never {
 func parseOptions() -> Options {
     var options = Options()
     var args = Array(CommandLine.arguments.dropFirst())
+    // A positional first argument is a subcommand, not a flag.
+    if let first = args.first, first == "people-snapshot" {
+        options.subcommand = first
+        args.removeFirst()
+    }
     func next(_ flag: String) -> String {
         guard !args.isEmpty else { fail("missing value for \(flag)") }
         return args.removeFirst()
@@ -1216,6 +1229,40 @@ struct TreeWaker {
     }
 
     mutating func prune(alive: Set<pid_t>) { ledger.prune(alive: alive) }
+}
+
+// MARK: - Roster parsing (pure; the People panel drives the AX side)
+
+/// The participant count, read from the roster panel's title row — "In this
+/// meeting (293)" as a StaticText value, or "In this meeting, 293 total" as
+/// the section's description. The People button itself carries no number in
+/// the tree, so this title row is the only count the AX side ever gets.
+func rosterCount(from candidates: [String]) -> Int? {
+    for text in candidates {
+        if let range = text.range(of: "\\((\\d+)\\)", options: .regularExpression) {
+            let digits = text[text.index(range.lowerBound, offsetBy: 1)..<text.index(range.upperBound, offsetBy: -1)]
+            if let n = Int(digits) { return n }
+        }
+    }
+    for text in candidates {
+        if let range = text.range(of: "(\\d+) total", options: .regularExpression) {
+            let upTo = text.index(range.upperBound, offsetBy: -" total".count)
+            if let n = Int(text[range.lowerBound..<upTo]) { return n }
+        }
+    }
+    return nil
+}
+
+private let rosterStateWords: Set<String> = ["Muted", "Unmuted", "Organizer",
+    "Speaking", "Sharing", "Presenting", "Pinned", "Spotlighted", "On hold"]
+
+/// A row's description is "<Name>[, <state>]…" — "Allen, Mary Catherine,
+/// Organizer, Muted". The trailing states are chips, not parts of the name;
+/// strip as many as trail. A name is whatever is left.
+func bareName(from description: String) -> String {
+    var parts = description.components(separatedBy: ", ")
+    while let last = parts.last, rosterStateWords.contains(last) { parts.removeLast() }
+    return parts.joined(separator: ", ")
 }
 
 // MARK: - Microsoft Teams
@@ -3318,7 +3365,218 @@ var stopRequested = false
 signal(SIGINT) { _ in stopRequested = true }
 signal(SIGTERM) { _ in stopRequested = true }
 
+/// One person on the roster. `key` is the DOM id's tail after
+/// `calling-roster-item-` — the participant's identity as Teams sees it, used
+/// to dedup when the list re-renders while it is being read.
+struct RosterPerson {
+    let name: String
+    let key: String
+}
+
+/// Everyone the panel is showing RIGHT NOW. Rows are keyed by their
+/// `calling-roster-item-*` DOM id, so re-renders dedup rather than double.
+/// The name comes from the avatar's StaticText, which is the bare name; the
+/// row's own description trails state chips ("Muted", "Organizer").
+func rosterPeople(in panel: AXUIElement) -> [RosterPerson] {
+    var seen = Set<String>()
+    var people: [RosterPerson] = []
+    func scanAvatar(_ e: AXUIElement, _ depth: Int, _ name: inout String) {
+        guard depth < 15, name.isEmpty else { return }
+        if axDomID(e).hasPrefix("roster-avatar-img-") {
+            for text in axStaticTexts(e) where !text.isEmpty { name = text; return }
+        }
+        for child in axChildren(e) { scanAvatar(child, depth + 1, &name) }
+    }
+    func scan(_ e: AXUIElement, _ depth: Int) {
+        guard depth < 60 else { return }
+        let domid = axDomID(e)
+        if domid.hasPrefix("calling-roster-item-") {
+            let key = String(domid.dropFirst("calling-roster-item-".count))
+            if !seen.contains(key) {
+                seen.insert(key)
+                var name = ""
+                scanAvatar(e, 0, &name)
+                if name.isEmpty { name = bareName(from: axDescription(e)) }
+                if !name.isEmpty { people.append(RosterPerson(name: name, key: key)) }
+            }
+            return // rows do not nest rows
+        }
+        for child in axChildren(e) { scan(child, depth + 1) }
+    }
+    scan(panel, 0)
+    return people
+}
+
+/// The control that loads more of a long list. Its exact shape is not yet
+/// confirmed against a big meeting (docs/people-snapshot-notes.md), so match
+/// broadly — description, DOM id or class naming "more" or "load" — and
+/// require that clicking it actually grew the list before trusting it.
+func moreControl(in panel: AXUIElement) -> AXUIElement? {
+    findElement(from: panel, where: { e in
+        guard axString(e, kAXRoleAttribute) == kAXButtonRole else { return false }
+        if axDescription(e).localizedCaseInsensitiveContains("more") { return true }
+        if axDescription(e).localizedCaseInsensitiveContains("load") { return true }
+        if axDomID(e).localizedCaseInsensitiveContains("more") { return true }
+        return axClasses(e).contains { $0.localizedCaseInsensitiveContains("load-more") }
+    })
+}
+
+/// Wheel the panel down hard. CGEvent scroll acts at the pointer, so the
+/// pointer has to be in the panel first.
+func scrollPanelToBottom(_ panel: AXUIElement) {
+    let (origin, size) = axFrame(panel)
+    let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height * 0.6)
+    let source = CGEventSource(stateID: .combinedSessionState)
+    CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+            mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
+    usleep(300_000)
+    for _ in 0..<30 {
+        let wheel = CGEvent(scrollWheelEvent2Source: source, units: .line,
+                            wheelCount: 1, wheel1: -12, wheel2: 0, wheel3: 0)
+        wheel?.location = point
+        wheel?.post(tap: .cghidEventTap)
+        usleep(120_000)
+    }
+}
+
+/// `meeting-capture people-snapshot`: open the People panel, read its head
+/// count, expand until the loaded rows match, list everyone, and close the
+/// panel again if we opened it. The pointer and the frontmost app are put
+/// back either way — even on failure, since exit() skips defers.
+func peopleSnapshot(pid: pid_t, json: Bool) -> Never {
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 8.0)
+    let windows = axWindows(app)
+    guard let window = windows.first(where: {
+        findElement(from: $0, where: { axDomID($0) == "hangup-button" }) != nil
+    }) else {
+        fail("no Microsoft Teams meeting is running")
+    }
+    let priorApp = NSWorkspace.shared.frontmostApplication
+    let priorPointer = CGEvent(source: nil)?.location
+    func restore() {
+        if let priorPointer {
+            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                    mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
+        }
+        priorApp?.activate()
+    }
+
+    let panelExisted = findElement(from: window, where: { axDescription($0) == "Participants" }) != nil
+    if !panelExisted {
+        guard let roster = findElement(from: window, where: { axDomID($0) == "roster-button" }) else {
+            restore(); fail("could not find Teams' People button")
+        }
+        NSRunningApplication(processIdentifier: pid)?.activate()
+        usleep(400_000)
+        let (origin, size) = axFrame(roster)
+        clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
+                                             y: origin.y + size.height / 2))
+        var opened = false
+        for _ in 0..<8 {
+            usleep(500_000)
+            if findElement(from: window, where: { axDescription($0) == "Participants" }) != nil {
+                opened = true
+                break
+            }
+        }
+        guard opened else { restore(); fail("People panel did not open") }
+    }
+    guard let panel = findElement(from: window, where: { axDescription($0) == "Participants" }) else {
+        restore(); fail("People panel vanished after opening")
+    }
+
+    // The head count lives in the title row; the People button carries none.
+    var countCandidates: [String] = []
+    if let title = findElement(from: panel, where: { axDomID($0).hasPrefix("roster-title-section") }) {
+        countCandidates.append(axDescription(title))
+        countCandidates.append(contentsOf: axStaticTexts(title))
+    }
+    let target = rosterCount(from: countCandidates)
+
+    var people = rosterPeople(in: panel)
+    var attempts = 0
+    while let need = target, people.count < need, attempts < 12 {
+        attempts += 1
+        scrollPanelToBottom(panel)
+        usleep(800_000)
+        let grown = rosterPeople(in: panel)
+        if grown.count > people.count { people = grown; continue }
+        if let more = moreControl(in: panel) {
+            NSRunningApplication(processIdentifier: pid)?.activate()
+            usleep(300_000)
+            let (origin, size) = axFrame(more)
+            clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
+                                                 y: origin.y + size.height / 2))
+            usleep(1_500_000)
+            let after = rosterPeople(in: panel)
+            if after.count > people.count { people = after; continue }
+            break // clicked and nothing grew: this is as long as the list gets
+        }
+        break // no growth and no control: report the shortfall honestly
+    }
+
+    if !panelExisted {
+        if let roster = findElement(from: window, where: { axDomID($0) == "roster-button" }) {
+            NSRunningApplication(processIdentifier: pid)?.activate()
+            usleep(300_000)
+            let (origin, size) = axFrame(roster)
+            clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
+                                                 y: origin.y + size.height / 2))
+            for _ in 0..<4 where
+                findElement(from: window, where: { axDescription($0) == "Participants" }) != nil {
+                usleep(500_000)
+            }
+        }
+    }
+    restore()
+
+    if json {
+        var payload: [String: Any] = [
+            "type": "people-snapshot", "app": "teams", "pid": pid,
+            "people": people.map { ["name": $0.name, "key": $0.key] },
+        ]
+        if let target {
+            payload["count"] = target
+            payload["confirmed"] = people.count == target
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            fail("could not encode the snapshot")
+        }
+        print(text)
+    } else {
+        let title = TeamsApp().meetingTitle(app, anchor: window)
+        var header = "\"\(title)\" — \(people.count) people"
+        if let target, people.count != target {
+            header += " — roster says \(target), only \(people.count) loaded; the list would not expand fully"
+        } else if let target {
+            header += " (confirmed against the roster's \(target))"
+        }
+        print(header)
+        for person in people { print("  \(person.name)") }
+    }
+    exit(0)
+}
+
 let options = parseOptions()
+
+if options.subcommand == "people-snapshot" {
+    guard AXIsProcessTrusted() else {
+        fail("no Accessibility permission — grant it in System Settings → Privacy & Security → Accessibility")
+    }
+    let pid: pid_t
+    if let forced = options.pid {
+        pid = forced
+    } else {
+        switch queryProcess(matching: TeamsApp().processPattern) {
+        case .running(let found): pid = found
+        case .notRunning: fail("Microsoft Teams is not running")
+        case .failed(let why): fail("cannot tell whether Microsoft Teams is running (\(why))")
+        }
+    }
+    peopleSnapshot(pid: pid, json: options.jsonToStdout)
+}
 let live = LiveView(options: options)
 
 if options.follow {

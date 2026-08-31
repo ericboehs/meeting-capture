@@ -1013,6 +1013,42 @@ do {
                "nothing known is not usable — the list has decayed")
 }
 
+// --- rosterCount / bareName ---------------------------------------------
+//
+// The People panel's head count is only available in its title row — the
+// People button itself carries no number in the tree. Two shapes were seen
+// live: the StaticText value "In this meeting (293)" and the section's own
+// description "In this meeting, 293 total".
+
+do {
+    expectEqual(rosterCount(from: ["In this meeting (293)"]), 293,
+                "the count reads out of the title row's parenthesised text")
+    expectEqual(rosterCount(from: ["", "In this meeting (8)"]), 8,
+                "candidates are tried in order and blanks are skipped")
+    expectEqual(rosterCount(from: ["In this meeting, 293 total"]), 293,
+                "the section description's 'N total' also counts")
+    expectEqual(rosterCount(from: ["Participants", "Close participants pane"]), nil,
+                "a panel without a title row reports no count")
+    expectEqual(rosterCount(from: ["In this meeting ()"]), nil,
+                "an empty parenthesised group is not a count")
+}
+
+// Row descriptions trail state chips: "Allen, Mary Catherine, Organizer,
+// Muted". The name is everything before them, and commas INSIDE the name
+// ("Last, First") survive because only trailing chips are stripped.
+do {
+    expectEqual(bareName(from: "Eric Boehs, Muted"), "Eric Boehs",
+                "the muted chip is not part of the name")
+    expectEqual(bareName(from: "Alvarado, Vicky N., Organizer, Muted"), "Alvarado, Vicky N.",
+                "organizer and muted chips strip, name commas survive")
+    expectEqual(bareName(from: "Clarkson, Steven A."), "Clarkson, Steven A.",
+                "a description with no chips is the bare name")
+    expectEqual(bareName(from: "Muted"), "",
+                "a description that is only chips leaves nothing")
+    expectEqual(bareName(from: "Parker, Dana, Speaking"), "Parker, Dana",
+                "other states strip the same way")
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")
