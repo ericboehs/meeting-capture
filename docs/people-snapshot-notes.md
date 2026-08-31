@@ -78,3 +78,15 @@ AXGroup desc=Participants            <- panel
    snapshot — partial output must say how many are missing.
 6. Close the panel again the same way it was opened (or leave open if it
    already was), and restore pointer + frontmost app.
+
+## Afternoon 8-person call (2026-08-31, live-verified)
+
+- `people-snapshot` shipped and ran clean on a small meeting: count read
+  from the title row, all 8 names, confirmed, panel closed, pointer and
+  frontmost app restored. Subcommand committed at ef96e84.
+- Confirmed the list is virtualized by COUNT, not window height: 9 AXRows
+  (8 people + title row) with the pane less than half full, so materializing
+  the rest is not a matter of scrolling a rendered pane — rows must be
+  ADDED by the "More" control (or something equivalent).
+- The daemon restart after install logged "Microsoft Teams, Slack is
+  running, waiting for a meeting" — the decayed-snapshot guards are in.
