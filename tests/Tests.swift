@@ -993,6 +993,26 @@ do {
                "a different Safari web app is not Meet")
 }
 
+// --- usableEntry --------------------------------------------------------
+//
+// A decayed NSWorkspace snapshot serves entries with no name and no path, and
+// a daemon that trusts it misses every meeting for as long as it lives —
+// three days, once. Any entry LaunchServices can describe proves the list is
+// alive; a list that cannot describe even Finder is broken, not empty.
+
+do {
+    expectTrue(usableEntry(executable: "/Applications/Slack.app/Contents/MacOS/Slack",
+                           bundle: "/Applications/Slack.app",
+                           bundleID: "com.tinyspeck.slackmacgap"),
+               "a fully described app is usable")
+    expectTrue(usableEntry(executable: "", bundle: "", bundleID: "com.apple.finder"),
+               "a bundle identifier alone is enough")
+    expectTrue(usableEntry(executable: "/usr/bin/pgrep", bundle: "", bundleID: ""),
+               "a path alone is enough")
+    expectTrue(!usableEntry(executable: "", bundle: "", bundleID: ""),
+               "nothing known is not usable — the list has decayed")
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")

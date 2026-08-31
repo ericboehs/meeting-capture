@@ -993,12 +993,33 @@ func processMatches(pattern: String, executable: String, bundle: String) -> Bool
     return haystack.range(of: pattern, options: .regularExpression) != nil
 }
 
+/// A snapshot entry is usable when LaunchServices can describe the app at all.
+/// A list where nothing can be described is broken, not empty — every
+/// logged-in desktop has a Finder it can name.
+func usableEntry(executable: String, bundle: String, bundleID: String) -> Bool {
+    !(executable.isEmpty && bundle.isEmpty && bundleID.isEmpty)
+}
+
 func queryProcess(matching pattern: String) -> ProcessQuery {
     // NSWorkspace is a list the system already keeps; pgrep was a process
     // spawn (and, for a while, an fd leak) every time we wondered whether
     // Teams was still open. Four of those every two seconds was 10% of a
     // core all evening, with no meeting happening.
-    let match = NSWorkspace.shared.runningApplications.first {
+    //
+    // But the list is served from a snapshot that decays: a daemon up for
+    // three days matched nothing at all — 0% of samples anywhere near the
+    // accessibility API, regexes running over entries with nothing in them —
+    // and missed every meeting until it was restarted. So a list that cannot
+    // describe even one app is a failure, never an answer.
+    let running = NSWorkspace.shared.runningApplications
+    guard running.contains(where: {
+        usableEntry(executable: $0.executableURL?.path ?? "",
+                    bundle: $0.bundleURL?.path ?? "",
+                    bundleID: $0.bundleIdentifier ?? "")
+    }) else {
+        return .failed("the app list is not serving names or paths")
+    }
+    let match = running.first {
         processMatches(pattern: pattern,
                        executable: $0.executableURL?.path ?? "",
                        bundle: $0.bundleURL?.path ?? "")
@@ -1006,15 +1027,65 @@ func queryProcess(matching pattern: String) -> ProcessQuery {
     return match.map { .running($0.processIdentifier) } ?? .notRunning
 }
 
+/// The ground truth, at the cost of a process spawn. The fallback for when
+/// NSWorkspace cannot answer, rate-limited by the caller: four spawns a
+/// minute is nothing, four every two seconds was the old CPU bill.
+func pgrepLookup(matching pattern: String) -> ProcessQuery {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    process.arguments = ["-f", pattern]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    // Pipe does not reliably release its descriptors on deinit once the
+    // handles have been accessed — without these closes every pgrep call
+    // leaks a pair, and ~2,500 leaked fds broke all lookups live on 2026-08-25.
+    defer {
+        try? pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
+    }
+    do {
+        try process.run()
+    } catch {
+        return .failed("cannot run pgrep: \(error.localizedDescription)")
+    }
+    process.waitUntilExit()
+    switch process.terminationStatus {
+    case 0: break
+    case 1: return .notRunning
+    default: return .failed("pgrep exited \(process.terminationStatus)")
+    }
+    // Exit 0 with unusable output is pgrep misbehaving, not proof the app is
+    // gone — treating it as notRunning would end an active meeting.
+    guard let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
+          let pid = output.split(separator: "\n").first.flatMap({ pid_t($0) }) else {
+        return .failed("pgrep produced no usable pid")
+    }
+    return .running(pid)
+}
+
 enum ProcessQuery {
     case running(pid_t)
     case notRunning
-    /// Kept so a lookup that cannot answer (as pgrep launch failures used to)
-    /// never looks like the app having quit. NSWorkspace does not fail that
-    /// way, but the session loop still distinguishes the two.
+    /// The lookup could not answer: a broken app-list snapshot, a pgrep launch
+    /// error. Says nothing about whether the app is running — callers must
+    /// never read it as "the app is gone".
     case failed(String)
 }
 
+var lastProcessLookupNote = ""
+var lastProcessLookupAt = Date.distantPast
+
+/// Process lookups failing is worth knowing even under --quiet, but not once
+/// per poll.
+func noteProcessLookupFailure(_ message: String) {
+    let now = Date()
+    guard !(message == lastProcessLookupNote && now.timeIntervalSince(lastProcessLookupAt) < 60) else { return }
+    lastProcessLookupNote = message
+    lastProcessLookupAt = now
+    status(message)
+}
+
+var lastPgrepScanAt = Date.distantPast
 /// True once a Chromium/WebKit tree is serving real content (DOM ids), as
 /// opposed to the hollow shell it starts with.
 func webTreeAwake(_ app: AXUIElement) -> Bool {
@@ -3296,7 +3367,7 @@ func runningApps() -> [Attachment] {
     // One snapshot, four patterns: four separate lookups used to mean four
     // process spawns, and the list does not change in the time between them.
     let running = NSWorkspace.shared.runningApplications
-    return wanted.compactMap { meetingApp in
+    var attachments = wanted.compactMap { meetingApp -> Attachment? in
         let match = running.first {
             processMatches(pattern: meetingApp.processPattern,
                            executable: $0.executableURL?.path ?? "",
@@ -3304,6 +3375,27 @@ func runningApps() -> [Attachment] {
         }
         return match.map { attach(meetingApp, pid: $0.processIdentifier) }
     }
+    // The snapshot can decay out from under a long-lived process — three days
+    // blind once. When the cheap list cannot see one of the apps we want, take
+    // a second opinion from pgrep: a spawn a minute is nothing, and it sees
+    // the truth every time because it reads the process table, not a cache.
+    let unmatched = wanted.filter { app in
+        !attachments.contains { $0.meetingApp.id == app.id }
+    }
+    if !unmatched.isEmpty, Date().timeIntervalSince(lastPgrepScanAt) >= 60 {
+        lastPgrepScanAt = Date()
+        for meetingApp in unmatched {
+            switch pgrepLookup(matching: meetingApp.processPattern) {
+            case .running(let found):
+                attachments.append(attach(meetingApp, pid: found))
+            case .notRunning:
+                break
+            case .failed(let why):
+                noteProcessLookupFailure("cannot look up \(meetingApp.displayName): \(why)")
+            }
+        }
+    }
+    return attachments
 }
 
 var attachment: Attachment?
@@ -3423,8 +3515,20 @@ while !stopRequested {
                         endSession("\(current.meetingApp.displayName) restarted")
                     }
                 case .notRunning:
-                    // Quitting the app ends the meeting as surely as leaving does.
-                    endSession("\(current.meetingApp.displayName) quit")
+                    // The lookup is name-based against a snapshot that can go
+                    // stale; the pid itself is the ground truth. A pid that is
+                    // still alive means the snapshot is lying — a blind lookup
+                    // once ran for three days and would have called every
+                    // meeting over the moment it started.
+                    if kill(current.pid, 0) == 0 || errno == EPERM {
+                        if now.timeIntervalSince(lastProcessWarning) > 60 {
+                            lastProcessWarning = now
+                            status("\(current.meetingApp.displayName) is running but the app list cannot see it; trusting the process")
+                        }
+                    } else {
+                        // Quitting the app ends the meeting as surely as leaving does.
+                        endSession("\(current.meetingApp.displayName) quit")
+                    }
                 case .failed(let why):
                     // The lookup itself failed; that says nothing about the app,
                     // and ending the session here would truncate an active meeting.
