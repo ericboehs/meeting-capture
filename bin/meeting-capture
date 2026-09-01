@@ -43,6 +43,8 @@ struct Options {
     /// In Teams the panel is also given a window of its own, so that a covered
     /// meeting window cannot freeze it.
     var popOutChat = false
+    /// Teams only: record who was in the meeting, once, a minute after joining.
+    var peopleSnapshot = false
     var once = false
     var follow = false
     var jsonToStdout = false
@@ -78,6 +80,8 @@ func usage() -> String {
       --popout-chat        open the meeting chat so it is recorded without
                            anyone opening the panel by hand; in Teams it also
                            gets a window of its own
+      --people-snapshot    Teams: record who is in the meeting, once, about a
+                           minute in (waits for a lull; never interrupts)
       --interval <ms>      poll interval while in a meeting (default 250)
       --idle-interval <ms> poll interval while waiting for one (default 2000)
       --dir <path>         output directory (default $XDG_DATA_HOME/meeting-capture)
@@ -125,6 +129,7 @@ func parseOptions() -> Options {
         case "--auto-captions": options.autoCaptions = true
         case "--popout-captions": options.popOutCaptions = true
         case "--popout-chat": options.popOutChat = true
+        case "--people-snapshot": options.peopleSnapshot = true
         case "--interval": options.intervalMs = UInt32(next(flag)) ?? options.intervalMs
         case "--idle-interval": options.idleIntervalMs = UInt32(next(flag)) ?? options.idleIntervalMs
         case "--dir": options.directory = (next(flag) as NSString).expandingTildeInPath
@@ -347,6 +352,63 @@ func restoreFrontmost(_ prior: NSRunningApplication?) {
     guard let prior else { return }
     let app = AXUIElementCreateApplication(prior.processIdentifier)
     AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+}
+
+/// One automated interaction at a time, process-wide.
+///
+/// Clicking is global state: the pointer, the frontmost app and the window
+/// under the cursor are all shared. The roster snapshot runs on a background
+/// thread so a 300-person list cannot stall caption polling for minutes, which
+/// means it can overlap the poll thread's own clicking (captions/chat pop-out,
+/// unpin). Two of those at once would each restore the other's "prior" pointer
+/// and app, and land clicks in the wrong window. Whoever gets here second
+/// simply tries again later; nothing waits, because the waiter would be the
+/// poll loop.
+enum UIAutomation {
+    private static let mutex = NSLock()
+    private static var busy = false
+
+    static func tryEnter() -> Bool {
+        mutex.lock()
+        defer { mutex.unlock() }
+        if busy { return false }
+        busy = true
+        return true
+    }
+
+    static func leave() {
+        mutex.lock()
+        busy = false
+        mutex.unlock()
+    }
+}
+
+/// How long since the human last typed, and how long since they last clicked,
+/// dragged or scrolled. Two separate questions, because they mean different
+/// things to anything that wants to take over the pointer and the front app.
+///
+/// Bare mouse MOVEMENT is deliberately not asked about. Measured in a live
+/// meeting, a hand resting on a trackpad kept mouseMoved under two seconds
+/// continuously for minutes on end, while the keyboard sat idle for twenty:
+/// a gate that waits for a still pointer simply never opens, and the first
+/// version of the roster snapshot never fired once.
+///
+/// Asks about specific event types rather than kCGAnyInputEventType: that
+/// sentinel is not a case of Swift's CGEventType, so it cannot be spelled
+/// without a force-unwrap that would trap. The source is .hidSystemState —
+/// real hardware, so our own synthetic clicks do not read as the user being
+/// busy.
+func secondsSinceTyping() -> TimeInterval {
+    [CGEventType.keyDown, .flagsChanged].map {
+        CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0)
+    }.min() ?? .greatestFiniteMagnitude
+}
+
+func secondsSincePointerAction() -> TimeInterval {
+    [CGEventType.leftMouseDown, .rightMouseDown, .otherMouseDown,
+     .leftMouseDragged, .rightMouseDragged, .scrollWheel].map {
+        CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0)
+    }.min() ?? .greatestFiniteMagnitude
 }
 
 // MARK: - Recording
@@ -689,8 +751,12 @@ final class Recorder {
         ]
         payload.merge(extra) { current, _ in current }
         guard writeJSON(payload) else { return .failed }
-        let tag = kind == "chat" ? "(chat) " : ""
-        let line = "[\(clock)] \(tag)\(speaker): \(body)"
+        // "(chat) Alex: hi", "(people) 8 in the meeting…" — the kind is worth
+        // seeing in the transcript when it is not someone speaking. A roster
+        // has no speaker, and "(people) : 8 in" would read like a bug.
+        let tag = kind == "caption" ? "" : "(\(kind)) "
+        let attribution = speaker.isEmpty ? "" : "\(speaker): "
+        let line = "[\(clock)] \(tag)\(attribution)\(body)"
         do {
             try text.append(Data((line + "\n").utf8))
         } catch {
@@ -910,6 +976,9 @@ protocol MeetingApp {
     func captionsPanelOpen(_ app: AXUIElement) -> Bool
     /// Ask the app to show captions.
     func requestCaptions(pid: pid_t) -> CaptionRequest
+    /// True when this app can list who is in the meeting, so the daemon can
+    /// record a roster once per meeting (see Session.maintainRoster).
+    var supportsRosterSnapshot: Bool { get }
     /// True when the captions control is a toggle (Teams' ⇧⌘A). A second
     /// press would turn them back off, so we must not retry blindly.
     var captionPressToggles: Bool { get }
@@ -983,6 +1052,8 @@ extension MeetingApp {
     func reportedElapsedSeconds(_ app: AXUIElement) -> TimeInterval? { nil }
     var reportsMeetingClock: Bool { false }
     var captionPressToggles: Bool { false }
+    // Only Teams exposes a readable participant list so far.
+    var supportsRosterSnapshot: Bool { false }
     // Assume native AppKit; only opt in to the wake where it is needed.
     var rendersWebContent: Bool { false }
     func treeReadiness(_ app: AXUIElement) -> TreeReadiness {
@@ -1299,6 +1370,321 @@ func rosterPagerRemaining(_ text: String) -> Int? {
     return Int(text.dropFirst().dropLast(" more".count))
 }
 
+/// One person on the roster. `key` is the DOM id's tail after
+/// `calling-roster-item-` — the participant's identity as Teams sees it, used
+/// to dedup when the list re-renders while it is being read.
+struct RosterPerson {
+    let name: String
+    let key: String
+}
+
+/// Who the People panel listed, and whether that is everyone.
+struct RosterSnapshot {
+    let people: [RosterPerson]
+    /// The head count the panel's own title row claims, when it exposes one.
+    let expected: Int?
+    /// True only when the names we loaded match the count Teams printed. A
+    /// roster is never presented as complete on our say-so.
+    var confirmed: Bool { expected == people.count }
+
+    /// The one transcript line a snapshot becomes. Everything the reader needs
+    /// is in it: how many, whether that is the whole room, and who.
+    static func headline(count: Int, expected: Int?) -> String {
+        var head = "\(count) in the meeting"
+        if let expected, expected != count {
+            head += " (roster says \(expected); \(count) loaded)"
+        } else if expected != nil {
+            head += " (confirmed)"
+        }
+        return head
+    }
+
+    static func summary(names: [String], expected: Int?) -> String {
+        let head = headline(count: names.count, expected: expected)
+        return names.isEmpty ? head : head + ": " + names.joined(separator: ", ")
+    }
+
+    var headline: String { RosterSnapshot.headline(count: people.count, expected: expected) }
+}
+
+/// Why a roster attempt produced no snapshot. The distinction is what keeps
+/// the daemon from burning its few attempts on moments that were never going
+/// to work — a deferral is "not now", a failure is "this did not work".
+enum RosterOutcome {
+    case captured(RosterSnapshot)
+    case deferred(String)
+    case failed(String)
+}
+
+/// Everyone the panel is showing RIGHT NOW. Rows are keyed by their
+/// `calling-roster-item-*` DOM id, so re-renders dedup rather than double.
+/// The name comes from the avatar's StaticText, which is the bare name; the
+/// row's own description trails state chips ("Muted", "Organizer").
+func rosterPeople(in panel: AXUIElement) -> [RosterPerson] {
+    var seen = Set<String>()
+    var people: [RosterPerson] = []
+    func scanAvatar(_ e: AXUIElement, _ depth: Int, _ name: inout String) {
+        guard depth < 15, name.isEmpty else { return }
+        if axDomID(e).hasPrefix("roster-avatar-img-") {
+            for text in axStaticTexts(e) where !text.isEmpty { name = text; return }
+        }
+        for child in axChildren(e) { scanAvatar(child, depth + 1, &name) }
+    }
+    func scan(_ e: AXUIElement, _ depth: Int) {
+        guard depth < 60 else { return }
+        let domid = axDomID(e)
+        if domid.hasPrefix("calling-roster-item-") {
+            let key = String(domid.dropFirst("calling-roster-item-".count))
+            if !seen.contains(key) {
+                seen.insert(key)
+                var name = ""
+                scanAvatar(e, 0, &name)
+                if name.isEmpty { name = bareName(from: axDescription(e)) }
+                if !name.isEmpty { people.append(RosterPerson(name: name, key: key)) }
+            }
+            return // rows do not nest rows
+        }
+        for child in axChildren(e) { scan(child, depth + 1) }
+    }
+    scan(panel, 0)
+    return people
+}
+
+func axActionNames(_ element: AXUIElement) -> [String] {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
+    return names as? [String] ?? []
+}
+
+func rosterPanel(in window: AXUIElement) -> AXUIElement? {
+    findElement(from: window, where: { axDescription($0) == "Participants" })
+}
+
+/// The long roster's paginator is not a button. It is an AXStaticText reading
+/// "See more", then "+203 more", inside a Fluent TreeItem row.
+func rosterPager(in panel: AXUIElement) -> (element: AXUIElement, text: String)? {
+    guard let element = findElement(from: panel, where: {
+        isRosterPager(axString($0, kAXValueAttribute))
+    }) else { return nil }
+    return (element, axString(element, kAXValueAttribute))
+}
+
+func rosterCount(in panel: AXUIElement) -> Int? {
+    guard let title = findElement(from: panel, where: {
+        axDomID($0).hasPrefix("roster-title-section")
+    }) else { return nil }
+    return rosterCount(from: [axDescription(title)] + axStaticTexts(title))
+}
+
+/// One overlapping virtualized-list step. Pixel wheel deltas are what
+/// Chromium accepts; line deltas changed clipping without advancing rows.
+func scrollRoster(_ panel: AXUIElement, direction: Int32) {
+    let root = findElement(from: panel, where: { axDescription($0) == "Attendees" }) ?? panel
+    let (origin, size) = axFrame(root)
+    let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height * 0.6)
+    let source = CGEventSource(stateID: .combinedSessionState)
+    CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+            mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
+    usleep(150_000)
+    for _ in 0..<2 {
+        let wheel = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
+                            wheelCount: 1, wheel1: direction * 350, wheel2: 0, wheel3: 0)
+        wheel?.location = point
+        wheel?.post(tap: .cghidEventTap)
+        usleep(120_000)
+    }
+}
+
+/// Ask the paginator for another page. AXPress works on the first See-more
+/// row; later +N-more rows sometimes report a false success, so verify the
+/// remaining number and fall back to a real click on the nearest pressable
+/// ancestor. A success is a disappearing label or a smaller remainder.
+func pressRosterPager(_ pager: (element: AXUIElement, text: String),
+                      panel: AXUIElement, window: AXUIElement, pid: pid_t) -> Bool {
+    func progressed() -> Bool {
+        guard let after = rosterPager(in: panel) else { return true }
+        if after.text != pager.text {
+            if let before = rosterPagerRemaining(pager.text),
+               let remaining = rosterPagerRemaining(after.text) {
+                return remaining < before
+            }
+            return true
+        }
+        return false
+    }
+    var row: AXUIElement? = pager.element
+    while let element = row,
+          axString(element, kAXRoleAttribute) != kAXRowRole {
+        row = axParent(element)
+    }
+    if let row {
+        AXUIElementPerformAction(row, kAXPressAction as CFString)
+        usleep(1_000_000)
+        if progressed() { return true }
+    }
+    var pressable: AXUIElement? = pager.element
+    while let element = pressable,
+          !axActionNames(element).contains(kAXPressAction) {
+        pressable = axParent(element)
+    }
+    guard let pressable else { return false }
+    bringToFront(pid: pid, window: window)
+    let (origin, size) = axFrame(pressable)
+    clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
+                                         y: origin.y + size.height / 2))
+    usleep(1_200_000)
+    return progressed()
+}
+
+/// Read the whole Teams roster: open the People panel, expand every page,
+/// accumulate each overlapping virtualized viewport by participant key, and
+/// put the window size, panel state, pointer and frontmost app back.
+///
+/// Only a roster too long to render needs the expensive half. A meeting whose
+/// loaded rows already match the head count is read from one still panel — no
+/// resizing, no scrolling, nothing on screen but a panel opening and closing.
+///
+/// `deadline` bounds the paging loop, so a 300-person roster cannot run for
+/// the length of the meeting: whatever was loaded by then is returned, and
+/// says honestly that it is short.
+func captureRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
+    // Clicks and pointer moves are global state; two of them at once would
+    // land in each other's windows (see UIAutomation).
+    guard UIAutomation.tryEnter() else {
+        return .deferred("another automated interaction is already running")
+    }
+    defer { UIAutomation.leave() }
+
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 8.0)
+    // A just-joined Teams can expose window chrome before the WebView controls.
+    var meetingWindow: AXUIElement?
+    for _ in 0..<8 where meetingWindow == nil {
+        meetingWindow = axWindows(app).first(where: {
+            findElement(from: $0, where: { axDomID($0) == "hangup-button" }) != nil
+        })
+        if meetingWindow == nil { pokeWebTree(app); usleep(500_000) }
+    }
+    guard let window = meetingWindow else {
+        return .failed("no Microsoft Teams meeting is running")
+    }
+    // Clicking a window on another Space would drag the user's screen over to
+    // it. Wait for a moment when the window is actually here.
+    guard windowLayer(pid: pid, frame: axFrame(window)) != nil else {
+        return .deferred("the meeting window is not on this Space")
+    }
+
+    let priorApp = NSWorkspace.shared.frontmostApplication
+    let priorPointer = CGEvent(source: nil)?.location
+    let originalSize = axFrame(window).size
+    let panelExisted = rosterPanel(in: window) != nil
+    var resized = false
+    var mustClosePanel = false
+
+    func togglePanel() {
+        guard let roster = findElement(from: window, where: {
+            axDomID($0) == "roster-button"
+        }) else { return }
+        bringToFront(pid: pid, window: window)
+        let (origin, size) = axFrame(roster)
+        clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
+                                             y: origin.y + size.height / 2))
+        usleep(700_000)
+    }
+    // Every exit path leaves the meeting exactly as it was found.
+    defer {
+        if resized { axSetSize(window, originalSize); usleep(400_000) }
+        if mustClosePanel, rosterPanel(in: window) != nil { togglePanel() }
+        if let priorPointer {
+            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                    mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
+        }
+        restoreFrontmost(priorApp)
+    }
+
+    // Reset an already-open panel to its top: its title/count may have been
+    // virtualized away, and the user's scroll position is unknowable.
+    if panelExisted {
+        togglePanel()
+        for _ in 0..<6 where rosterPanel(in: window) != nil { usleep(300_000) }
+    }
+    var opened = false
+    for _ in 0..<3 where !opened {
+        togglePanel()
+        for _ in 0..<8 {
+            if rosterPanel(in: window) != nil { opened = true; break }
+            usleep(350_000)
+        }
+    }
+    guard opened, var panel = rosterPanel(in: window) else {
+        return .failed("the People panel did not open")
+    }
+    // Leave it open only if that is how it was found.
+    mustClosePanel = !panelExisted
+
+    var expected = rosterCount(in: panel)
+    var people: [RosterPerson] = []
+    var seen = Set<String>()
+    @discardableResult
+    func mergeViewport() -> Int {
+        let before = seen.count
+        for person in rosterPeople(in: panel) where seen.insert(person.key).inserted {
+            people.append(person)
+        }
+        return seen.count - before
+    }
+    mergeViewport()
+
+    if expected == nil || people.count < expected! {
+        // The paginator sits just below the last rendered row and is otherwise
+        // clipped away. Grow to the bottom of this display to reveal it.
+        let windowFrame = axFrame(window)
+        if let display = displayBounds().first(where: {
+            $0.contains(CGPoint(x: windowFrame.origin.x + windowFrame.size.width / 2,
+                                y: windowFrame.origin.y + windowFrame.size.height / 2))
+        }), display.maxY - windowFrame.origin.y > originalSize.height {
+            resized = axSetSize(window, CGSize(width: originalSize.width,
+                                               height: display.maxY - windowFrame.origin.y))
+            usleep(800_000)
+            panel = rosterPanel(in: window) ?? panel
+            mergeViewport()
+        }
+
+        // Down through all pages. Each wheel step overlaps the previous
+        // viewport, so no row can fall through the cracks; at page boundaries
+        // the pager is pressed and its progress verified before continuing.
+        var stale = 0
+        for _ in 0..<200 {
+            if let expected, seen.count >= expected { break }
+            if let deadline, Date() >= deadline { break }
+            if let pager = rosterPager(in: panel),
+               pressRosterPager(pager, panel: panel, window: window, pid: pid) {
+                stale = 0
+                mergeViewport()
+                continue
+            }
+            scrollRoster(panel, direction: -1)
+            usleep(450_000)
+            stale = mergeViewport() == 0 ? stale + 1 : 0
+            if stale >= 3 { break }
+        }
+
+        // Walk back to the top: catches any row the renderer swapped during
+        // the downward pass, and brings the title row back into the tree.
+        stale = 0
+        for _ in 0..<80 where stale < 3 {
+            scrollRoster(panel, direction: 1)
+            usleep(300_000)
+            stale = mergeViewport() == 0 ? stale + 1 : 0
+        }
+        expected = rosterCount(in: panel) ?? expected
+    }
+
+    people.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    guard !people.isEmpty else { return .failed("the People panel listed nobody") }
+    return .captured(RosterSnapshot(people: people, expected: expected))
+}
+
 // MARK: - Microsoft Teams
 
 /// Teams renders its UI in a Chromium WebView, which exposes DOM ids and class
@@ -1311,6 +1697,8 @@ final class TeamsApp: MeetingApp {
     let displayName = "Microsoft Teams"
     let processPattern = "Microsoft Teams.app/Contents/MacOS/MSTeams"
     let captionPressToggles = true
+    // The People panel lists everyone, expandable page by page (captureRoster).
+    let supportsRosterSnapshot = true
     // Teams 2 is Edge WebView2, so its tree starts switched off.
     let rendersWebContent = true
     // Teams keeps ~3 lines on screen; without this, --follow sees nothing
@@ -2424,6 +2812,25 @@ struct WallClock: TimeSource {
     func now() -> Date { Date() }
 }
 
+/// A finished roster attempt, handed from the snapshot thread back to the
+/// poll loop. One slot, because only one attempt is ever in flight.
+final class RosterInbox {
+    private let mutex = NSLock()
+    private var value: RosterOutcome?
+
+    func put(_ outcome: RosterOutcome) {
+        mutex.lock()
+        value = outcome
+        mutex.unlock()
+    }
+
+    func take() -> RosterOutcome? {
+        mutex.lock()
+        defer { value = nil; mutex.unlock() }
+        return value
+    }
+}
+
 final class Session {
     let options: Options
     let live: LiveView
@@ -2504,6 +2911,45 @@ final class Session {
     private var timelineStart: Date
     private var timelineResolved = false
     private var nextTimelineCheck = Date.distantPast
+    /// Roster bookkeeping. ONE recorded roster per meeting: read once the
+    /// joining rush has settled, retried only while it comes back short of
+    /// the head count Teams itself prints.
+    private let rosterInbox = RosterInbox()
+    private var rosterRunning = false
+    private var rosterDone = false
+    private var rosterAttempts = 0
+    private var nextRosterAttempt: Date
+    /// When to stop hunting for a quiet moment and accept that this meeting
+    /// goes unrostered.
+    private let rosterGiveUpAt: Date
+    /// How long after joining the first roster is read. People are still
+    /// arriving in the first seconds of a call, and a roster taken then is
+    /// both wrong and certain to disagree with the head count. It also leaves
+    /// the captions/chat pop-outs (attempted at 0s and 60s) the clear run at
+    /// the pointer they need.
+    static let rosterSettleSeconds: TimeInterval = 90
+    /// A lull, so the pointer is never taken mid-word or mid-gesture. Typing
+    /// gets the longer threshold: keystrokes during the snapshot would land in
+    /// whatever Teams focuses, which is the one genuinely destructive outcome.
+    static let rosterTypingIdleSeconds: TimeInterval = 3
+    static let rosterPointerIdleSeconds: TimeInterval = 1.5
+    /// How often to look for that lull. This is a HUNT, not a sample: the
+    /// first version asked once every 20 seconds and, measured against a
+    /// meeting where the user was taking notes throughout, never once found
+    /// the keyboard quiet — the roster simply never happened. Gaps of a few
+    /// seconds are common; you just have to be looking when one arrives.
+    static let rosterLullRecheckSeconds: TimeInterval = 2
+    /// How long to keep hunting before giving up and saying so.
+    static let rosterHuntSeconds: TimeInterval = 20 * 60
+    static let rosterRetrySeconds: TimeInterval = 120
+    /// Backoff for conditions that are nobody's fault and cost no attempt:
+    /// another automated interaction in progress, or a meeting window sitting
+    /// on some other Space.
+    static let rosterDeferSeconds: TimeInterval = 20
+    static let rosterMaxAttempts = 3
+    /// Bound on one attempt's paging, so a huge roster cannot spend the whole
+    /// meeting scrolling.
+    static let rosterBudgetSeconds: TimeInterval = 180
 
     init(options: Options, live: LiveView, meetingApp: MeetingApp, title: String,
          clock: any TimeSource = WallClock()) {
@@ -2513,6 +2959,9 @@ final class Session {
         self.title = title
         self.clock = clock
         self.timelineStart = clock.now()
+        self.nextRosterAttempt = clock.now().addingTimeInterval(Session.rosterSettleSeconds)
+        self.rosterGiveUpAt = clock.now()
+            .addingTimeInterval(Session.rosterSettleSeconds + Session.rosterHuntSeconds)
         chatBaselineDone = options.includeChatBacklog
         // Apps are singletons; drop any caption bookkeeping a previous meeting left.
         meetingApp.resetCaptureState()
@@ -2715,12 +3164,110 @@ final class Session {
             if needsChat { chatContainer = meetingApp.chatContainer(app) }
         }
 
-        if options.autoCaptions { ensureCaptionsOn(app: app, pid: pid, now: now) }
-        meetingApp.maintainSurfaces(app, pid: pid, now: now,
-                                    popOutCaptions: options.popOutCaptions,
-                                    popOutChat: options.popOutChat)
+        if options.peopleSnapshot { maintainRoster(pid: pid, now: now) }
+        // Fronting, clicking and key posting are all global state, so none of
+        // them may overlap the roster snapshot's background thread (see
+        // UIAutomation). Whoever loses simply tries again next poll.
+        if UIAutomation.tryEnter() {
+            if options.autoCaptions { ensureCaptionsOn(app: app, pid: pid, now: now) }
+            meetingApp.maintainSurfaces(app, pid: pid, now: now,
+                                        popOutCaptions: options.popOutCaptions,
+                                        popOutChat: options.popOutChat)
+            UIAutomation.leave()
+        }
         if options.captureCaptions { pollCaptions(now: now) }
         if options.captureChat { pollChat(now: now) }
+    }
+
+    /// Record who was in the meeting, once.
+    ///
+    /// The reading runs on a background thread: expanding a 300-person roster
+    /// is minutes of clicking and scrolling, and doing that on the poll loop
+    /// would drop every caption spoken meanwhile. This only starts attempts
+    /// and writes back what they found.
+    ///
+    /// A snapshot is written when it matches Teams' own head count, or when
+    /// the last attempt is spent — so a transcript holds exactly one roster,
+    /// and a short one says how short it is.
+    private func maintainRoster(pid: pid_t, now: Date) {
+        if let outcome = rosterInbox.take() {
+            rosterRunning = false
+            switch outcome {
+            case .captured(let snapshot):
+                rosterAttempts += 1
+                nextRosterAttempt = now.addingTimeInterval(Session.rosterRetrySeconds)
+                // An unconfirmed roster is usually a meeting still filling up.
+                // Take it as the answer only when there are no tries left.
+                if snapshot.confirmed || rosterAttempts >= Session.rosterMaxAttempts {
+                    writeRoster(snapshot, at: now)
+                    rosterDone = true
+                }
+            case .failed(let why):
+                rosterAttempts += 1
+                nextRosterAttempt = now.addingTimeInterval(Session.rosterRetrySeconds)
+                guard rosterAttempts >= Session.rosterMaxAttempts else { return }
+                rosterDone = true
+                if !options.quiet {
+                    status("could not read the \(meetingApp.displayName) participant list: \(why)")
+                }
+            case .deferred:
+                // Not now, and not this meeting's fault: costs no attempt.
+                nextRosterAttempt = now.addingTimeInterval(Session.rosterDeferSeconds)
+            }
+            return
+        }
+        guard meetingApp.supportsRosterSnapshot, !rosterDone, !rosterRunning else { return }
+        guard rosterAttempts < Session.rosterMaxAttempts else { return }
+        // Hunting for a lull cannot go on all day; say so rather than leaving
+        // a silent gap where the roster should be.
+        if now >= rosterGiveUpAt {
+            rosterDone = true
+            if !options.quiet {
+                status("never found a quiet moment to read the \(meetingApp.displayName) participant list; this meeting has no roster")
+            }
+            return
+        }
+        guard now >= nextRosterAttempt else { return }
+        // Reading the panel means clicking it, so the tree has to be awake.
+        guard ledger.isPopulated(pid: pid) else { return }
+        // The snapshot borrows the pointer and the front app for a moment.
+        // Wait for a lull rather than stealing mid-sentence or mid-gesture.
+        guard !Session.interruptsUser(typingIdle: secondsSinceTyping(),
+                                      pointerIdle: secondsSincePointerAction()) else {
+            nextRosterAttempt = now.addingTimeInterval(Session.rosterLullRecheckSeconds)
+            return
+        }
+        rosterRunning = true
+        let inbox = rosterInbox
+        let deadline = now.addingTimeInterval(Session.rosterBudgetSeconds)
+        DispatchQueue.global(qos: .utility).async {
+            inbox.put(captureRoster(pid: pid, deadline: deadline))
+        }
+    }
+
+    /// Whether taking the pointer and the front app right now would interrupt
+    /// something the user is in the middle of.
+    static func interruptsUser(typingIdle: TimeInterval, pointerIdle: TimeInterval) -> Bool {
+        typingIdle < rosterTypingIdleSeconds || pointerIdle < rosterPointerIdleSeconds
+    }
+
+    /// Write the roster as one event: a `people` line in the transcript and a
+    /// `people` record in the jsonl carrying the names as a list, so it can be
+    /// read by machine without parsing the sentence.
+    private func writeRoster(_ snapshot: RosterSnapshot, at date: Date) {
+        let names = snapshot.people.map(\.name)
+        var extra: [String: Any] = [
+            "people": names,
+            "count": names.count,
+            "confirmed": snapshot.confirmed,
+        ]
+        if let expected = snapshot.expected { extra["roster_count"] = expected }
+        emit(kind: "people", speaker: "",
+             body: RosterSnapshot.summary(names: names, expected: snapshot.expected),
+             at: date, extra: extra)
+        if !options.quiet {
+            status("recorded the participant list: \(snapshot.headline)")
+        }
     }
 
     /// Retry the ordered backlog on bounded exponential backoff (capped at
@@ -3397,293 +3944,30 @@ var stopRequested = false
 signal(SIGINT) { _ in stopRequested = true }
 signal(SIGTERM) { _ in stopRequested = true }
 
-/// One person on the roster. `key` is the DOM id's tail after
-/// `calling-roster-item-` — the participant's identity as Teams sees it, used
-/// to dedup when the list re-renders while it is being read.
-struct RosterPerson {
-    let name: String
-    let key: String
-}
-
-/// Everyone the panel is showing RIGHT NOW. Rows are keyed by their
-/// `calling-roster-item-*` DOM id, so re-renders dedup rather than double.
-/// The name comes from the avatar's StaticText, which is the bare name; the
-/// row's own description trails state chips ("Muted", "Organizer").
-func rosterPeople(in panel: AXUIElement) -> [RosterPerson] {
-    var seen = Set<String>()
-    var people: [RosterPerson] = []
-    func scanAvatar(_ e: AXUIElement, _ depth: Int, _ name: inout String) {
-        guard depth < 15, name.isEmpty else { return }
-        if axDomID(e).hasPrefix("roster-avatar-img-") {
-            for text in axStaticTexts(e) where !text.isEmpty { name = text; return }
-        }
-        for child in axChildren(e) { scanAvatar(child, depth + 1, &name) }
-    }
-    func scan(_ e: AXUIElement, _ depth: Int) {
-        guard depth < 60 else { return }
-        let domid = axDomID(e)
-        if domid.hasPrefix("calling-roster-item-") {
-            let key = String(domid.dropFirst("calling-roster-item-".count))
-            if !seen.contains(key) {
-                seen.insert(key)
-                var name = ""
-                scanAvatar(e, 0, &name)
-                if name.isEmpty { name = bareName(from: axDescription(e)) }
-                if !name.isEmpty { people.append(RosterPerson(name: name, key: key)) }
-            }
-            return // rows do not nest rows
-        }
-        for child in axChildren(e) { scan(child, depth + 1) }
-    }
-    scan(panel, 0)
-    return people
-}
-
-func axActionNames(_ element: AXUIElement) -> [String] {
-    var names: CFArray?
-    guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
-    return names as? [String] ?? []
-}
-
-/// The long roster's paginator is not a button. It is an AXStaticText reading
-/// "See more", then "+203 more", inside a Fluent TreeItem row.
-func rosterPager(in panel: AXUIElement) -> (element: AXUIElement, text: String)? {
-    guard let element = findElement(from: panel, where: {
-        isRosterPager(axString($0, kAXValueAttribute))
-    }) else { return nil }
-    return (element, axString(element, kAXValueAttribute))
-}
-
-func rosterCount(in panel: AXUIElement) -> Int? {
-    guard let title = findElement(from: panel, where: {
-        axDomID($0).hasPrefix("roster-title-section")
-    }) else { return nil }
-    return rosterCount(from: [axDescription(title)] + axStaticTexts(title))
-}
-
-/// One overlapping virtualized-list step. Pixel wheel deltas are what
-/// Chromium accepts; line deltas changed clipping without advancing rows.
-func scrollRoster(_ panel: AXUIElement, direction: Int32) {
-    let root = findElement(from: panel, where: { axDescription($0) == "Attendees" }) ?? panel
-    let (origin, size) = axFrame(root)
-    let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height * 0.6)
-    let source = CGEventSource(stateID: .combinedSessionState)
-    CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
-            mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
-    usleep(150_000)
-    for _ in 0..<2 {
-        let wheel = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
-                            wheelCount: 1, wheel1: direction * 350, wheel2: 0, wheel3: 0)
-        wheel?.location = point
-        wheel?.post(tap: .cghidEventTap)
-        usleep(120_000)
-    }
-}
-
-/// Ask the paginator for another page. AXPress works on the first See-more
-/// row; later +N-more rows sometimes report a false success, so verify the
-/// remaining number and fall back to a real click on the nearest pressable
-/// ancestor. A success is a disappearing label or a smaller remainder.
-func pressRosterPager(_ pager: (element: AXUIElement, text: String),
-                      panel: AXUIElement, app: AXUIElement,
-                      window: AXUIElement, pid: pid_t) -> Bool {
-    func progressed() -> Bool {
-        guard let after = rosterPager(in: panel) else { return true }
-        if after.text != pager.text {
-            if let before = rosterPagerRemaining(pager.text),
-               let remaining = rosterPagerRemaining(after.text) {
-                return remaining < before
-            }
-            return true
-        }
-        return false
-    }
-    var row: AXUIElement? = pager.element
-    while let element = row,
-          axString(element, kAXRoleAttribute) != kAXRowRole {
-        row = axParent(element)
-    }
-    if let row {
-        AXUIElementPerformAction(row, kAXPressAction as CFString)
-        usleep(1_000_000)
-        if progressed() { return true }
-    }
-    var pressable: AXUIElement? = pager.element
-    while let element = pressable,
-          !axActionNames(element).contains(kAXPressAction) {
-        pressable = axParent(element)
-    }
-    guard let pressable else { return false }
-    bringToFront(pid: pid, window: window)
-    let (origin, size) = axFrame(pressable)
-    clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
-                                         y: origin.y + size.height / 2))
-    usleep(1_200_000)
-    return progressed()
-}
-
-/// `meeting-capture people-snapshot`: reset/open Teams' People panel, expand
-/// its pages, and accumulate every overlapping virtualized viewport by the
-/// participant's stable roster key. Restore the window, panel state, pointer
-/// and frontmost app afterwards.
+/// `meeting-capture people-snapshot`: one roster, printed. The daemon records
+/// the same snapshot itself (see Session.maintainRoster); this is for when you
+/// want one right now, or want to see whether the reading works at all.
 func peopleSnapshot(pid: pid_t, json: Bool) -> Never {
-    let app = AXUIElementCreateApplication(pid)
-    AXUIElementSetMessagingTimeout(app, 8.0)
-    // A just-joined Teams can expose window chrome before the WebView controls.
-    var window: AXUIElement?
-    for _ in 0..<8 where window == nil {
-        window = axWindows(app).first(where: {
-            findElement(from: $0, where: { axDomID($0) == "hangup-button" }) != nil
-        })
-        if window == nil { pokeWebTree(app); usleep(500_000) }
+    let snapshot: RosterSnapshot
+    switch captureRoster(pid: pid) {
+    case .captured(let captured): snapshot = captured
+    case .deferred(let why), .failed(let why): fail(why)
     }
-    guard let window else { fail("no Microsoft Teams meeting is running") }
-
-    let priorApp = NSWorkspace.shared.frontmostApplication
-    let priorPointer = CGEvent(source: nil)?.location
-    let originalSize = axFrame(window).size
-    let panelExisted = findElement(from: window, where: {
-        axDescription($0) == "Participants"
-    }) != nil
-    func restore() {
-        axSetSize(window, originalSize)
-        if let priorPointer {
-            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
-                    mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
-        }
-        restoreFrontmost(priorApp)
-    }
-    func togglePanel() -> Bool {
-        guard let roster = findElement(from: window, where: {
-            axDomID($0) == "roster-button"
-        }) else { return false }
-        bringToFront(pid: pid, window: window)
-        let (origin, size) = axFrame(roster)
-        clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
-                                             y: origin.y + size.height / 2))
-        usleep(700_000)
-        return true
-    }
-
-    // Reset an already-open panel to its top: its title/count may have been
-    // virtualized away, and the user's scroll position is unknowable.
-    if panelExisted {
-        _ = togglePanel()
-        for _ in 0..<6 where findElement(from: window, where: {
-            axDescription($0) == "Participants"
-        }) != nil { usleep(300_000) }
-    }
-    var opened = false
-    for _ in 0..<3 where !opened {
-        _ = togglePanel()
-        for _ in 0..<8 {
-            if findElement(from: window, where: {
-                axDescription($0) == "Participants"
-            }) != nil { opened = true; break }
-            usleep(350_000)
-        }
-    }
-    guard opened, var panel = findElement(from: window, where: {
-        axDescription($0) == "Participants"
-    }) else { restore(); fail("People panel did not open") }
-
-    var target = rosterCount(in: panel)
-    // The paginator sits just below the 20th row and is otherwise clipped.
-    // Grow to the bottom of this display, then restore the user's size later.
-    let windowFrame = axFrame(window)
-    if let display = displayBounds().first(where: {
-        $0.contains(CGPoint(x: windowFrame.origin.x + windowFrame.size.width / 2,
-                            y: windowFrame.origin.y + windowFrame.size.height / 2))
-    }) {
-        axSetSize(window, CGSize(width: originalSize.width,
-                                 height: display.maxY - windowFrame.origin.y))
-        usleep(800_000)
-        panel = findElement(from: window, where: {
-            axDescription($0) == "Participants"
-        }) ?? panel
-    }
-
-    var people: [RosterPerson] = []
-    var seen = Set<String>()
-    @discardableResult
-    func mergeViewport() -> Int {
-        let before = seen.count
-        for person in rosterPeople(in: panel) where seen.insert(person.key).inserted {
-            people.append(person)
-        }
-        return seen.count - before
-    }
-    _ = mergeViewport()
-
-    // Down through all pages. Each wheel step overlaps the previous viewport,
-    // so no row can fall through the cracks; at page boundaries, +N more is
-    // pressed and verified before continuing.
-    var stale = 0
-    for _ in 0..<100 {
-        if let target, seen.count >= target { break }
-        if let pager = rosterPager(in: panel),
-           pressRosterPager(pager, panel: panel, app: app,
-                            window: window, pid: pid) {
-            stale = 0
-            _ = mergeViewport()
-            continue
-        }
-        scrollRoster(panel, direction: -1)
-        usleep(450_000)
-        stale = mergeViewport() == 0 ? stale + 1 : 0
-        if stale >= 3 {
-            if let pager = rosterPager(in: panel),
-               pressRosterPager(pager, panel: panel, app: app,
-                                window: window, pid: pid) {
-                stale = 0
-                continue
-            }
-            break
-        }
-    }
-
-    // Walk back to the top: catches any row a renderer swapped during the
-    // downward pass, and brings the title/count back into the tree.
-    stale = 0
-    for _ in 0..<60 where stale < 3 {
-        scrollRoster(panel, direction: 1)
-        usleep(350_000)
-        stale = mergeViewport() == 0 ? stale + 1 : 0
-    }
-    target = rosterCount(in: panel) ?? target
-    people.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-
-    axSetSize(window, originalSize)
-    usleep(500_000)
-    // We opened a fresh panel. Restore "closed" if that is how the user had it;
-    // leave it open if it was already open before the snapshot.
-    if !panelExisted { _ = togglePanel() }
-    restore()
-
     if json {
         var payload: [String: Any] = [
             "type": "people-snapshot", "app": "teams", "pid": pid,
-            "people": people.map { ["name": $0.name, "key": $0.key] },
+            "people": snapshot.people.map { ["name": $0.name, "key": $0.key] },
+            "confirmed": snapshot.confirmed,
         ]
-        if let target {
-            payload["count"] = target
-            payload["confirmed"] = people.count == target
-        }
+        if let expected = snapshot.expected { payload["count"] = expected }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
               let text = String(data: data, encoding: .utf8) else {
             fail("could not encode the snapshot")
         }
         print(text)
     } else {
-        let title = TeamsApp().meetingTitle(app, anchor: window)
-        var header = "\"\(title)\" — \(people.count) people"
-        if let target, people.count != target {
-            header += " — roster says \(target), only \(people.count) loaded; the list would not expand fully"
-        } else if let target {
-            header += " (confirmed against the roster's \(target))"
-        }
-        print(header)
-        for person in people { print("  \(person.name)") }
+        print(snapshot.headline)
+        for person in snapshot.people { print("  \(person.name)") }
     }
     exit(0)
 }

@@ -38,6 +38,10 @@ chat() { # chat <file> <mm:ss> <speaker> <text>
   printf '{"type":"chat","speaker":"%s","text":"%s","ts":"%s:%s-05:00","message_id":"1"}\n' \
     "$3" "$4" "$day" "$2" >> "$1"
 }
+people() { # people <file> <mm:ss> <summary>
+  printf '{"type":"people","speaker":"","text":"%s","ts":"%s:%s-05:00","count":2,"confirmed":true}\n' \
+    "$3" "$day" "$2" >> "$1"
+}
 stopped() { # stopped <file> <mm:ss> <lost>
   printf '{"type":"metadata","event":"stopped","stopped_at":"%s:%s-05:00","duration":"00:01:00","lost_events":%s}\n' \
     "$day" "$1" "$3" >> "$2"
@@ -159,6 +163,22 @@ stopped "31:00" "$g" 0
 "$merge" -o "$work/withchat" --quiet "$g"
 check "chat lines survive the merge and stay marked" \
   "[11:30:05] (chat) Alex Teal: https://example.test/thing" "$(body "$work/withchat.txt" | tail -1)"
+
+# --- A roster survives, and keeps its missing attribution ------------------
+#
+# The daemon records who was in the meeting as a speakerless "people" event.
+# Rendering it like a caption would produce "(people) : 2 in the meeting".
+
+r="$work/r.jsonl"
+meta "00:00" "$r"
+people "$r" "01:00" "2 in the meeting (confirmed): Ashley, Eric"
+caption "$r" "02:00" "Eric Boehs" "Morning."
+stopped "03:00" "$r" 0
+
+"$merge" -o "$work/withpeople" --quiet "$r"
+check "the roster survives the merge without a dangling attribution" \
+  "[11:01:00] (people) 2 in the meeting (confirmed): Ashley, Eric" \
+  "$(body "$work/withpeople.txt" | head -1)"
 
 # --- Damaged input --------------------------------------------------------
 #

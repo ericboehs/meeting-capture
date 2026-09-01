@@ -179,8 +179,13 @@ def collapse(events, lookback, window):
 def text_line(event):
     stamp = parse_ts(event.get("ts"))
     clock = stamp.strftime("%H:%M:%S") if stamp else "??:??:??"
-    tag = "(chat) " if event.get("type") == "chat" else ""
-    return f"[{clock}] {tag}{event.get('speaker', '')}: {event.get('text', '')}"
+    # Mirrors the recorder: anything that is not someone speaking is tagged by
+    # kind, and an event with no speaker (a roster) gets no attribution.
+    kind = event.get("type", "caption")
+    tag = "" if kind == "caption" else f"({kind}) "
+    speaker = event.get("speaker", "")
+    attribution = f"{speaker}: " if speaker else ""
+    return f"[{clock}] {tag}{attribution}{event.get('text', '')}"
 
 
 def merged_metadata(sources, names):

@@ -100,6 +100,7 @@ write a second transcript of the same meeting.
 | `--auto-captions` | Turn live captions on when a meeting starts |
 | `--popout-captions` | Teams: move captions into their own window, which a covered window can't pause |
 | `--popout-chat` | Open the meeting chat so it is recorded unattended; in Teams it also gets its own window |
+| `--people-snapshot` | Teams: record who was in the meeting, once, about 90s in |
 | `--dir <path>` | Output directory |
 | `--follow`, `--watch` | Watch whatever the running daemon is recording, never record |
 | `--interval <ms>` | Poll interval during a meeting (default 250) |
@@ -110,13 +111,38 @@ write a second transcript of the same meeting.
 
 ### People snapshot
 
-`meeting-capture people-snapshot` is a one-shot Teams roster, independent of
-the recorder lock: it opens People, expands every page, walks the virtualized
-list in overlapping viewports, and prints names alphabetically. `--json` adds
-Teams' participant keys for machine use. A clean result says it was confirmed
-against the panel's own count; a changing meeting or an expansion failure says
-exactly how many were loaded instead of presenting a partial list as complete.
-The People button's visible badge is not exposed to AX, so the title row —
+With `--people-snapshot` (on in the agent) the daemon records who was in the
+meeting, once, about 90 seconds after joining — long enough for the joining
+rush to settle. It lands as one `(people)` line in the transcript and one
+`people` event in the jsonl carrying the names as a list:
+
+```text
+[07:01:32] (people) 8 in the meeting (confirmed): Alex Teal, Ashley Boehs, …
+```
+
+Reading the panel means taking the pointer and the front app for a moment, so
+it waits for a lull: three seconds without typing and 1.5 without a click,
+drag or scroll. Bare pointer MOVEMENT is ignored on purpose — measured in a
+live meeting, a hand resting on a trackpad kept it under two seconds for
+minutes while the keyboard sat idle for twenty, and the first version of this
+gate waited for a still mouse and so never fired at all. Nothing happens while
+the meeting window is on another Space either — clicking would drag your
+screen to it — it just looks again every couple of seconds, and after twenty
+minutes of never finding a gap it says so rather than leaving a silent hole.
+A large roster is expanded page by page on a background thread, so captions
+keep being recorded the whole time it works. If people are still arriving and
+the names do not match the panel's head count, it retries (up to three
+attempts, two minutes apart) and records the best it managed, saying how short
+it is. This is the one thing that will create a transcript for an otherwise
+silent meeting: who was there is worth keeping even when nobody captioned
+anything.
+
+`meeting-capture people-snapshot` is the same reading on demand, independent
+of the recorder lock: it prints names alphabetically, and `--json` adds Teams'
+participant keys for machine use. A clean result says it was confirmed against
+the panel's own count; a changing meeting or an expansion failure says exactly
+how many were loaded instead of presenting a partial list as complete. The
+People button's visible badge is not exposed to AX, so the title row —
 `In this meeting (311)` — is the authoritative count available to the command.
 The panel, meeting-window size, pointer and frontmost app are restored when it
 finishes.

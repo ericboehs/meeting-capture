@@ -456,6 +456,19 @@ do {
     expectTrue(text.string.contains("A: hello"), "text sink got the transcript line")
 }
 
+// Events that are not someone speaking are tagged by kind, and a roster has
+// no speaker at all — "(people) : 3 in the meeting" would read like a bug.
+do {
+    let jsonl = MemorySink(path: "/tmp/j.jsonl"), text = MemorySink(path: "/tmp/t.txt")
+    let r = injectedRecorder(jsonl: jsonl, text: text)
+    expectEqual(r.record(kind: "chat", speaker: "Alex Teal", body: "hi", at: epoch),
+                WriteOutcome.written("[\(clockStamp(epoch))] (chat) Alex Teal: hi"),
+                "chat keeps its tag and its author")
+    expectEqual(r.record(kind: "people", speaker: "", body: "3 in the meeting", at: epoch),
+                WriteOutcome.written("[\(clockStamp(epoch))] (people) 3 in the meeting"),
+                "a speakerless event is written without an empty attribution")
+}
+
 // jsonl fails: nothing anywhere, not even the text half.
 do {
     let jsonl = ClosedSink(path: "/tmp/j.jsonl"), text = MemorySink(path: "/tmp/t.txt")
@@ -1060,6 +1073,52 @@ do {
     expectTrue(!isRosterPager("+ people"), "a malformed numbered paginator is rejected")
     expectEqual(rosterPagerRemaining("+203 more"), 203, "the remaining count parses")
     expectEqual(rosterPagerRemaining("See more"), nil, "the first unnumbered page has no remaining count")
+}
+
+// A roster is only "confirmed" when the names we loaded match the count Teams
+// printed above them. Everything else has to say how short it fell.
+do {
+    let people = [RosterPerson(name: "Ashley", key: "a"),
+                  RosterPerson(name: "Eric", key: "b")]
+    expectTrue(RosterSnapshot(people: people, expected: 2).confirmed,
+               "a roster matching the head count is confirmed")
+    expectTrue(!RosterSnapshot(people: people, expected: 311).confirmed,
+               "a roster short of the head count is not confirmed")
+    expectTrue(!RosterSnapshot(people: people, expected: nil).confirmed,
+               "a roster with no head count to check against is never confirmed")
+    expectEqual(RosterSnapshot(people: people, expected: 2).headline,
+                "2 in the meeting (confirmed)", "a confirmed roster says so")
+    expectEqual(RosterSnapshot(people: people, expected: 311).headline,
+                "2 in the meeting (roster says 311; 2 loaded)",
+                "a short roster reports both numbers rather than implying it is whole")
+    expectEqual(RosterSnapshot(people: people, expected: nil).headline,
+                "2 in the meeting", "with no head count, only what was read is claimed")
+    expectEqual(RosterSnapshot.summary(names: ["Ashley", "Eric"], expected: 2),
+                "2 in the meeting (confirmed): Ashley, Eric",
+                "the transcript line carries the names after the count")
+    expectEqual(RosterSnapshot.summary(names: [], expected: 0),
+                "0 in the meeting (confirmed)",
+                "an empty roster line does not end in a dangling colon")
+}
+
+// The politeness gate, which decides whether a roster snapshot may take the
+// pointer. Measured in a live meeting: keyboard idle 19-25s while mouseMoved
+// never once exceeded ~2s, because a hand was resting on the trackpad. The
+// first version waited for total input silence and so never fired at all.
+do {
+    expectTrue(!Session.interruptsUser(typingIdle: 20, pointerIdle: 2),
+               "a quiet keyboard and a settled pointer is a lull")
+    expectTrue(Session.interruptsUser(typingIdle: 0.5, pointerIdle: 30),
+               "typing is never interrupted, however still the mouse is")
+    expectTrue(Session.interruptsUser(typingIdle: 30, pointerIdle: 0.2),
+               "a click or drag in progress is not interrupted either")
+    expectTrue(!Session.interruptsUser(typingIdle: 3, pointerIdle: 1.5),
+               "the thresholds themselves count as quiet")
+    // The live regression: this exact reading was seen every two seconds for
+    // minutes, and must be a lull or no meeting with a resting hand on the
+    // trackpad would ever get a roster.
+    expectTrue(!Session.interruptsUser(typingIdle: 25.48, pointerIdle: 3.9),
+               "a resting hand does not count as the user being busy")
 }
 
 // --- Summary ------------------------------------------------------------

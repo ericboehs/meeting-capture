@@ -63,3 +63,51 @@ AXStaticText value="+N more"
 
 The meeting emptied before the final rebuilt command could be run end-to-end,
 but each mechanism above was proved independently against the live tree.
+
+## Automatic snapshots (daemon)
+
+`--people-snapshot` records one roster per meeting. Design constraints that
+fell out of the probes above:
+
+- **Background thread.** Expanding a 300-person roster is minutes of clicking
+  and scrolling. On the poll loop that would drop every caption spoken
+  meanwhile, so the reading runs on a utility queue and hands its result back
+  through a one-slot `RosterInbox`.
+- **One automated interaction at a time.** Fronting, clicking and key posting
+  are global state. `UIAutomation` is a process-wide try-lock shared by the
+  roster thread and the poll loop's caption/chat/unpin clicking; whoever loses
+  skips that tick rather than blocking, because the waiter would be the poll
+  loop itself.
+- **90 seconds after joining.** Late enough for the joining rush, and after
+  the captions/chat pop-out attempts (0s and 60s) have had the pointer.
+- **Deferrals are not failures.** Someone typing, or a meeting window on
+  another Space, means "not now": retry in 20s, spend no attempt. Only three
+  real attempts are allowed, two minutes apart.
+- **The lull is a hunt, not a sample.** Live test, Sep 1: the first gate asked
+  once every 20s for total input silence and never fired in a 20-minute
+  meeting. Probing the event source showed why — `keyDown` idle was 19-25s
+  while `mouseMoved` idle never exceeded ~2s, a hand resting on the trackpad.
+  The gate now ignores bare pointer movement, asks for 3s without typing and
+  1.5s without a click/drag/scroll, and re-checks every 2s. It fired within
+  seconds of that change, in the same meeting, with the same user activity.
+- **Real hardware only.** Idle is read from `.hidSystemState`, not
+  `.combinedSessionState`, so the snapshot's own synthetic clicks and pointer
+  restores do not read as the user being busy.
+- **Written once.** A confirmed roster is written immediately; an unconfirmed
+  one is only written when the last attempt is spent, so a transcript holds
+  exactly one roster and a short one says how short.
+- **Cheap for small meetings.** The window is only enlarged, and the list only
+  scrolled, when the loaded rows fall short of the title count. An 8-person
+  call is one panel open, one read, one panel close.
+
+## 2026-09-01, live verification (12-person meeting)
+
+- `people-snapshot` on demand: 12/12, confirmed, ~3s of AX work. Probed the
+  window before and after — identical frame `(-1575, 283) 960x1049`, panel
+  closed, pointer and front app restored.
+- Automatic path, run as a second daemon against the same live meeting with
+  the settle time shortened: `recorded the participant list: 12 in the meeting
+  (confirmed)`, written as `[14:09:23] (people) 12 in the meeting
+  (confirmed): …` in the text half and a `people` event carrying
+  `count`/`confirmed`/`roster_count` and a 12-string list in the jsonl.
+  Captions kept being recorded throughout (26 lines in the same file).

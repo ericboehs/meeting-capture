@@ -220,6 +220,7 @@ cat > "$plist" <<PLIST
     <string>--auto-captions</string>
     <string>--popout-captions</string>
     <string>--popout-chat</string>
+    <string>--people-snapshot</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
