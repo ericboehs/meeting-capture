@@ -1049,6 +1049,19 @@ do {
                 "other states strip the same way")
 }
 
+// Long rosters expose a StaticText paginator, first "See more" and then
+// "+203 more" as pages load. Participant row context buttons say "More
+// options" and must never be mistaken for the paginator.
+do {
+    expectTrue(isRosterPager("See more"), "the first roster paginator is recognised")
+    expectTrue(isRosterPager("+203 more"), "the numbered roster paginator is recognised")
+    expectTrue(isRosterPager("+9 more"), "a one-digit remaining count is recognised")
+    expectTrue(!isRosterPager("More options"), "participant context menus are not paginators")
+    expectTrue(!isRosterPager("+ people"), "a malformed numbered paginator is rejected")
+    expectEqual(rosterPagerRemaining("+203 more"), 203, "the remaining count parses")
+    expectEqual(rosterPagerRemaining("See more"), nil, "the first unnumbered page has no remaining count")
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")

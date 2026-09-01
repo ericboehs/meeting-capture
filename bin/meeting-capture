@@ -328,6 +328,27 @@ func clickThroughWindowServer(at point: CGPoint) {
     up?.post(tap: .cghidEventTap)
 }
 
+/// Make an app genuinely frontmost before a real click or shortcut. Merely
+/// calling NSRunningApplication.activate() is only a request: while the user
+/// was active in Ghostty, macOS refused it and every "Teams" click landed on
+/// the terminal instead. AXFrontmost is authoritative under the Accessibility
+/// permission this tool already requires.
+@discardableResult
+func bringToFront(pid: pid_t, window: AXUIElement? = nil) -> NSRunningApplication? {
+    let prior = NSWorkspace.shared.frontmostApplication
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+    if let window { AXUIElementPerformAction(window, kAXRaiseAction as CFString) }
+    usleep(350_000)
+    return prior
+}
+
+func restoreFrontmost(_ prior: NSRunningApplication?) {
+    guard let prior else { return }
+    let app = AXUIElementCreateApplication(prior.processIdentifier)
+    AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+}
+
 // MARK: - Recording
 
 struct Utterance {
@@ -1265,6 +1286,19 @@ func bareName(from description: String) -> String {
     return parts.joined(separator: ", ")
 }
 
+/// Teams paginates a long roster twice: first "See more", then "+203 more"
+/// (the number shrinks as pages are added). Both labels are StaticTexts inside
+/// an outline row, not buttons.
+func isRosterPager(_ text: String) -> Bool {
+    if text == "See more" { return true }
+    return text.range(of: "^\\+\\d+ more$", options: .regularExpression) != nil
+}
+
+func rosterPagerRemaining(_ text: String) -> Int? {
+    guard text.hasPrefix("+"), text.hasSuffix(" more") else { return nil }
+    return Int(text.dropFirst().dropLast(" more".count))
+}
+
 // MARK: - Microsoft Teams
 
 /// Teams renders its UI in a Chromium WebView, which exposes DOM ids and class
@@ -1550,17 +1584,15 @@ final class TeamsApp: MeetingApp {
     /// header that gives it a window. Both are real clicks for the same
     /// reason as the captions pop-out: Teams' WebView ignores AXPress.
     private func popOutChat(_ app: AXUIElement, pid: pid_t) {
-        let priorApp = NSWorkspace.shared.frontmostApplication
         let priorPointer = CGEvent(source: nil)?.location
+        let priorApp = bringToFront(pid: pid, window: standardWindow(app))
         defer {
             if let priorPointer {
                 CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
                         mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
             }
-            priorApp?.activate()
+            restoreFrontmost(priorApp)
         }
-        NSRunningApplication(processIdentifier: pid)?.activate()
-        usleep(300_000)
 
         var panel = findElement(from: app) { axDomID($0) == chatPanelID }
         if panel == nil {
@@ -1632,13 +1664,10 @@ final class TeamsApp: MeetingApp {
     /// loop, which is why maintainCaptionSurface only allows two tries.
     private func popOutCaptions(_ app: AXUIElement, pid: pid_t) {
         guard let window = standardWindow(app) else { return }
-        let priorApp = NSWorkspace.shared.frontmostApplication
         let priorPointer = CGEvent(source: nil)?.location
+        let priorApp = bringToFront(pid: pid, window: window)
         let originalSize = axFrame(window).size
         var widened = false
-
-        NSRunningApplication(processIdentifier: pid)?.activate()
-        usleep(300_000)
         var button = findElement(from: app) { axDomID($0) == popOutButtonID }
         if button == nil, originalSize.width < popOutRevealWidth {
             // Narrow window: the control is in an overflow menu accessibility
@@ -1656,7 +1685,7 @@ final class TeamsApp: MeetingApp {
                 CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
                         mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
             }
-            priorApp?.activate()
+            restoreFrontmost(priorApp)
         }
 
         guard let button else {
@@ -1693,16 +1722,15 @@ final class TeamsApp: MeetingApp {
     /// The button only exists while the window is pinned — it IS the "Unpin"
     /// affordance — which is exactly when this needs it.
     private func unpin(_ window: AXUIElement, pid: pid_t) {
-        let priorApp = NSWorkspace.shared.frontmostApplication
         let priorPointer = CGEvent(source: nil)?.location
+        let priorApp = bringToFront(pid: pid, window: window)
         defer {
             if let priorPointer {
                 CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
                         mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
             }
-            priorApp?.activate()
+            restoreFrontmost(priorApp)
         }
-        NSRunningApplication(processIdentifier: pid)?.activate()
         for _ in 0..<2 {
             usleep(300_000)
             guard let layer = windowLayer(pid: pid, frame: axFrame(window)), layer > 0,
@@ -1749,6 +1777,10 @@ final class TeamsApp: MeetingApp {
     /// Teams' own shortcut (⇧⌘A), delivered straight to the process so it
     /// bypasses global event taps such as a Hammerspoon remap.
     func requestCaptions(pid: pid_t) -> CaptionRequest {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 5.0)
+        let prior = bringToFront(pid: pid, window: standardWindow(app))
+        defer { usleep(250_000); restoreFrontmost(prior) }
         let source = CGEventSource(stateID: .privateState)
         let keyA: CGKeyCode = 0
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyA, keyDown: true),
@@ -3407,128 +3439,225 @@ func rosterPeople(in panel: AXUIElement) -> [RosterPerson] {
     return people
 }
 
-/// The control that loads more of a long list. Its exact shape is not yet
-/// confirmed against a big meeting (docs/people-snapshot-notes.md), so match
-/// broadly — description, DOM id or class naming "more" or "load" — and
-/// require that clicking it actually grew the list before trusting it.
-func moreControl(in panel: AXUIElement) -> AXUIElement? {
-    findElement(from: panel, where: { e in
-        guard axString(e, kAXRoleAttribute) == kAXButtonRole else { return false }
-        if axDescription(e).localizedCaseInsensitiveContains("more") { return true }
-        if axDescription(e).localizedCaseInsensitiveContains("load") { return true }
-        if axDomID(e).localizedCaseInsensitiveContains("more") { return true }
-        return axClasses(e).contains { $0.localizedCaseInsensitiveContains("load-more") }
-    })
+func axActionNames(_ element: AXUIElement) -> [String] {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
+    return names as? [String] ?? []
 }
 
-/// Wheel the panel down hard. CGEvent scroll acts at the pointer, so the
-/// pointer has to be in the panel first.
-func scrollPanelToBottom(_ panel: AXUIElement) {
-    let (origin, size) = axFrame(panel)
+/// The long roster's paginator is not a button. It is an AXStaticText reading
+/// "See more", then "+203 more", inside a Fluent TreeItem row.
+func rosterPager(in panel: AXUIElement) -> (element: AXUIElement, text: String)? {
+    guard let element = findElement(from: panel, where: {
+        isRosterPager(axString($0, kAXValueAttribute))
+    }) else { return nil }
+    return (element, axString(element, kAXValueAttribute))
+}
+
+func rosterCount(in panel: AXUIElement) -> Int? {
+    guard let title = findElement(from: panel, where: {
+        axDomID($0).hasPrefix("roster-title-section")
+    }) else { return nil }
+    return rosterCount(from: [axDescription(title)] + axStaticTexts(title))
+}
+
+/// One overlapping virtualized-list step. Pixel wheel deltas are what
+/// Chromium accepts; line deltas changed clipping without advancing rows.
+func scrollRoster(_ panel: AXUIElement, direction: Int32) {
+    let root = findElement(from: panel, where: { axDescription($0) == "Attendees" }) ?? panel
+    let (origin, size) = axFrame(root)
     let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height * 0.6)
     let source = CGEventSource(stateID: .combinedSessionState)
     CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
             mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
-    usleep(300_000)
-    for _ in 0..<30 {
-        let wheel = CGEvent(scrollWheelEvent2Source: source, units: .line,
-                            wheelCount: 1, wheel1: -12, wheel2: 0, wheel3: 0)
+    usleep(150_000)
+    for _ in 0..<2 {
+        let wheel = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
+                            wheelCount: 1, wheel1: direction * 350, wheel2: 0, wheel3: 0)
         wheel?.location = point
         wheel?.post(tap: .cghidEventTap)
         usleep(120_000)
     }
 }
 
-/// `meeting-capture people-snapshot`: open the People panel, read its head
-/// count, expand until the loaded rows match, list everyone, and close the
-/// panel again if we opened it. The pointer and the frontmost app are put
-/// back either way — even on failure, since exit() skips defers.
+/// Ask the paginator for another page. AXPress works on the first See-more
+/// row; later +N-more rows sometimes report a false success, so verify the
+/// remaining number and fall back to a real click on the nearest pressable
+/// ancestor. A success is a disappearing label or a smaller remainder.
+func pressRosterPager(_ pager: (element: AXUIElement, text: String),
+                      panel: AXUIElement, app: AXUIElement,
+                      window: AXUIElement, pid: pid_t) -> Bool {
+    func progressed() -> Bool {
+        guard let after = rosterPager(in: panel) else { return true }
+        if after.text != pager.text {
+            if let before = rosterPagerRemaining(pager.text),
+               let remaining = rosterPagerRemaining(after.text) {
+                return remaining < before
+            }
+            return true
+        }
+        return false
+    }
+    var row: AXUIElement? = pager.element
+    while let element = row,
+          axString(element, kAXRoleAttribute) != kAXRowRole {
+        row = axParent(element)
+    }
+    if let row {
+        AXUIElementPerformAction(row, kAXPressAction as CFString)
+        usleep(1_000_000)
+        if progressed() { return true }
+    }
+    var pressable: AXUIElement? = pager.element
+    while let element = pressable,
+          !axActionNames(element).contains(kAXPressAction) {
+        pressable = axParent(element)
+    }
+    guard let pressable else { return false }
+    bringToFront(pid: pid, window: window)
+    let (origin, size) = axFrame(pressable)
+    clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
+                                         y: origin.y + size.height / 2))
+    usleep(1_200_000)
+    return progressed()
+}
+
+/// `meeting-capture people-snapshot`: reset/open Teams' People panel, expand
+/// its pages, and accumulate every overlapping virtualized viewport by the
+/// participant's stable roster key. Restore the window, panel state, pointer
+/// and frontmost app afterwards.
 func peopleSnapshot(pid: pid_t, json: Bool) -> Never {
     let app = AXUIElementCreateApplication(pid)
     AXUIElementSetMessagingTimeout(app, 8.0)
-    let windows = axWindows(app)
-    guard let window = windows.first(where: {
-        findElement(from: $0, where: { axDomID($0) == "hangup-button" }) != nil
-    }) else {
-        fail("no Microsoft Teams meeting is running")
+    // A just-joined Teams can expose window chrome before the WebView controls.
+    var window: AXUIElement?
+    for _ in 0..<8 where window == nil {
+        window = axWindows(app).first(where: {
+            findElement(from: $0, where: { axDomID($0) == "hangup-button" }) != nil
+        })
+        if window == nil { pokeWebTree(app); usleep(500_000) }
     }
+    guard let window else { fail("no Microsoft Teams meeting is running") }
+
     let priorApp = NSWorkspace.shared.frontmostApplication
     let priorPointer = CGEvent(source: nil)?.location
+    let originalSize = axFrame(window).size
+    let panelExisted = findElement(from: window, where: {
+        axDescription($0) == "Participants"
+    }) != nil
     func restore() {
+        axSetSize(window, originalSize)
         if let priorPointer {
             CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
                     mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
         }
-        priorApp?.activate()
+        restoreFrontmost(priorApp)
     }
-
-    let panelExisted = findElement(from: window, where: { axDescription($0) == "Participants" }) != nil
-    if !panelExisted {
-        guard let roster = findElement(from: window, where: { axDomID($0) == "roster-button" }) else {
-            restore(); fail("could not find Teams' People button")
-        }
-        NSRunningApplication(processIdentifier: pid)?.activate()
-        usleep(400_000)
+    func togglePanel() -> Bool {
+        guard let roster = findElement(from: window, where: {
+            axDomID($0) == "roster-button"
+        }) else { return false }
+        bringToFront(pid: pid, window: window)
         let (origin, size) = axFrame(roster)
         clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
                                              y: origin.y + size.height / 2))
-        var opened = false
+        usleep(700_000)
+        return true
+    }
+
+    // Reset an already-open panel to its top: its title/count may have been
+    // virtualized away, and the user's scroll position is unknowable.
+    if panelExisted {
+        _ = togglePanel()
+        for _ in 0..<6 where findElement(from: window, where: {
+            axDescription($0) == "Participants"
+        }) != nil { usleep(300_000) }
+    }
+    var opened = false
+    for _ in 0..<3 where !opened {
+        _ = togglePanel()
         for _ in 0..<8 {
-            usleep(500_000)
-            if findElement(from: window, where: { axDescription($0) == "Participants" }) != nil {
-                opened = true
-                break
-            }
+            if findElement(from: window, where: {
+                axDescription($0) == "Participants"
+            }) != nil { opened = true; break }
+            usleep(350_000)
         }
-        guard opened else { restore(); fail("People panel did not open") }
     }
-    guard let panel = findElement(from: window, where: { axDescription($0) == "Participants" }) else {
-        restore(); fail("People panel vanished after opening")
-    }
+    guard opened, var panel = findElement(from: window, where: {
+        axDescription($0) == "Participants"
+    }) else { restore(); fail("People panel did not open") }
 
-    // The head count lives in the title row; the People button carries none.
-    var countCandidates: [String] = []
-    if let title = findElement(from: panel, where: { axDomID($0).hasPrefix("roster-title-section") }) {
-        countCandidates.append(axDescription(title))
-        countCandidates.append(contentsOf: axStaticTexts(title))
-    }
-    let target = rosterCount(from: countCandidates)
-
-    var people = rosterPeople(in: panel)
-    var attempts = 0
-    while let need = target, people.count < need, attempts < 12 {
-        attempts += 1
-        scrollPanelToBottom(panel)
+    var target = rosterCount(in: panel)
+    // The paginator sits just below the 20th row and is otherwise clipped.
+    // Grow to the bottom of this display, then restore the user's size later.
+    let windowFrame = axFrame(window)
+    if let display = displayBounds().first(where: {
+        $0.contains(CGPoint(x: windowFrame.origin.x + windowFrame.size.width / 2,
+                            y: windowFrame.origin.y + windowFrame.size.height / 2))
+    }) {
+        axSetSize(window, CGSize(width: originalSize.width,
+                                 height: display.maxY - windowFrame.origin.y))
         usleep(800_000)
-        let grown = rosterPeople(in: panel)
-        if grown.count > people.count { people = grown; continue }
-        if let more = moreControl(in: panel) {
-            NSRunningApplication(processIdentifier: pid)?.activate()
-            usleep(300_000)
-            let (origin, size) = axFrame(more)
-            clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
-                                                 y: origin.y + size.height / 2))
-            usleep(1_500_000)
-            let after = rosterPeople(in: panel)
-            if after.count > people.count { people = after; continue }
-            break // clicked and nothing grew: this is as long as the list gets
-        }
-        break // no growth and no control: report the shortfall honestly
+        panel = findElement(from: window, where: {
+            axDescription($0) == "Participants"
+        }) ?? panel
     }
 
-    if !panelExisted {
-        if let roster = findElement(from: window, where: { axDomID($0) == "roster-button" }) {
-            NSRunningApplication(processIdentifier: pid)?.activate()
-            usleep(300_000)
-            let (origin, size) = axFrame(roster)
-            clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
-                                                 y: origin.y + size.height / 2))
-            for _ in 0..<4 where
-                findElement(from: window, where: { axDescription($0) == "Participants" }) != nil {
-                usleep(500_000)
+    var people: [RosterPerson] = []
+    var seen = Set<String>()
+    @discardableResult
+    func mergeViewport() -> Int {
+        let before = seen.count
+        for person in rosterPeople(in: panel) where seen.insert(person.key).inserted {
+            people.append(person)
+        }
+        return seen.count - before
+    }
+    _ = mergeViewport()
+
+    // Down through all pages. Each wheel step overlaps the previous viewport,
+    // so no row can fall through the cracks; at page boundaries, +N more is
+    // pressed and verified before continuing.
+    var stale = 0
+    for _ in 0..<100 {
+        if let target, seen.count >= target { break }
+        if let pager = rosterPager(in: panel),
+           pressRosterPager(pager, panel: panel, app: app,
+                            window: window, pid: pid) {
+            stale = 0
+            _ = mergeViewport()
+            continue
+        }
+        scrollRoster(panel, direction: -1)
+        usleep(450_000)
+        stale = mergeViewport() == 0 ? stale + 1 : 0
+        if stale >= 3 {
+            if let pager = rosterPager(in: panel),
+               pressRosterPager(pager, panel: panel, app: app,
+                                window: window, pid: pid) {
+                stale = 0
+                continue
             }
+            break
         }
     }
+
+    // Walk back to the top: catches any row a renderer swapped during the
+    // downward pass, and brings the title/count back into the tree.
+    stale = 0
+    for _ in 0..<60 where stale < 3 {
+        scrollRoster(panel, direction: 1)
+        usleep(350_000)
+        stale = mergeViewport() == 0 ? stale + 1 : 0
+    }
+    target = rosterCount(in: panel) ?? target
+    people.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+    axSetSize(window, originalSize)
+    usleep(500_000)
+    // We opened a fresh panel. Restore "closed" if that is how the user had it;
+    // leave it open if it was already open before the snapshot.
+    if !panelExisted { _ = togglePanel() }
     restore()
 
     if json {

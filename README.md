@@ -87,6 +87,7 @@ recording, it follows along; otherwise it records.
 meeting-capture              # record every meeting, or follow the agent
 meeting-capture --once       # just the meeting happening now
 meeting-capture --follow     # only watch, never record
+meeting-capture people-snapshot  # Teams: list and confirm everyone present
 meeting-capture --help
 ```
 
@@ -107,13 +108,29 @@ write a second transcript of the same meeting.
 | `--json` | Emit JSONL on stdout instead of pretty lines |
 | `--quiet` | Say nothing |
 
+### People snapshot
+
+`meeting-capture people-snapshot` is a one-shot Teams roster, independent of
+the recorder lock: it opens People, expands every page, walks the virtualized
+list in overlapping viewports, and prints names alphabetically. `--json` adds
+Teams' participant keys for machine use. A clean result says it was confirmed
+against the panel's own count; a changing meeting or an expansion failure says
+exactly how many were loaded instead of presenting a partial list as complete.
+The People button's visible badge is not exposed to AX, so the title row —
+`In this meeting (311)` — is the authoritative count available to the command.
+The panel, meeting-window size, pointer and frontmost app are restored when it
+finishes.
+
 ### Automatic captions
 
 `--auto-captions` (on by default in the agent) turns captions on when it finds
 a meeting without them. Zoom exposes a pressable captions button, so it just
-presses it. Teams doesn't, so its shortcut (⇧⌘A) goes straight to the process
-with `CGEvent.postToPid`, which bypasses global event taps — a Hammerspoon or
-Karabiner remap of that shortcut won't intercept it. Slack has a captions tab
+presses it. Teams doesn't, so its meeting window is made genuinely frontmost
+and its shortcut (⇧⌘A) goes straight to the process with `CGEvent.postToPid`,
+which bypasses global event taps — a Hammerspoon or Karabiner remap of that
+shortcut won't intercept it. Fronting is load-bearing: macOS can refuse
+`NSRunningApplication.activate()` while another app is active, leaving Teams'
+shortcut and every HID click aimed at the wrong window. Slack has a captions tab
 in the huddle's side panel, pressed only if no captions are anywhere on screen,
 so a huddle already captioning is left alone — but the press does switch the
 side panel to captions, which is worth knowing if you were reading another tab
