@@ -376,6 +376,23 @@ enum UIAutomation {
         return true
     }
 
+    /// Wait for a turn, for callers that can afford to.
+    ///
+    /// The poll loop must never block — it is what records captions — so it
+    /// uses tryEnter and skips a tick. The roster snapshot is the opposite
+    /// case: it was moved onto a background thread precisely so it could take
+    /// its time, and one-shot contention is how it starved. Measured live: the
+    /// poll loop held this lock through a whole-tree search four times a
+    /// second, the snapshot asked for it once every twenty seconds, and it
+    /// never once got in.
+    static func enter(waitingUntil deadline: Date) -> Bool {
+        while true {
+            if tryEnter() { return true }
+            guard Date() < deadline else { return false }
+            usleep(200_000)
+        }
+    }
+
     static func leave() {
         mutex.lock()
         busy = false
@@ -979,6 +996,14 @@ protocol MeetingApp {
     /// True when this app can list who is in the meeting, so the daemon can
     /// record a roster once per meeting (see Session.maintainRoster).
     var supportsRosterSnapshot: Bool { get }
+    /// True when reading that list disturbs nothing: no pointer taken, no
+    /// window brought forward, no window resized. Meet is quiet (AXPress does
+    /// everything); Teams is not (its WebView ignores AXPress, so the roster
+    /// costs real clicks). A noisy reader has to wait for the user to pause.
+    var rosterSnapshotIsQuiet: Bool { get }
+    /// Read the participant list. Called on a BACKGROUND THREAD, so an
+    /// implementation must not touch the app object's mutable state.
+    func captureRoster(pid: pid_t, deadline: Date?) -> RosterOutcome
     /// True when the captions control is a toggle (Teams' ⇧⌘A). A second
     /// press would turn them back off, so we must not retry blindly.
     var captionPressToggles: Bool { get }
@@ -1037,6 +1062,11 @@ protocol MeetingApp {
     /// its WebView is still hollow. Apps whose captions need more than
     /// detection uses should keep waking until both hold.
     func treeReadiness(_ app: AXUIElement) -> TreeReadiness
+
+    /// Whether this app's web content has finished waking up. The default
+    /// asks for DOM ids, which is what Chromium and Electron publish; WebKit
+    /// publishes none, so Safari web apps override this.
+    func webTreeIsAwake(_ app: AXUIElement) -> Bool
 }
 
 extension MeetingApp {
@@ -1054,11 +1084,17 @@ extension MeetingApp {
     var captionPressToggles: Bool { false }
     // Only Teams exposes a readable participant list so far.
     var supportsRosterSnapshot: Bool { false }
+    // Assume the pessimistic case: a reader that takes the pointer.
+    var rosterSnapshotIsQuiet: Bool { false }
+    func captureRoster(pid: pid_t, deadline: Date?) -> RosterOutcome {
+        .failed("\(displayName) has no participant list that can be read")
+    }
     // Assume native AppKit; only opt in to the wake where it is needed.
     var rendersWebContent: Bool { false }
+    func webTreeIsAwake(_ app: AXUIElement) -> Bool { webTreeAwake(app) }
     func treeReadiness(_ app: AXUIElement) -> TreeReadiness {
         rendersWebContent
-            ? (webTreeAwake(app) ? .webContent : .unreadable)
+            ? (webTreeIsAwake(app) ? .webContent : .unreadable)
             : (!axChildren(app).isEmpty ? .webContent : .unreadable)
     }
     // Chat is optional; most apps don't expose it to us yet.
@@ -1193,6 +1229,11 @@ func noteProcessLookupFailure(_ message: String) {
 var lastPgrepScanAt = Date.distantPast
 /// True once a Chromium/WebKit tree is serving real content (DOM ids), as
 /// opposed to the hollow shell it starts with.
+/// True when a Chromium or Electron app has published its web content. DOM
+/// ids are the signal because they appear exactly when the renderer switches
+/// its accessibility tree on. WebKit publishes no AXDOMIdentifier at all, so
+/// Safari web apps must answer this question differently — see
+/// MeetApp.webTreeIsAwake.
 func webTreeAwake(_ app: AXUIElement) -> Bool {
     findElement(from: app, where: { !axDomID($0).isEmpty }) != nil
 }
@@ -1295,7 +1336,7 @@ struct TreeWaker {
         if ledger.isPopulated(pid: attachment.pid) {
             awake = true
         } else {
-            awake = webTreeAwake(app)
+            awake = attachment.meetingApp.webTreeIsAwake(app)
             if awake { ledger.markPopulated(pid: attachment.pid) }
         }
         let (poke, attempt) = pokeDecision(pid: attachment.pid, awake: awake, now: now)
@@ -1547,10 +1588,12 @@ func pressRosterPager(_ pager: (element: AXUIElement, text: String),
 /// `deadline` bounds the paging loop, so a 300-person roster cannot run for
 /// the length of the meeting: whatever was loaded by then is returned, and
 /// says honestly that it is short.
-func captureRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
+func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
     // Clicks and pointer moves are global state; two of them at once would
-    // land in each other's windows (see UIAutomation).
-    guard UIAutomation.tryEnter() else {
+    // land in each other's windows (see UIAutomation). Wait a few seconds for
+    // a turn rather than spending an attempt: the poll loop takes this lock
+    // constantly, and one-shot contention starved the snapshot completely.
+    guard UIAutomation.enter(waitingUntil: Date().addingTimeInterval(5)) else {
         return .deferred("another automated interaction is already running")
     }
     defer { UIAutomation.leave() }
@@ -1697,8 +1740,12 @@ final class TeamsApp: MeetingApp {
     let displayName = "Microsoft Teams"
     let processPattern = "Microsoft Teams.app/Contents/MacOS/MSTeams"
     let captionPressToggles = true
-    // The People panel lists everyone, expandable page by page (captureRoster).
+    // The People panel lists everyone, expandable page by page — with real
+    // clicks, because Teams' WebView ignores AXPress (captureTeamsRoster).
     let supportsRosterSnapshot = true
+    func captureRoster(pid: pid_t, deadline: Date?) -> RosterOutcome {
+        captureTeamsRoster(pid: pid, deadline: deadline)
+    }
     // Teams 2 is Edge WebView2, so its tree starts switched off.
     let rendersWebContent = true
     // Teams keeps ~3 lines on screen; without this, --follow sees nothing
@@ -2543,6 +2590,204 @@ struct ZoomApp: MeetingApp {
 
 // MARK: - Google Meet
 
+/// Google Meet's roster, read entirely through AXPress.
+///
+/// Nothing here resembles the Teams reader, because Meet's list is everything
+/// Teams' is not. Measured on a live 59-person call:
+///
+///  - the side panel holds one `AXList` described "Participants", whose
+///    children ARE the people — each row's AXDescription is the name (a
+///    dial-in participant's "name" is their phone number);
+///  - `AXButton` titled "Contributors 59" is the head count, and it agreed
+///    with the rendered rows exactly, so there is no pagination to expand;
+///  - the panel answers AXPress, so no window has to come forward, no pointer
+///    is taken, and no window is resized. Nothing is stolen from the user.
+///
+/// A second list, "Guests", sits below "Also invited 104": people who were
+/// invited and are NOT here. Reading only the Participants list's children
+/// leaves them out, which is the whole point of the distinction.
+///
+/// Scrolling is kept as a fallback for a call big enough that Meet starts
+/// dropping offscreen rows — not seen at 59, but the shortfall would be
+/// silent, so it is handled rather than assumed away.
+func captureMeetRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
+    guard UIAutomation.enter(waitingUntil: Date().addingTimeInterval(5)) else {
+        return .deferred("another automated interaction is already running")
+    }
+    defer { UIAutomation.leave() }
+
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 8.0)
+    var found: AXUIElement?
+    for _ in 0..<8 where found == nil {
+        found = axWindows(app).first(where: {
+            findElement(from: $0, where: { axDescription($0) == meetLeaveDescription }) != nil
+        })
+        if found == nil { pokeWebTree(app); usleep(500_000) }
+    }
+    guard let window = found else { return .failed("no Google Meet call is running") }
+
+    func sidePanel() -> AXUIElement? {
+        findElement(from: window, where: { axDescription($0) == meetSidePanelDescription })
+    }
+    func participantList() -> AXUIElement? {
+        findElement(from: window, where: {
+            axString($0, kAXRoleAttribute) == kAXListRole
+                && axDescription($0) == meetParticipantsListDescription
+        })
+    }
+    // Which panel the side panel is showing. Identified structurally, because
+    // the obvious signal lies: with chat open, the first heading inside the
+    // panel is "Today" — a date separator in the message list, not the panel's
+    // name. What is reliable is that chat renders in its own AXWebArea (it is
+    // an iframe), People renders the Participants list in the main document,
+    // and a closed panel has no children at all.
+    enum Showing { case people, chat, closed, other }
+    func shownPanel() -> Showing {
+        guard let panel = sidePanel() else { return .closed }
+        if participantList() != nil { return .people }
+        if axChildren(panel).isEmpty { return .closed }
+        if findElement(from: panel, where: {
+            axString($0, kAXRoleAttribute) == "AXWebArea"
+                && axDescription($0) == meetChatWebAreaDescription
+        }) != nil { return .chat }
+        return .other
+    }
+
+    let priorPanel = shownPanel()
+    // Meet's side panel shows ONE thing at a time, so opening People closes
+    // whatever was there — including the chat panel the daemon reads. Put back
+    // what was there.
+    func restorePanel() {
+        switch priorPanel {
+        case .people:
+            return // already what the user had
+        case .chat:
+            // The chat button toggles, so this both re-opens chat and is what
+            // a user would press.
+            if let chat = findElement(from: window, where: {
+                axDescription($0).hasPrefix(meetChatButtonPrefix)
+            }) { press(chat) }
+        case .closed, .other:
+            // "Other" is some panel we cannot name (activities, notes). We
+            // cannot restore it, so close rather than leave People sitting
+            // open over the call.
+            if let panel = sidePanel(), let close = findElement(from: panel, where: {
+                axString($0, kAXRoleAttribute) == kAXButtonRole
+                    && axString($0, kAXTitleAttribute) == meetClosePanelTitle
+            }) { press(close) }
+        }
+    }
+    defer { restorePanel() }
+
+    if participantList() == nil {
+        guard let people = findElement(from: window, where: {
+            axString($0, kAXRoleAttribute) == "AXPopUpButton"
+                && axDescription($0) == meetPeoplePanelHeading
+        }) else { return .failed("Google Meet's People control is not in the tree") }
+        press(people)
+        for _ in 0..<12 where participantList() == nil { usleep(400_000) }
+    }
+    guard let list = participantList() else {
+        return .failed("the People panel did not open")
+    }
+
+    func headCount() -> Int? {
+        guard let button = findElement(from: window, where: {
+            meetContributorCount(from: axString($0, kAXTitleAttribute)) != nil
+        }) else { return nil }
+        return meetContributorCount(from: axString(button, kAXTitleAttribute))
+    }
+    // A row's name is its description; the StaticText inside says the same
+    // thing and is the fallback if a future build drops the description.
+    func people(in list: AXUIElement) -> [String] {
+        axChildren(list).compactMap { row in
+            let name = axDescription(row)
+            if !name.isEmpty { return name }
+            return axStaticTexts(row).first { !$0.isEmpty }
+        }
+    }
+
+    var seen = Set<String>()
+    var names: [String] = []
+    @discardableResult
+    func merge() -> Int {
+        let before = seen.count
+        for name in people(in: list) where seen.insert(name).inserted { names.append(name) }
+        return seen.count - before
+    }
+    merge()
+
+    var expected = headCount()
+    // Fallback only: at 59 people the list was complete at rest. If a bigger
+    // call ever renders less than it claims, walk it rather than under-report.
+    if let need = expected, seen.count < need, let panel = sidePanel() {
+        let (origin, size) = axFrame(panel)
+        let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
+        let priorPointer = CGEvent(source: nil)?.location
+        var stale = 0
+        for _ in 0..<80 {
+            if seen.count >= need { break }
+            if let deadline, Date() >= deadline { break }
+            scrollWheel(at: point, direction: -1)
+            stale = merge() == 0 ? stale + 1 : 0
+            if stale >= 4 { break }
+        }
+        for _ in 0..<80 where stale < 4 {
+            scrollWheel(at: point, direction: 1)
+            stale = merge() == 0 ? stale + 1 : 0
+        }
+        if let priorPointer {
+            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                    mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
+        }
+        expected = headCount() ?? expected
+    }
+
+    guard !names.isEmpty else { return .failed("the People panel listed nobody") }
+    let roster = names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        .map { RosterPerson(name: $0, key: $0) }
+    return .captured(RosterSnapshot(people: roster, expected: expected))
+}
+
+/// "Contributors 59" is the number of people actually in the call. The button
+/// below the list says "Also invited 104" and must never be read as one.
+func meetContributorCount(from title: String) -> Int? {
+    guard title.hasPrefix(meetContributorsPrefix) else { return nil }
+    let digits = title.dropFirst(meetContributorsPrefix.count)
+    guard !digits.isEmpty, digits.allSatisfy(\.isNumber) else { return nil }
+    return Int(digits)
+}
+
+let meetLeaveDescription = "Leave call"
+let meetSidePanelDescription = "Side panel"
+let meetParticipantsListDescription = "Participants"
+let meetPeoplePanelHeading = "People"
+let meetChatWebAreaDescription = "Chat"
+let meetContributorsPrefix = "Contributors "
+let meetClosePanelTitle = "Close"
+let meetChatButtonPrefix = "Chat with everyone"
+
+/// AXPress an element. Meet answers it, so its roster needs no HID clicking.
+func press(_ element: AXUIElement) {
+    AXUIElementPerformAction(element, kAXPressAction as CFString)
+    usleep(400_000)
+}
+
+/// One pixel-wheel step at a point. Chromium and WebKit both ignore line
+/// deltas in these lists.
+func scrollWheel(at point: CGPoint, direction: Int32) {
+    let source = CGEventSource(stateID: .combinedSessionState)
+    CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+            mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
+    usleep(80_000)
+    let wheel = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
+                        wheelCount: 1, wheel1: direction * 300, wheel2: 0, wheel3: 0)
+    wheel?.location = point
+    wheel?.post(tap: .cghidEventTap)
+    usleep(250_000)
+}
+
 /// Google Meet installed as a Safari web app (Add to Dock), which is what
 /// `Web App` runs when handed the bundle on its command line. A Meet tab in an
 /// ordinary browser window is NOT supported: the browser would be the process,
@@ -2560,8 +2805,29 @@ final class MeetApp: MeetingApp {
     // WebKit also serves an empty tree until something asks for it: before the
     // poke this app is 17 nodes with no AXWebArea at all.
     let rendersWebContent = true
+
+    /// WebKit publishes no DOM ids, so the shared "has this tree woken up"
+    /// test never passes for a Safari web app. Measured mid-call: 857 nodes,
+    /// captions reading perfectly, ZERO AXDOMIdentifier values — the daemon
+    /// was warning that captions could not be read while it was recording
+    /// them, and everything gated on the ledger (the roster snapshot) never
+    /// ran. What actually appears on waking is the AXWebArea itself, since a
+    /// hollow web app has none, so that is the signal here. A childless one
+    /// does not count: the frame exists before the document is in it.
+    func webTreeIsAwake(_ app: AXUIElement) -> Bool {
+        findElement(from: app, where: {
+            axString($0, kAXRoleAttribute) == "AXWebArea" && !axChildren($0).isEmpty
+        }) != nil
+    }
     // The button says which way it goes, so pressing is never a guess.
     let captionPressToggles = false
+    // The side panel lists everyone, and AXPress opens it: nothing is taken
+    // from the user to read it (captureMeetRoster).
+    let supportsRosterSnapshot = true
+    let rosterSnapshotIsQuiet = true
+    func captureRoster(pid: pid_t, deadline: Date?) -> RosterOutcome {
+        captureMeetRoster(pid: pid, deadline: deadline)
+    }
     // Meet displays no call duration, so lines get the time of day.
     let reportsMeetingClock = false
     // Segments stay put once a newer one lands, so finalize on being
@@ -2579,7 +2845,8 @@ final class MeetApp: MeetingApp {
     private let captionsDescription = "Captions"
     private let captionsOnLabel = "Turn off captions"
     private let captionsOffLabel = "Turn on captions"
-    /// The chat composer, which is how the message list is found.
+    /// The chat composer. Kept only as a historical note: Google's move to
+    /// the Chat iframe removed it from the tree (see chatContainer).
     private let composerDescription = "Send a message"
     /// Opens the chat panel. Its description gains " - New message" when
     /// something is unread, so it is matched by prefix.
@@ -2639,16 +2906,42 @@ final class MeetApp: MeetingApp {
     /// Captions are one block per speaker - a name, then a group of text
     /// segments - laid out as alternating children. Segments are appended as
     /// sentences finish; only the last one is still being revised.
+    /// Meet writes each utterance as two sibling groups: the speaker's name,
+    /// then the sentences they said. Pairing them looks like a job for
+    /// alternation — and that is what this did, stepping two at a time from
+    /// the front of the list.
+    ///
+    /// It is wrong, and it fails silently. Meet prunes old captions off the
+    /// FRONT as the panel fills, so pruning an odd number of groups shifts
+    /// every pair by one and swaps every speaker with their words. Observed
+    /// live, hours into a call: `[15:32:21] a whole sentence spoken by
+    /// someone.: Emily Allan`. Captions kept flowing, and every line was
+    /// backwards.
+    ///
+    /// So which side holds the names is decided from evidence (see
+    /// nameParity) rather than from position.
     func captionEntries(in container: AXUIElement) -> [CaptionEntry] {
-        var visible: [(speaker: String, text: String)] = []
         let blocks = axChildren(container)
-        var index = 0
-        while index + 1 < blocks.count {
-            let speaker = axStaticTexts(blocks[index]).first ?? ""
-            for text in axStaticTexts(blocks[index + 1]) where !text.isEmpty {
-                visible.append((speaker, text))
+        var lines: [[String]] = []
+        var shapes: [CaptionBlockShape] = []
+        for block in blocks {
+            let text = axStaticTexts(block)
+            lines.append(text)
+            // Only a single-line group is ambiguous. A group of sentences is
+            // never a name, so measuring it would be a round trip for nothing.
+            let height = text.count == 1 ? Double(axFrame(block).size.height) : 0
+            shapes.append(CaptionBlockShape(lines: text.count, height: height))
+        }
+        let isName = MeetApp.nameBlocks(shapes)
+
+        var visible: [(speaker: String, text: String)] = []
+        var speaker = ""
+        for (index, block) in lines.enumerated() {
+            if isName[index] {
+                speaker = block.first ?? speaker
+                continue
             }
-            index += 2
+            for text in block where !text.isEmpty { visible.append((speaker, text)) }
         }
         guard !visible.isEmpty else { return [] }
 
@@ -2658,6 +2951,62 @@ final class MeetApp: MeetingApp {
         return visible.enumerated().map { offset, entry in
             CaptionEntry(id: "seg:\(base + offset)", speaker: entry.speaker, text: entry.text)
         }
+    }
+
+    /// What a caption group looks like without reading what it says.
+    struct CaptionBlockShape {
+        /// How many sentences it holds. A name is always exactly one.
+        let lines: Int
+        /// Its height in points, or 0 when it was not worth measuring.
+        let height: Double
+    }
+
+    /// Which groups are speakers' names rather than what they said.
+    ///
+    /// Each group is judged on its own. Pairing them off by alternation is the
+    /// obvious reading and it is wrong twice over: Meet prunes old captions
+    /// off the FRONT, so counting pairs from index 0 flips every speaker onto
+    /// the wrong words as soon as it prunes an odd number, and the alternation
+    /// does not even hold from end to end — measured live, one list had its
+    /// names on the even indices at the top and the odd ones at the bottom.
+    ///
+    /// What does hold is typography: Meet sets a name in smaller type than the
+    /// caption under it. In that same list, single-line groups measured 15-16
+    /// points 144 times and 25 points 74 times, with nothing in between, and
+    /// the size class alternated correctly in all but one adjacent pair. So
+    /// the smallest type present is the names, and anything taller is speech.
+    ///
+    /// The threshold is relative to the smallest group rather than absolute,
+    /// because Meet's caption size is a setting; and it is anchored to the
+    /// SMALL end rather than the span, because a caption that wraps is taller
+    /// still and must not drag a midpoint up past the one-line captions.
+    static func nameBlocks(_ shapes: [CaptionBlockShape]) -> [Bool] {
+        let measured = shapes.filter { $0.lines == 1 && $0.height > 0 }.map(\.height)
+        if let smallest = measured.min(), measured.contains(where: { $0 > smallest * 1.2 }) {
+            let threshold = smallest * 1.2
+            return shapes.map { $0.lines == 1 && $0.height > 0 && $0.height <= threshold }
+        }
+        // Only one type size among the single-line groups, so there is nothing
+        // to compare them against — unless a group of sentences is present,
+        // which gives the caption line height directly. Take the LEAST such
+        // group: a caption that wrapped is taller per sentence than one that
+        // did not, and an inflated estimate would start reading captions as
+        // names.
+        let perLine = shapes.filter { $0.lines > 1 && $0.height > 0 }
+            .map { $0.height / Double($0.lines) }
+        if let lineHeight = perLine.min() {
+            return shapes.map { $0.lines == 1 && $0.height > 0 && $0.height < lineHeight * 0.9 }
+        }
+        // Nothing measurable at all: fall back to alternation, but anchored at
+        // the END, where new captions arrive, rather than the front, which is
+        // the end Meet prunes.
+        var names = [Bool](repeating: false, count: shapes.count)
+        var index = shapes.count - 2
+        while index >= 0 {
+            names[index] = shapes[index].lines <= 1
+            index -= 2
+        }
+        return names
     }
 
     func resetCaptureState() {
@@ -2687,101 +3036,116 @@ final class MeetApp: MeetingApp {
         status("opened Google Meet's chat panel so chat is recorded")
     }
 
+    /// Whether the chat panel is showing. The web area only exists while it
+    /// is open, so its presence is the test (the composer this used to look
+    /// for is no longer in the tree at all).
     private func chatPanelOpen(_ app: AXUIElement) -> Bool {
         findElement(from: app) {
-            axString($0, kAXRoleAttribute) == "AXTextArea" && axDescription($0) == composerDescription
+            axString($0, kAXRoleAttribute) == "AXWebArea"
+                && axDescription($0) == meetChatWebAreaDescription
         } != nil
     }
 
-    /// Meet's chat: the message list beside the composer.
+    /// Meet's chat lives in its own web area now.
     ///
-    /// The panel has to be open to exist — nothing here can be read from a
-    /// closed one — and it is found from the composer, which is the one part
-    /// of it that is reliably labelled. The list is the child of the panel
-    /// immediately before the composer's own group; picking it by position
-    /// rather than by label keeps it working when the notice above it ("chat
-    /// is turned off", "messages are only visible to people in the call")
-    /// changes or disappears.
+    /// Google moved the panel to the Chat product: what used to be a flat run
+    /// of one-line groups beside a composer described "Send a message" is now
+    /// an iframe, exposed as `AXWebArea` described "Chat". The composer is not
+    /// in the tree at all any more — measured mid-call, the only AXTextArea in
+    /// the whole window was one titled "History is on" — so anchoring on it,
+    /// as this did, silently recorded no chat whatsoever.
+    ///
+    /// The web area itself is the anchor now. It exists only while the panel
+    /// is open, which is exactly the condition the old composer test stood in
+    /// for.
     func chatContainer(_ app: AXUIElement) -> AXUIElement? {
-        guard let composer = findElement(from: app, where: {
-            axString($0, kAXRoleAttribute) == "AXTextArea" && axDescription($0) == composerDescription
-        }) else { return nil }
-        // Climb until the composer's group is a direct child of the panel.
-        var child = composer
-        for _ in 0..<8 {
-            guard let parent = axParent(child) else { return nil }
-            let siblings = axChildren(parent)
-            if let index = siblings.firstIndex(where: { $0 == child }), index > 0 {
-                let previous = siblings[index - 1]
-                if axString(previous, kAXRoleAttribute) == "AXGroup", !axChildren(previous).isEmpty {
-                    return previous
-                }
-            }
-            child = parent
+        findElement(from: app) {
+            axString($0, kAXRoleAttribute) == "AXWebArea"
+                && axDescription($0) == meetChatWebAreaDescription
         }
-        return nil
     }
 
-    /// Meet gives messages no ids and no per-message grouping: the list is a
-    /// flat run of one-line groups reading author, time, text, time, text —
-    /// the author appearing once however many messages they send in a row.
-    /// See parseChat for how that is read back apart.
+    /// Pull the messages out of that web area.
+    ///
+    /// A message is a group whose LAST child is the relative age Meet writes
+    /// after every message, wrapped in commas so a screen reader pauses around
+    /// it: ["," , "3 min", ","]. That triple is the only reliable mark of a
+    /// message row, and it keeps the panel's furniture out: the "messages are
+    /// only visible to people in the call" notice, the "SPACE UPDATE: HISTORY
+    /// IS ON" banner and the "Today" date heading all lack it.
+    ///
+    /// Before the age come the text-bearing groups: sender then message, or
+    /// message alone when the same person sends two in a row. A reactions
+    /// AXList can sit between them and is skipped by role.
     func chatMessages(in container: AXUIElement) -> [ChatMessage] {
-        let lines = axChildren(container).compactMap { child -> String? in
-            guard axString(child, kAXRoleAttribute) == "AXGroup" else { return nil }
-            let text = axText(child).trimmingCharacters(in: .whitespacesAndNewlines)
-            return text.isEmpty ? nil : text
+        var rows: [MeetChatRow] = []
+        func walk(_ element: AXUIElement, depth: Int) {
+            guard depth < 12 else { return }
+            if let row = MeetApp.chatRow(element) { rows.append(row); return }
+            for child in axChildren(element) { walk(child, depth: depth + 1) }
         }
-        return MeetApp.parseChat(lines).suffix(20)
+        walk(container, depth: 0)
+        return MeetApp.messages(from: rows).suffix(20)
     }
 
-    /// Turn Meet's flat run of chat lines into messages.
+    /// One row, flattened to the three things a transcript needs.
+    struct MeetChatRow {
+        /// Empty when this row continues the sender above it.
+        let sender: String
+        let text: String
+        /// "3 min". Deliberately not part of the id; see messages(from:).
+        let age: String
+    }
+
+    static func chatRow(_ element: AXUIElement) -> MeetChatRow? {
+        guard axString(element, kAXRoleAttribute) == kAXGroupRole else { return nil }
+        let children = axChildren(element)
+        guard children.count >= 2, let last = children.last,
+              let age = commaWrappedAge(last) else { return nil }
+        let parts = children.dropLast()
+            .filter { axString($0, kAXRoleAttribute) == kAXGroupRole }
+            .map { axStaticTexts($0).joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let text = parts.last else { return nil }
+        return MeetChatRow(sender: parts.count >= 2 ? parts[parts.count - 2] : "",
+                           text: text, age: age)
+    }
+
+    /// The comma-wrapped age that ends every message row.
+    static func commaWrappedAge(_ element: AXUIElement) -> String? {
+        guard axString(element, kAXRoleAttribute) == kAXGroupRole else { return nil }
+        let texts = axStaticTexts(element)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard texts.count == 3, texts[0] == ",", texts[2] == ",", !texts[1].isEmpty else {
+            return nil
+        }
+        return texts[1]
+    }
+
+    /// Turn rows into messages: carry the sender down through the follow-ups,
+    /// and give each one an id that survives both a restart and the clock.
     ///
-    /// The shape is `author, time, text (, time, text)*`, repeating for each
-    /// author who speaks in turn, with stray furniture ("Hover over a message
-    /// to pin it") mixed in. A timestamp is the only thing here with a
-    /// recognisable shape, so it is the hinge: the line after one is a
-    /// message, and a line that is neither is the name of whoever sends the
-    /// messages that follow.
-    ///
-    /// A message consisting of nothing but a timestamp ("3:02") is therefore
-    /// read as furniture and skipped. That is the price of a panel with no
-    /// ids; it costs one line rather than derailing the rest.
-    ///
-    /// Ids have to be made up too, and are hashed from time, author and text
-    /// so that the same words sent twice in one minute count once while the
-    /// same words tomorrow count again. FNV-1a rather than Hasher, whose seed
-    /// changes every run: ids must survive a restart mid-meeting.
-    static func parseChat(_ lines: [String]) -> [ChatMessage] {
+    /// The age is NOT hashed, though the old clock timestamp was. It cannot
+    /// be: "3 min" becomes "4 min" while the same message sits there, so an
+    /// id made from it would rename every message on every poll and record
+    /// the whole panel again each minute. The cost is that the same words
+    /// twice from one person would collide, so identical (sender, text) pairs
+    /// are numbered by their position in the panel instead.
+    static func messages(from rows: [MeetChatRow]) -> [ChatMessage] {
         var messages: [ChatMessage] = []
-        var author = ""
-        var time = ""
-        var expectingText = false
-        for line in lines {
-            if isTimestamp(line) {
-                time = line
-                expectingText = true
-                continue
-            }
-            guard expectingText else {
-                author = line // a line before any timestamp names the sender
-                continue
-            }
-            expectingText = false
-            let id = String(fnv1a("\(time)|\(author)|\(line)"), radix: 36)
-            messages.append(ChatMessage(id: id, author: author.isEmpty ? "Unknown" : author, text: line))
+        var sender = ""
+        var occurrences: [String: Int] = [:]
+        for row in rows {
+            if !row.sender.isEmpty { sender = row.sender }
+            let author = sender.isEmpty ? "Unknown" : sender
+            let key = "\(author)|\(row.text)"
+            let seen = (occurrences[key] ?? 0) + 1
+            occurrences[key] = seen
+            let id = String(fnv1a(seen == 1 ? key : "\(key)|#\(seen)"), radix: 36)
+            messages.append(ChatMessage(id: id, author: author, text: row.text))
         }
         return messages
-    }
-
-    /// "3:02 PM", "15:02", "3:02\u{202f}PM" — a clock, whatever the locale's
-    /// separator and suffix, but never a sentence.
-    static func isTimestamp(_ line: String) -> Bool {
-        guard line.count <= 12 else { return false }
-        let digitsAndColon = line.prefix { $0.isNumber || $0 == ":" }
-        guard digitsAndColon.contains(":"), digitsAndColon.count >= 3 else { return false }
-        let rest = line.dropFirst(digitsAndColon.count)
-        return rest.allSatisfy { $0.isLetter || $0.isWhitespace || $0 == "." }
     }
 
     /// FNV-1a, for ids that are the same in every process.
@@ -2872,6 +3236,9 @@ final class Session {
     var nextRetry = Date.distantPast
     var retryDelay: TimeInterval = 1
     private var nextCaptionCheck = Date.distantPast
+    /// When the surface upkeep (captions on, chat open) may next hold the
+    /// automation lock. See tick for why it is rate-limited.
+    private var nextSurfaceCheck = Date.distantPast
     private var sawCaptions = false
     /// One line already on disk, kept around to recognise the app re-rendering
     /// it. `lastSeen` is refreshed for as long as a row on screen still shows
@@ -3038,7 +3405,7 @@ final class Session {
         // Native short-circuit: mark populated even though no WebView exists —
         // caption gating below reads the ledger, not rendersWebContent.
         guard meetingApp.rendersWebContent else { ledger.markPopulated(pid: pid); return }
-        if webTreeAwake(app) { // DOM ids specifically: Teams reads as "readable" from titles alone
+        if meetingApp.webTreeIsAwake(app) { // whatever waking looks like for this app
             // Transition announcement only fires if we poked at least once
             // before — detection-side wakes never announce, and this must not
             // become a behavior change inside a refactor.
@@ -3168,7 +3535,15 @@ final class Session {
         // Fronting, clicking and key posting are all global state, so none of
         // them may overlap the roster snapshot's background thread (see
         // UIAutomation). Whoever loses simply tries again next poll.
-        if UIAutomation.tryEnter() {
+        //
+        // Both of these search the whole tree before they decide they have
+        // nothing to do, and they were doing it under the lock at every poll —
+        // four times a second, against a caption panel of thousands of nodes.
+        // That left no gap for anything else to take the lock, and the roster
+        // snapshot (which asks once every 20s) never ran at all. A second
+        // between looks is plenty for turning captions on or reopening chat.
+        if now >= nextSurfaceCheck, UIAutomation.tryEnter() {
+            nextSurfaceCheck = now.addingTimeInterval(1)
             if options.autoCaptions { ensureCaptionsOn(app: app, pid: pid, now: now) }
             meetingApp.maintainSurfaces(app, pid: pid, now: now,
                                         popOutCaptions: options.popOutCaptions,
@@ -3231,17 +3606,20 @@ final class Session {
         // Reading the panel means clicking it, so the tree has to be awake.
         guard ledger.isPopulated(pid: pid) else { return }
         // The snapshot borrows the pointer and the front app for a moment.
-        // Wait for a lull rather than stealing mid-sentence or mid-gesture.
-        guard !Session.interruptsUser(typingIdle: secondsSinceTyping(),
-                                      pointerIdle: secondsSincePointerAction()) else {
+        // Wait for a lull rather than stealing mid-sentence or mid-gesture —
+        // unless this app's reader takes nothing, as Meet's does not.
+        if !meetingApp.rosterSnapshotIsQuiet,
+           Session.interruptsUser(typingIdle: secondsSinceTyping(),
+                                  pointerIdle: secondsSincePointerAction()) {
             nextRosterAttempt = now.addingTimeInterval(Session.rosterLullRecheckSeconds)
             return
         }
         rosterRunning = true
         let inbox = rosterInbox
+        let reader = meetingApp
         let deadline = now.addingTimeInterval(Session.rosterBudgetSeconds)
         DispatchQueue.global(qos: .utility).async {
-            inbox.put(captureRoster(pid: pid, deadline: deadline))
+            inbox.put(reader.captureRoster(pid: pid, deadline: deadline))
         }
     }
 
@@ -3947,15 +4325,15 @@ signal(SIGTERM) { _ in stopRequested = true }
 /// `meeting-capture people-snapshot`: one roster, printed. The daemon records
 /// the same snapshot itself (see Session.maintainRoster); this is for when you
 /// want one right now, or want to see whether the reading works at all.
-func peopleSnapshot(pid: pid_t, json: Bool) -> Never {
+func peopleSnapshot(app: MeetingApp, pid: pid_t, json: Bool) -> Never {
     let snapshot: RosterSnapshot
-    switch captureRoster(pid: pid) {
+    switch app.captureRoster(pid: pid, deadline: nil) {
     case .captured(let captured): snapshot = captured
     case .deferred(let why), .failed(let why): fail(why)
     }
     if json {
         var payload: [String: Any] = [
-            "type": "people-snapshot", "app": "teams", "pid": pid,
+            "type": "people-snapshot", "app": app.id, "pid": pid,
             "people": snapshot.people.map { ["name": $0.name, "key": $0.key] },
             "confirmed": snapshot.confirmed,
         ]
@@ -3978,17 +4356,31 @@ if options.subcommand == "people-snapshot" {
     guard AXIsProcessTrusted() else {
         fail("no Accessibility permission — grant it in System Settings → Privacy & Security → Accessibility")
     }
-    let pid: pid_t
-    if let forced = options.pid {
-        pid = forced
+    // Which app to ask. --app names one; otherwise take the first roster-
+    // capable app that is actually running, so the command works in a Meet
+    // call and a Teams call without being told which.
+    let candidates = supportedApps.filter(\.supportsRosterSnapshot).filter {
+        options.app == nil || $0.id == options.app
+    }
+    guard !candidates.isEmpty else {
+        fail("no app that can list participants was asked for (known: "
+             + supportedApps.filter(\.supportsRosterSnapshot).map(\.id).joined(separator: ", ") + ")")
+    }
+    var target: (app: MeetingApp, pid: pid_t)?
+    if let forced = options.pid, let only = candidates.first, candidates.count == 1 {
+        target = (only, forced)
     } else {
-        switch queryProcess(matching: TeamsApp().processPattern) {
-        case .running(let found): pid = found
-        case .notRunning: fail("Microsoft Teams is not running")
-        case .failed(let why): fail("cannot tell whether Microsoft Teams is running (\(why))")
+        for candidate in candidates {
+            if case .running(let found) = queryProcess(matching: candidate.processPattern) {
+                target = (candidate, found)
+                break
+            }
         }
     }
-    peopleSnapshot(pid: pid, json: options.jsonToStdout)
+    guard let target else {
+        fail(candidates.map(\.displayName).joined(separator: " or ") + " is not running")
+    }
+    peopleSnapshot(app: target.app, pid: target.pid, json: options.jsonToStdout)
 }
 let live = LiveView(options: options)
 

@@ -111,3 +111,81 @@ fell out of the probes above:
   (confirmed): …` in the text half and a `people` event carrying
   `count`/`confirmed`/`roster_count` and a 12-string list in the jsonl.
   Captions kept being recorded throughout (26 lines in the same file).
+
+## 2026-09-01, Google Meet
+
+Meet's roster is everything Teams' is not, and the reader shares nothing with
+it but the plumbing. Measured live on a call that grew from 52 to 61 people:
+
+- The side panel holds `AXList` described **"Participants"**, whose children
+  ARE the people: each row's AXDescription is the name. A dial-in participant's
+  name is their phone number.
+- `AXButton` titled **"Contributors 59"** is the head count. Below the list sits
+  **"Also invited 104"** and a second `AXList` described "Guests" — people who
+  were invited and did not come. Reading only the Participants list's children
+  keeps them out.
+- Rows matched the count exactly at 59, 60 and 61, so there is no pagination to
+  expand. Scrolling is kept as a fallback for a call big enough that Meet drops
+  offscreen rows, because a shortfall would otherwise be silent.
+- **AXPress works.** Opening the panel, closing it and restoring chat are all
+  presses. Nothing comes forward, nothing is clicked, no window is resized, and
+  the politeness gate is skipped (`rosterSnapshotIsQuiet`).
+
+Restoring the panel needs structure, not labels. The side panel shows one thing
+at a time, so reading the roster closes whatever was there — including the chat
+panel the daemon reads. What it was showing:
+
+| Showing | How to tell |
+| --- | --- |
+| People | the Participants list is present |
+| Chat | an `AXWebArea` described "Chat" (it is an iframe) |
+| Closed | the side panel landmark has no children |
+
+The obvious signal lies: with chat open, the first `AXHeading` inside the side
+panel is **"Today"** — a date separator in the message list, not the panel's
+name. The chat button toggles, so restoring chat is one press.
+
+Live verification, 61-person call:
+
+- on demand: 61/61 confirmed in ~3s; panel state identical before and after,
+  tested from both chat-open and closed
+- automatic: `recorded the participant list: 61 in the meeting (confirmed)`,
+  one `people` event, 61 unique names, alongside 378 captions and 3 chat
+  messages recorded in the same minute
+
+## The snapshot that never ran (2026-09-01)
+
+The Meet snapshot worked on demand and in a bare daemon (`--people-snapshot`),
+then recorded nothing at all in the real one — no roster line, no failure, no
+warning, for 33 minutes of a live call.
+
+Nothing was wrong with the snapshot. The daemon runs it on a background thread
+and takes a global lock first, because fronting, clicking and key posting are
+all global state and two of them at once land in each other's windows. The poll
+loop takes the same lock for its surface upkeep — turning captions on, reopening
+chat — and both of those search the whole tree *before* they conclude they have
+nothing to do. Against a caption panel of thousands of nodes, four times a
+second, the lock was essentially never free.
+
+So the loser was always the same one: the poll loop asked constantly and the
+snapshot asked once every 20 seconds, and lost every time. Deferrals are silent
+by design (they are not failures and cost no attempt), which is why 20 minutes
+of them looked exactly like nothing happening.
+
+Two changes, both needed:
+
+- surface upkeep takes the lock at most once a second rather than at every poll
+  — a second is plenty for turning captions back on, and it costs less CPU at
+  idle too;
+- the snapshot thread *waits* up to 5s for its turn (`UIAutomation.enter(waitingUntil:)`)
+  instead of giving up instantly. The poll loop must never block, since it is
+  what records captions, but the snapshot was moved onto its own thread
+  precisely so it could afford to wait.
+
+Reproduced and fixed against the same live call: with the daemon's exact flags
+(`--auto-captions --popout-captions --popout-chat --people-snapshot`), before
+the fix zero attempts completed; after it, `recorded the participant list: 60
+in the meeting (confirmed)`.
+
+The lesson generalises: a try-lock between a fast poller and a slow, patient
+job is not a fair fight, and a silent retry hides the fact that it never was.

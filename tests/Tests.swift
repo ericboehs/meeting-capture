@@ -67,43 +67,94 @@ expectEqual(Recorder.slugify("Weekly Sync | Microsoft Teams"), "weekly-sync", "s
 expectEqual(Recorder.slugify("!!!"), "meeting", "all-punctuation title falls back to 'meeting'")
 expectEqual(Recorder.slugify("Ada's 2nd standup!"), "ada-s-2nd-standup", "slug keeps letters and digits")
 
-// --- Reading Google Meet's chat -----------------------------------------
-// Meet gives chat messages no ids and no per-message grouping: the panel is a
-// flat run of lines reading author, time, text, time, text, with the author
-// named once however many messages they send in a row, and furniture mixed in.
+// --- Telling Google Meet's speakers from what they said -------------------
+// Meet writes name, sentences, name, sentences... but prunes old captions off
+// the front, and the alternation does not even hold end to end: one live list
+// had its names on the even indices at the top and the odd ones at the bottom.
+// Typography is what holds — the name is set smaller than the caption — so
+// every group is judged on its own.
 do {
-    let lines = [
-        "Ken Hughes", "3:02 PM", "first message",
-        "3:03 PM", "second message from the same person",
-        "Ada Lovelace", "3:04 PM", "a reply",
-        "Hover over a message to pin it",
+    typealias Shape = MeetApp.CaptionBlockShape
+    // The live shape: 16pt names against 25pt captions, some groups holding
+    // several sentences.
+    let panel = [
+        Shape(lines: 1, height: 16),   // name
+        Shape(lines: 5, height: 120),  // what they said
+        Shape(lines: 1, height: 16),   // name
+        Shape(lines: 1, height: 25),   // one sentence
     ]
-    let messages = MeetApp.parseChat(lines)
-    expectEqual(messages.count, 3, "three messages, however the names are laid out")
+    expectEqual(MeetApp.nameBlocks(panel), [true, false, true, false],
+                "the smaller type is the speaker's name")
+    // Pruning one group off the front changes nothing, which is the whole
+    // point: this is what silently inverted every line before.
+    expectEqual(MeetApp.nameBlocks(Array(panel.dropFirst())), [false, true, false],
+                "pruning an odd number no longer swaps speakers with their words")
+    // A run that breaks the alternation outright — two names with nothing said
+    // between them, then two groups of speech.
+    expectEqual(MeetApp.nameBlocks([
+        Shape(lines: 1, height: 16), Shape(lines: 1, height: 16),
+        Shape(lines: 1, height: 25), Shape(lines: 3, height: 75),
+    ]), [true, true, false, false],
+                "a broken alternation is read correctly rather than shifted")
+    expectEqual(MeetApp.nameBlocks([
+        Shape(lines: 1, height: 16), Shape(lines: 1, height: 50),
+    ]), [true, false],
+                "a caption that wraps to two visual lines is still a caption")
+    expectEqual(MeetApp.nameBlocks([Shape(lines: 9, height: 200), Shape(lines: 1, height: 16)]),
+                [false, true],
+                "a group of sentences gives the caption line height, so the small one is a name")
+
+    // Nothing measurable: fall back to alternation, anchored at the END, since
+    // the front is the end Meet prunes.
+    expectEqual(MeetApp.nameBlocks([
+        Shape(lines: 1, height: 0), Shape(lines: 1, height: 0),
+        Shape(lines: 1, height: 0), Shape(lines: 1, height: 0),
+    ]), [true, false, true, false],
+                "with no type sizes, pair backwards from the newest caption")
+    expectEqual(MeetApp.nameBlocks([]), [], "an empty panel yields nothing")
+}
+
+// --- Reading Google Meet's chat -----------------------------------------
+// Google moved chat into the Chat product's iframe: messages are structured
+// rows now, each ending in a relative age ("3 min"), with the sender named
+// once however many messages they send in a row.
+do {
+    typealias Row = MeetApp.MeetChatRow
+    let rows = [
+        Row(sender: "Ken Hughes", text: "first message", age: "5 min"),
+        Row(sender: "", text: "second message from the same person", age: "4 min"),
+        Row(sender: "Ada Lovelace", text: "a reply", age: "2 min"),
+    ]
+    let messages = MeetApp.messages(from: rows)
+    expectEqual(messages.count, 3, "three rows are three messages")
     expectEqual(messages.map { $0.author }, ["Ken Hughes", "Ken Hughes", "Ada Lovelace"],
-                "a name carries to every message under it")
+                "a sender carries down to the follow-ups that omit the name")
     expectEqual(messages.map { $0.text },
                 ["first message", "second message from the same person", "a reply"],
-                "timestamps and trailing furniture are not messages")
+                "the text is taken verbatim")
     expectTrue(Set(messages.map { $0.id }).count == 3, "ids distinguish the messages")
 
-    expectEqual(MeetApp.parseChat(["Ken", "3:02 PM", "same words"]).first?.id,
-                MeetApp.parseChat(["Ken", "3:02 PM", "same words"]).first?.id,
+    expectEqual(MeetApp.messages(from: [Row(sender: "Ken", text: "hi", age: "1 min")]).first?.id,
+                MeetApp.messages(from: [Row(sender: "Ken", text: "hi", age: "1 min")]).first?.id,
                 "ids are stable across runs, so a restart mid-meeting does not repeat chat")
-    expectTrue(MeetApp.parseChat(["Ken", "3:02 PM", "same words"]).first?.id
-                 != MeetApp.parseChat(["Ken", "3:03 PM", "same words"]).first?.id,
-               "the same words a minute later is a new message")
-    expectEqual(MeetApp.parseChat(["3:02 PM", "no name yet"]).first?.author, "Unknown",
-                "a message with no name above it still gets recorded")
+    // The reason ages are not hashed: a message's age ticks while it sits
+    // there, and an id that moved with it would re-record the whole panel
+    // every minute.
+    expectEqual(MeetApp.messages(from: [Row(sender: "Ken", text: "hi", age: "1 min")]).first?.id,
+                MeetApp.messages(from: [Row(sender: "Ken", text: "hi", age: "9 min")]).first?.id,
+                "the same message growing older is still the same message")
+    // ...  and the price of that: identical words twice are told apart by
+    // where they sit rather than by when they were sent.
+    let twice = MeetApp.messages(from: [
+        Row(sender: "Ken", text: "same words", age: "9 min"),
+        Row(sender: "", text: "same words", age: "1 min"),
+    ])
+    expectEqual(twice.count, 2, "the same words twice are two messages")
+    expectTrue(twice[0].id != twice[1].id, "and they are told apart by position")
 
-    expectTrue(MeetApp.isTimestamp("3:02 PM"), "12-hour clock")
-    expectTrue(MeetApp.isTimestamp("15:02"), "24-hour clock")
-    expectTrue(MeetApp.isTimestamp("3:02\u{202f}PM"), "narrow no-break space, which macOS uses")
-    expectTrue(MeetApp.isTimestamp("12:00 a.m."), "lowercase suffix with stops")
-    expectTrue(!MeetApp.isTimestamp("Ken Hughes"), "a name is not a clock")
-    expectTrue(!MeetApp.isTimestamp("4:03 is an oddly specific time"),
-               "a sentence that opens with a clock is not a clock")
-    expectTrue(!MeetApp.isTimestamp("Hover over a message to pin it"), "furniture is not a clock")
+    expectEqual(MeetApp.messages(from: [Row(sender: "", text: "no name yet", age: "1 min")])
+                    .first?.author,
+                "Unknown", "a message with no name above it still gets recorded")
 }
 
 // --- Tucking the popped-out captions window ------------------------------
@@ -1099,6 +1150,23 @@ do {
     expectEqual(RosterSnapshot.summary(names: [], expected: 0),
                 "0 in the meeting (confirmed)",
                 "an empty roster line does not end in a dangling colon")
+}
+
+// Google Meet's roster: the count button, which must never be confused with
+// the "Also invited" button sitting directly below the same list.
+do {
+    expectEqual(meetContributorCount(from: "Contributors 59").map(String.init), "59",
+                "the contributors button is the head count")
+    expectEqual(meetContributorCount(from: "Contributors 1").map(String.init), "1",
+                "a call of one still parses")
+    expectTrue(meetContributorCount(from: "Also invited 104") == nil,
+               "people who were invited and did not come are not contributors")
+    expectTrue(meetContributorCount(from: "Contributors") == nil,
+               "a button with no number is not a count")
+    expectTrue(meetContributorCount(from: "Contributors many") == nil,
+               "a word where the number goes is not a count")
+    expectTrue(meetContributorCount(from: "") == nil,
+               "an empty title is not a count")
 }
 
 // The politeness gate, which decides whether a roster snapshot may take the

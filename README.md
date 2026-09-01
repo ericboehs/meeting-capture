@@ -87,7 +87,7 @@ recording, it follows along; otherwise it records.
 meeting-capture              # record every meeting, or follow the agent
 meeting-capture --once       # just the meeting happening now
 meeting-capture --follow     # only watch, never record
-meeting-capture people-snapshot  # Teams: list and confirm everyone present
+meeting-capture people-snapshot  # list and confirm everyone present (Teams, Meet)
 meeting-capture --help
 ```
 
@@ -100,7 +100,7 @@ write a second transcript of the same meeting.
 | `--auto-captions` | Turn live captions on when a meeting starts |
 | `--popout-captions` | Teams: move captions into their own window, which a covered window can't pause |
 | `--popout-chat` | Open the meeting chat so it is recorded unattended; in Teams it also gets its own window |
-| `--people-snapshot` | Teams: record who was in the meeting, once, about 90s in |
+| `--people-snapshot` | Record who was in the meeting, once (Teams, Meet) |
 | `--dir <path>` | Output directory |
 | `--follow`, `--watch` | Watch whatever the running daemon is recording, never record |
 | `--interval <ms>` | Poll interval during a meeting (default 250) |
@@ -129,6 +129,13 @@ gate waited for a still mouse and so never fired at all. Nothing happens while
 the meeting window is on another Space either — clicking would drag your
 screen to it — it just looks again every couple of seconds, and after twenty
 minutes of never finding a gap it says so rather than leaving a silent hole.
+
+That is all Teams' price, not Meet's. Meet's side panel answers AXPress, so
+nothing is taken from you at all: no window comes forward, no pointer moves,
+no window is resized, and the snapshot does not wait for a lull. It opens the
+panel, reads the list, and puts back whatever the side panel was showing —
+including the chat panel, which shares that space.
+
 A large roster is expanded page by page on a background thread, so captions
 keep being recorded the whole time it works. If people are still arriving and
 the names do not match the panel's head count, it retries (up to three
@@ -138,8 +145,9 @@ silent meeting: who was there is worth keeping even when nobody captioned
 anything.
 
 `meeting-capture people-snapshot` is the same reading on demand, independent
-of the recorder lock: it prints names alphabetically, and `--json` adds Teams'
-participant keys for machine use. A clean result says it was confirmed against
+of the recorder lock: it prints names alphabetically, and `--json` adds each
+app's participant keys for machine use. With no `--app` it asks whichever
+roster-capable app is running. A clean result says it was confirmed against
 the panel's own count; a changing meeting or an expansion failure says exactly
 how many were loaded instead of presenting a partial list as complete. The
 People button's visible badge is not exposed to AX, so the title row —
@@ -372,24 +380,53 @@ The daemon polls the accessibility tree of each supported app:
      DOM id, so a sentence is identified by its position in that list rather
      than by its text — people say "Yeah." twice, and hashing would file that
      as one.
+     The speaker's name is a block of its own, written just before the words,
+     which invites reading the list as pairs. That is wrong twice over: Meet
+     prunes old captions off the *front*, so pairs counted from index 0 invert
+     every line as soon as it prunes an odd number, and the alternation does
+     not hold end to end anyway — one live list had its names on the even
+     indices at the top and the odd ones at the bottom. It failed silently,
+     for a whole meeting: `[15:32:21] a whole sentence spoken by someone.:
+     Emily Allan`. What holds is typography. Meet sets a name in smaller type
+     than the caption (measured live: 15–16pt against 25, 144 blocks against
+     74, nothing in between), so each block is judged on its own — a block of
+     several sentences is never a name, and otherwise the smallest type
+     present is the names. The threshold is relative, because caption size is
+     a setting, and anchored to the small end, so a caption that wraps to two
+     lines cannot drag it up over the one-line captions.
 3. **Read the chat.** In Teams, message ids are epoch milliseconds, which double
    as timestamps; anything already on screen when you join is treated as seen.
-   Google Meet gives chat no ids and no per-message grouping at all — the panel
-   is a flat run of lines reading author, time, text, time, text, with a name
-   appearing once however many messages that person sends in a row. Timestamps
-   are the only part with a recognisable shape, so they are the hinge: the line
-   after one is a message, and a line that is neither is a name. Ids are hashed
-   (FNV-1a, not `Hasher`, whose seed changes every run) from time, author and
-   text, so the same words twice in a minute count once and the same words
-   tomorrow count again. A message consisting only of a clock ("3:02") reads as
-   furniture and is skipped, which is the price of a panel with no ids. Zoom
-   chat is not wired up yet.
+   Google Meet moved its chat into the Chat product, so the panel is now an
+   iframe of its own — an `AXWebArea` described "Chat", holding one group per
+   message. A message is recognised by the relative age Meet writes after it
+   ("3 min"), wrapped in commas so a screen reader pauses around it; that
+   triple is what keeps the notices, the "HISTORY IS ON" banner and the
+   "Today" heading out. Before the age come the sender and the text, and the
+   sender is written once however many messages that person sends in a row.
+   Ids are hashed (FNV-1a, not `Hasher`, whose seed changes every run) from
+   sender and text but deliberately NOT from the age, which ticks while the
+   message sits there and would otherwise re-record the whole panel every
+   minute; identical words from one person are told apart by position instead.
+   Zoom chat is not wired up yet.
+
+   This panel was rebuilt underneath us: the old reader anchored on a composer
+   described "Send a message", and when that left the tree, Meet chat stopped
+   being recorded silently — captions kept flowing, so nothing looked wrong.
 
 Google Meet has no desktop app, so the target here is the Safari web app — Meet
 added to the Dock from Safari, which macOS runs as its own process. A Meet tab
 in an ordinary browser window is not supported: the browser would be the
 process, every other tab would share its tree, and finding the call would mean
 searching all of them.
+
+Being WebKit rather than Chromium, it also answers the "has this tree woken
+up?" question differently. The shared test looks for DOM ids, which Chromium
+and Electron publish when their accessibility tree switches on; WebKit
+publishes none at all — measured mid-call, 857 nodes and zero — so Meet was
+permanently "hollow" in the daemon's eyes. It warned that captions could not
+be read while it was recording them, and anything gated on that flag (the
+roster snapshot) never ran. Meet answers with its `AXWebArea` instead, which
+is what actually appears on waking: a hollow web app has none.
 
 A finished utterance is often re-rendered under a fresh id, so identical text
 from the same speaker is dropped if an active entry already carries it as a
