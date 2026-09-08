@@ -1113,17 +1113,44 @@ do {
                 "other states strip the same way")
 }
 
-// Long rosters expose a StaticText paginator, first "See more" and then
-// "+203 more" as pages load. Participant row context buttons say "More
-// options" and must never be mistaken for the paginator.
+// Long rosters expose two StaticTexts that both read like "more", and only
+// one of them is a control. "See more" opens the full attendee list; "+203
+// more" is a placeholder for rows the server has not sent, and nothing makes
+// it act. Participant row context buttons say "More options" and must never be
+// mistaken for either.
 do {
-    expectTrue(isRosterPager("See more"), "the first roster paginator is recognised")
-    expectTrue(isRosterPager("+203 more"), "the numbered roster paginator is recognised")
-    expectTrue(isRosterPager("+9 more"), "a one-digit remaining count is recognised")
-    expectTrue(!isRosterPager("More options"), "participant context menus are not paginators")
-    expectTrue(!isRosterPager("+ people"), "a malformed numbered paginator is rejected")
-    expectEqual(rosterPagerRemaining("+203 more"), 203, "the remaining count parses")
-    expectEqual(rosterPagerRemaining("See more"), nil, "the first unnumbered page has no remaining count")
+    expectTrue(isRosterExpander("See more"), "the control that opens the full list is recognised")
+    expectTrue(!isRosterExpander("+203 more"), "the placeholder is not a control")
+    expectTrue(!isRosterExpander("More options"), "participant context menus are not the expander")
+    expectEqual(rosterBacklog("+203 more"), 203, "the unfetched count parses")
+    expectEqual(rosterBacklog("+9 more"), 9, "a one-digit unfetched count parses")
+    expectEqual(rosterBacklog("See more"), nil, "the expander carries no count")
+    expectEqual(rosterBacklog("+ people"), nil, "a malformed placeholder is rejected")
+    expectEqual(rosterBacklog("More options"), nil, "a context menu carries no count")
+
+    // Newer Teams builds moved the total out of roster-title-section and into
+    // a heading, so the count has to be read from either shape.
+    expectEqual(rosterCount(from: ["In this meeting (284)"]), 284,
+                "the heading Teams uses now yields the total")
+    expectEqual(rosterCount(from: ["Attendees", "(12)"]), 12,
+                "the older section title still yields the total")
+    expectEqual(rosterCount(from: ["Participants"]), nil,
+                "a heading with no number yields nothing")
+}
+
+// A read that runs for a minute has to give the pointer back the moment the
+// human wants it. The idle clocks cannot tell — our own scrolling resets them
+// — so the test is whether the pointer is still parked where we put it.
+do {
+    let parked = CGPoint(x: 500, y: 400)
+    expectTrue(!pointerTakenBack(now: parked, parked: parked),
+               "an unmoved pointer is not a takeback")
+    expectTrue(!pointerTakenBack(now: CGPoint(x: 503, y: 396), parked: parked),
+               "a few points of settling is not a takeback")
+    expectTrue(pointerTakenBack(now: CGPoint(x: 500, y: 409), parked: parked),
+               "a real move is a takeback")
+    expectTrue(pointerTakenBack(now: CGPoint(x: 520, y: 400), parked: parked),
+               "and so is a sideways one")
 }
 
 // A roster is only "confirmed" when the names we loaded match the count Teams

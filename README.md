@@ -136,13 +136,32 @@ no window is resized, and the snapshot does not wait for a lull. It opens the
 panel, reads the list, and puts back whatever the side panel was showing —
 including the chat panel, which shares that space.
 
-A large roster is expanded page by page on a background thread, so captions
-keep being recorded the whole time it works. If people are still arriving and
-the names do not match the panel's head count, it retries (up to three
-attempts, two minutes apart) and records the best it managed, saying how short
-it is. This is the one thing that will create a transcript for an otherwise
-silent meeting: who was there is worth keeping even when nobody captioned
-anything.
+A large roster is expanded on a background thread, so captions keep being
+recorded the whole time it works. Teams' long list is a slow trickle rather
+than a set of pages: it opens the full attendee list with the "See more"
+control, and from there the server sends a few names at a time, seconds apart,
+for as long as something keeps scrolling. Reaching the bottom therefore means
+nothing on its own, so the read waits and nudges, and only gives up after about
+fifteen seconds in which nobody new appeared. Measured live at 293 people, the
+impatient version recorded 102.
+
+The "+187 more" line at the end of that list looks like the way to get the
+rest, and is not: it is a placeholder for rows the server has not sent, and
+neither AXPress, AXDisclosing, Return, Space nor a real click moves it. Its
+number drifts on its own as people come and go, which is worse than useless —
+it let a press that did nothing look like progress.
+
+Because a patient read can run for a minute, it gives the pointer back the
+moment you want it. Idle clocks cannot tell it apart from us once we are the
+ones moving the pointer, so it watches position instead: it parks the pointer
+precisely to scroll, and anything else moving it is a person. It then stops,
+keeps what it has, and retries later.
+
+If people are still arriving and the names do not match the panel's head count,
+it retries (up to three attempts, two minutes apart) and records the best it
+managed, saying how short it is. This is the one thing that will create a
+transcript for an otherwise silent meeting: who was there is worth keeping even
+when nobody captioned anything.
 
 `meeting-capture people-snapshot` is the same reading on demand, independent
 of the recorder lock: it prints names alphabetically, and `--json` adds each

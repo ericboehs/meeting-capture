@@ -189,3 +189,49 @@ in the meeting (confirmed)`.
 
 The lesson generalises: a try-lock between a fast poller and a slow, patient
 job is not a fair fight, and a silent retry hides the fact that it never was.
+
+## The list that had not finished arriving (2026-09-08)
+
+A 293-person Teams meeting recorded 102 people. The snapshot did not fail; it
+believed it had finished.
+
+Two separate things go wrong at that size, and they hide each other.
+
+**"+187 more" is not a pager.** Teams puts two StaticTexts in the roster that
+both read like "more". "See more" is real: it opens the full attendee list as
+its own panel. "+187 more" is a placeholder parked at the end of the rows the
+server has actually sent, and nothing makes it act. Tried against the live
+meeting, all on the row that advertises them:
+
+| Attempt | Result |
+| --- | --- |
+| `AXPress` on the row | no change |
+| `AXPress` on the inner StyledText group | no change |
+| set `AXDisclosing` = true (the row lists it) | no change |
+| focus + Return | no change |
+| focus + Space | no change |
+| real pointer click on the row centre | no change |
+
+The user reported the same thing clicking it by hand. Worse, reading it as a
+pager made the failure invisible: its number drifts on its own as people come
+and go, so a press that did nothing still looked like progress — "+189 more"
+became "+187 more" and the loop took that as a loaded page.
+
+**The bottom of the list is not the end of the list.** Teams fetches a large
+roster a page at a time, and the fetch is slow and small. Sitting at the bottom
+and nudging, the count climbed 73 → 76 → 78 → 81 over ten seconds, two or three
+at a time, while the placeholder quietly disappeared. The old loop gave up
+after three scrolls that gained nothing — about 1.4 seconds — and wrote down a
+third of the room.
+
+So the loop is patient now: when a scroll gains nothing it waits, nudges, and
+only counts that as stale if the second look is empty too. Six such rounds,
+about fifteen seconds, before believing the list has ended.
+
+Patience costs time, and a read that runs for a minute cannot hold the pointer
+hostage. The idle clocks are no help once we are the ones generating events —
+measured, our own synthetic move drops `mouseMoved` idle from 1.58s to 0.30s —
+so the read watches the pointer's POSITION instead: it parks the pointer
+somewhere precise to scroll, and anything else moving it is a person. On a
+takeback it stops where it is, keeps what it has, and lets the ordinary retry
+try again later.

@@ -1401,12 +1401,23 @@ func bareName(from description: String) -> String {
 /// Teams paginates a long roster twice: first "See more", then "+203 more"
 /// (the number shrinks as pages are added). Both labels are StaticTexts inside
 /// an outline row, not buttons.
-func isRosterPager(_ text: String) -> Bool {
-    if text == "See more" { return true }
-    return text.range(of: "^\\+\\d+ more$", options: .regularExpression) != nil
-}
-
-func rosterPagerRemaining(_ text: String) -> Int? {
+/// Teams' roster has two very different things that both read like "more".
+///
+/// "See more" is a control: it opens the full attendee list as its own panel.
+///
+/// "+187 more" is not. It is a placeholder Teams parks at the end of the rows
+/// it has actually fetched, and nothing makes it act — not AXPress, not
+/// AXDisclosing on its row (which advertises it), not focus and Return, not
+/// focus and Space, not a real pointer click on the row. All were tried
+/// against a live 293-person meeting; none moved a single row. Reading it as a
+/// pager was worse than useless, because its number keeps changing on its own
+/// as people come and go, so a press that did nothing at all still looked like
+/// progress: "+189 more" became "+187 more" and the loop believed it.
+///
+/// What it really means is "the server has not sent these yet", and the only
+/// thing that helps is waiting at the bottom of the list.
+func isRosterExpander(_ text: String) -> Bool { text == "See more" }
+func rosterBacklog(_ text: String) -> Int? {
     guard text.hasPrefix("+"), text.hasSuffix(" more") else { return nil }
     return Int(text.dropFirst().dropLast(" more".count))
 }
@@ -1502,24 +1513,45 @@ func rosterPanel(in window: AXUIElement) -> AXUIElement? {
 }
 
 /// The long roster's paginator is not a button. It is an AXStaticText reading
-/// "See more", then "+203 more", inside a Fluent TreeItem row.
-func rosterPager(in panel: AXUIElement) -> (element: AXUIElement, text: String)? {
+/// "See more", then "+203 more", inside a Fluent TreeItem row. Only the first
+/// of those does anything (see isRosterExpander).
+func rosterExpander(in panel: AXUIElement) -> (element: AXUIElement, text: String)? {
     guard let element = findElement(from: panel, where: {
-        isRosterPager(axString($0, kAXValueAttribute))
+        isRosterExpander(axString($0, kAXValueAttribute))
     }) else { return nil }
     return (element, axString(element, kAXValueAttribute))
 }
 
-func rosterCount(in panel: AXUIElement) -> Int? {
-    guard let title = findElement(from: panel, where: {
-        axDomID($0).hasPrefix("roster-title-section")
+/// How many people Teams admits it has not fetched yet, when it says so.
+func rosterBacklog(in panel: AXUIElement) -> Int? {
+    guard let element = findElement(from: panel, where: {
+        rosterBacklog(axString($0, kAXValueAttribute)) != nil
     }) else { return nil }
-    return rosterCount(from: [axDescription(title)] + axStaticTexts(title))
+    return rosterBacklog(axString(element, kAXValueAttribute))
+}
+
+func rosterCount(in panel: AXUIElement) -> Int? {
+    if let title = findElement(from: panel, where: {
+        axDomID($0).hasPrefix("roster-title-section")
+    }), let count = rosterCount(from: [axDescription(title)] + axStaticTexts(title)) {
+        return count
+    }
+    // Newer Teams builds drop that id and put the total in a heading instead:
+    // "In this meeting (284)".
+    var heading: Int?
+    _ = findElement(from: panel, where: { element in
+        guard axString(element, kAXRoleAttribute) == "AXHeading" else { return false }
+        heading = rosterCount(from: [axString(element, kAXTitleAttribute)] + axStaticTexts(element))
+        return heading != nil
+    })
+    return heading
 }
 
 /// One overlapping virtualized-list step. Pixel wheel deltas are what
 /// Chromium accepts; line deltas changed clipping without advancing rows.
-func scrollRoster(_ panel: AXUIElement, direction: Int32) {
+/// Scroll the roster, and report where the pointer was parked to do it.
+@discardableResult
+func scrollRoster(_ panel: AXUIElement, direction: Int32) -> CGPoint {
     let root = findElement(from: panel, where: { axDescription($0) == "Attendees" }) ?? panel
     let (origin, size) = axFrame(root)
     let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height * 0.6)
@@ -1534,26 +1566,35 @@ func scrollRoster(_ panel: AXUIElement, direction: Int32) {
         wheel?.post(tap: .cghidEventTap)
         usleep(120_000)
     }
+    return point
 }
 
-/// Ask the paginator for another page. AXPress works on the first See-more
-/// row; later +N-more rows sometimes report a false success, so verify the
-/// remaining number and fall back to a real click on the nearest pressable
-/// ancestor. A success is a disappearing label or a smaller remainder.
-func pressRosterPager(_ pager: (element: AXUIElement, text: String),
-                      panel: AXUIElement, window: AXUIElement, pid: pid_t) -> Bool {
-    func progressed() -> Bool {
-        guard let after = rosterPager(in: panel) else { return true }
-        if after.text != pager.text {
-            if let before = rosterPagerRemaining(pager.text),
-               let remaining = rosterPagerRemaining(after.text) {
-                return remaining < before
-            }
-            return true
-        }
-        return false
-    }
-    var row: AXUIElement? = pager.element
+/// True when the pointer is no longer where we parked it, which means the
+/// human has taken it back.
+///
+/// The idle clocks cannot answer this. They are the right question before a
+/// snapshot starts, but our own synthetic moves and wheels reset them
+/// (measured: mouseMoved idle fell from 1.58s to 0.30s on our own event), so
+/// during a read they only ever report us. Position is not fooled: we put the
+/// pointer somewhere precise, and anything else moving it is a person.
+func pointerTakenBack(from parked: CGPoint) -> Bool {
+    guard let now = CGEvent(source: nil)?.location else { return false }
+    return pointerTakenBack(now: now, parked: parked)
+}
+/// Four points of slack, because the pointer can settle a hair away from where
+/// it was told to go.
+func pointerTakenBack(now: CGPoint, parked: CGPoint) -> Bool {
+    abs(now.x - parked.x) > 4 || abs(now.y - parked.y) > 4
+}
+
+/// Open the full attendee list. Success is that the control has gone, not
+/// that its label changed: labels here drift on their own as people come and
+/// go, and treating a drifting label as progress is exactly how the old pager
+/// convinced itself it was working while loading nobody.
+func pressRosterExpander(_ expander: (element: AXUIElement, text: String),
+                         panel: AXUIElement, window: AXUIElement, pid: pid_t) -> Bool {
+    func opened() -> Bool { rosterExpander(in: panel) == nil }
+    var row: AXUIElement? = expander.element
     while let element = row,
           axString(element, kAXRoleAttribute) != kAXRowRole {
         row = axParent(element)
@@ -1561,9 +1602,9 @@ func pressRosterPager(_ pager: (element: AXUIElement, text: String),
     if let row {
         AXUIElementPerformAction(row, kAXPressAction as CFString)
         usleep(1_000_000)
-        if progressed() { return true }
+        if opened() { return true }
     }
-    var pressable: AXUIElement? = pager.element
+    var pressable: AXUIElement? = expander.element
     while let element = pressable,
           !axActionNames(element).contains(kAXPressAction) {
         pressable = axParent(element)
@@ -1574,7 +1615,7 @@ func pressRosterPager(_ pager: (element: AXUIElement, text: String),
     clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
                                          y: origin.y + size.height / 2))
     usleep(1_200_000)
-    return progressed()
+    return opened()
 }
 
 /// Read the whole Teams roster: open the People panel, expand every page,
@@ -1693,34 +1734,62 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
             mergeViewport()
         }
 
-        // Down through all pages. Each wheel step overlaps the previous
-        // viewport, so no row can fall through the cracks; at page boundaries
-        // the pager is pressed and its progress verified before continuing.
+        // Down through the list. Each wheel step overlaps the previous
+        // viewport, so no row can fall through the cracks; "See more" opens
+        // the full attendee list when it appears.
+        //
+        // Reaching the end is not the same as running out of people. Teams
+        // fetches a big roster from the server a page at a time, so the bottom
+        // of what is loaded arrives long before the last person does: measured
+        // live, a 293-person meeting stopped dead at 102 and then trickled in
+        // two or three at a time, seconds apart, for as long as something kept
+        // asking. The old loop gave up after 1.4s of that and wrote down a
+        // third of the room.
         var stale = 0
-        for _ in 0..<200 {
+        var interrupted = false
+        for _ in 0..<400 {
             if let expected, seen.count >= expected { break }
             if let deadline, Date() >= deadline { break }
-            if let pager = rosterPager(in: panel),
-               pressRosterPager(pager, panel: panel, window: window, pid: pid) {
+            if let expander = rosterExpander(in: panel),
+               pressRosterExpander(expander, panel: panel, window: window, pid: pid) {
                 stale = 0
                 mergeViewport()
                 continue
             }
-            scrollRoster(panel, direction: -1)
+            var parked = scrollRoster(panel, direction: -1)
             usleep(450_000)
-            stale = mergeViewport() == 0 ? stale + 1 : 0
-            if stale >= 3 { break }
+            var gained = mergeViewport()
+            if pointerTakenBack(from: parked) { interrupted = true; break }
+            if gained == 0 {
+                // Apparently the bottom. Wait for the fetch this scroll has
+                // most likely just asked for, then nudge it again.
+                usleep(1_400_000)
+                parked = scrollRoster(panel, direction: -1)
+                usleep(600_000)
+                gained = mergeViewport()
+                if pointerTakenBack(from: parked) { interrupted = true; break }
+            }
+            stale = gained == 0 ? stale + 1 : 0
+            // Six such rounds, about fifteen seconds of nothing, before
+            // believing the list has really ended.
+            if stale >= 6 { break }
         }
 
         // Walk back to the top: catches any row the renderer swapped during
         // the downward pass, and brings the title row back into the tree.
         stale = 0
-        for _ in 0..<80 where stale < 3 {
-            scrollRoster(panel, direction: 1)
+        for _ in 0..<80 where stale < 3 && !interrupted {
+            let parked = scrollRoster(panel, direction: 1)
             usleep(300_000)
             stale = mergeViewport() == 0 ? stale + 1 : 0
+            if pointerTakenBack(from: parked) { interrupted = true }
         }
         expected = rosterCount(in: panel) ?? expected
+        // Nothing to show for an interrupted read is worth retrying rather
+        // than recording; a partial one is worth keeping, and says so.
+        if interrupted, people.isEmpty {
+            return .deferred("the pointer was needed elsewhere")
+        }
     }
 
     people.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
