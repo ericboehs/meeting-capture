@@ -96,6 +96,9 @@ func usage() -> String {
     people-snapshot      Teams only: open the People panel, expand the list,
                          and print everyone in the meeting, confirmed against
                          the panel's own head count. --json for machine output.
+                         Also records the list into the live transcript right
+                         away when one is being recorded (immediate — it takes
+                         the pointer now; roster-now is the polite version).
 
     roster-now           ask the running daemon to record the participant list
                          again at the next quiet moment. Appends a people
@@ -608,6 +611,41 @@ enum TimestampMode {
     }
 }
 
+/// Render one transcript event exactly as Recorder.record writes it: the
+/// jsonl line (newline-terminated, keys sorted) and the bare transcript line.
+/// Extracted so an immediate `people-snapshot` appends byte-identical lines
+/// to the live transcript from a second process. `mode` supplies the
+/// `elapsed` stamp; the daemon passes its recorder mode, the standalone path
+/// recovers it from the transcript's metadata event.
+func renderEvent(kind: String, speaker: String, body: String, at date: Date,
+                 mode: TimestampMode, extra: [String: Any] = [:]) -> (json: String, line: String)? {
+    // Two renderings of one instant. The jsonl keeps the meeting-relative
+    // `elapsed` field for anyone reasoning about position within the call;
+    // the transcript gets the time of day, which is what you actually need
+    // to line a quote up against a calendar or a chat message.
+    let stamped = mode.stamp(date)
+    let clock = Recorder.clockText(from: date)
+    var payload: [String: Any] = [
+        "type": kind,
+        "speaker": speaker,
+        "text": body,
+        "ts": Recorder.isoFormatter.string(from: date),
+        "elapsed": stamped
+    ]
+    payload.merge(extra) { current, _ in current }
+    guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+          var json = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+    json += "\n"
+    // "(chat) Alex: hi", "(people) 8 in the meeting" — the kind is worth
+    // seeing in the transcript when it is not someone speaking. A roster
+    // has no speaker, and "(people) : 8 in" would read like a bug.
+    let tag = kind == "caption" ? "" : "(\(kind)) "
+    let attribution = speaker.isEmpty ? "" : "\(speaker): "
+    return (json, "[\(clock)] \(tag)\(attribution)\(body)")
+}
+
 /// One writable transcript file. A protocol so tests can inject failing or
 /// scripted sinks: FileHandle raises unrecoverable ObjC exceptions for closed
 /// descriptors and never throws in-process, so write-failure paths are only
@@ -628,12 +666,15 @@ struct FileSink: TranscriptSink {
     }
 
     /// nil when the file can't be opened for writing (missing directory,
-    /// permissions). Callers decide whether that's fatal. Opens at EOF so
-    /// appends never clobber existing transcripts.
+    /// permissions). Callers decide whether that's fatal. Opens O_APPEND so
+    /// every write lands at the true end of file even when another process
+    /// (an immediate `people-snapshot` recording into the live transcript)
+    /// grew the file after this handle opened — a retained seek offset would
+    /// silently clobber those bytes.
     init?(url: URL) {
-        guard let handle = FileHandle(forWritingAtPath: url.path) else { return nil }
-        handle.seekToEndOfFile()
-        self.init(path: url.path, handle: handle)
+        let fd = url.path.withCString { open($0, O_WRONLY | O_APPEND) }
+        guard fd >= 0 else { return nil }
+        self.init(path: url.path, handle: FileHandle(fileDescriptor: fd, closeOnDealloc: true))
     }
 
     func append(_ data: Data) throws {
@@ -760,27 +801,19 @@ final class Recorder {
     /// happened; a text write that fails after jsonl succeeded cannot be
     /// undone, so the caller gets .jsonOnly(line) to retry text-only.
     func record(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any] = [:]) -> WriteOutcome {
-        // Two renderings of one instant. The jsonl keeps the meeting-relative
-        // `elapsed` field for anyone reasoning about position within the call;
-        // the transcript gets the time of day, which is what you actually need
-        // to line a quote up against a calendar or a chat message.
-        let stamped = elapsed(date)
-        let clock = Recorder.clockText(from: date)
-        var payload: [String: Any] = [
-            "type": kind,
-            "speaker": speaker,
-            "text": body,
-            "ts": Recorder.isoFormatter.string(from: date),
-            "elapsed": stamped
-        ]
-        payload.merge(extra) { current, _ in current }
-        guard writeJSON(payload) else { return .failed }
-        // "(chat) Alex: hi", "(people) 8 in the meeting…" — the kind is worth
-        // seeing in the transcript when it is not someone speaking. A roster
-        // has no speaker, and "(people) : 8 in" would read like a bug.
-        let tag = kind == "caption" ? "" : "(\(kind)) "
-        let attribution = speaker.isEmpty ? "" : "\(speaker): "
-        let line = "[\(clock)] \(tag)\(attribution)\(body)"
+        guard let rendered = renderEvent(kind: kind, speaker: speaker, body: body,
+                                         at: date, mode: mode, extra: extra) else {
+            status("could not serialize a \(kind) event; neither file records it")
+            return .failed
+        }
+        do {
+            try jsonl.append(Data(rendered.json.utf8))
+        } catch {
+            status("cannot write to \(jsonlURL.path): \(error.localizedDescription); neither file records this event")
+            return .failed
+        }
+        if options.jsonToStdout && !options.quiet { stdout.write(Data(rendered.json.utf8)) }
+        let line = rendered.line
         do {
             try text.append(Data((line + "\n").utf8))
         } catch {
@@ -3412,6 +3445,9 @@ final class Session {
         self.rosterGiveUpAt = clock.now()
             .addingTimeInterval(Session.rosterSettleSeconds + Session.rosterHuntSeconds)
         chatBaselineDone = options.includeChatBacklog
+        // A marker from a previous meeting must not suppress this one's
+        // join-time capture; markers only ever apply to the live meeting.
+        try? FileManager.default.removeItem(atPath: rosterDonePath(in: options.stateDirectory))
         // Apps are singletons; drop any caption bookkeeping a previous meeting left.
         meetingApp.resetCaptureState()
     }
@@ -3651,6 +3687,12 @@ final class Session {
         // the session consumes it next poll. An explicit request gets a fresh
         // attempt budget and its own hunt window, and skips the join-time
         // settle wait — but still waits for a lull below; never interrupts.
+        // An immediate people-snapshot already wrote this room to the
+        // transcript; the join-time flow stands down. An explicit roster-now
+        // request still runs — asked for is asked for.
+        if consumeRosterDone(at: options.stateDirectory) {
+            rosterDone = true
+        }
         // A stale file (requested while idle) simply merges into the
         // join-time capture, which is the same single read either way.
         if !rosterRequested, consumeRosterRequest(at: options.stateDirectory) {
@@ -4271,6 +4313,152 @@ func consumeRosterRequest(at stateDirectory: String) -> Bool {
     return true
 }
 
+/// `people-snapshot` reads the roster in its own process and writes the
+/// event straight into the live transcript, bypassing the daemon's
+/// once-per-meeting flow — so it also leaves this marker, and the session
+/// consumes it instead of recording the same room again at its join-time
+/// attempt. Only dropped when the event actually landed in a live
+/// transcript, so a stale marker can only come from a just-ended meeting
+/// (and Session init clears those).
+func rosterDonePath(in stateDirectory: String) -> String {
+    stateDirectory + "/roster-done"
+}
+
+func markRosterDone(stateDirectory: String) {
+    FileManager.default.createFile(atPath: rosterDonePath(in: stateDirectory), contents: nil)
+}
+
+/// True exactly once per marker.
+func consumeRosterDone(at stateDirectory: String) -> Bool {
+    let path = rosterDonePath(in: stateDirectory)
+    guard FileManager.default.fileExists(atPath: path) else { return false }
+    try? FileManager.default.removeItem(atPath: path)
+    return true
+}
+
+/// The transcript the daemon is recording right now, if any: the `current`
+/// pointer names the .txt, and the .jsonl is its sibling. Both must exist —
+/// the pointer is published only after the metadata event lands, so a
+/// missing sibling means a rotated or half-gone transcript, not a live one.
+func liveTranscriptURLs(stateDirectory: String) -> (jsonl: URL, text: URL)? {
+    guard let raw = try? String(contentsOfFile: stateDirectory + "/current", encoding: .utf8) else { return nil }
+    let textURL = URL(fileURLWithPath: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+    guard FileManager.default.fileExists(atPath: textURL.path) else { return nil }
+    let jsonlURL = textURL.deletingPathExtension().appendingPathExtension("jsonl")
+    guard FileManager.default.fileExists(atPath: jsonlURL.path) else { return nil }
+    return (jsonlURL, textURL)
+}
+
+/// Recover the timestamp mode the live transcript was started with, from its
+/// metadata event (always the first line). Whatever the timeline looks like
+/// now is what the file gets — a standalone read must stamp like the daemon
+/// did, never reinterpret history.
+func transcriptTimestampMode(jsonlURL: URL) -> TimestampMode? {
+    guard let handle = FileHandle(forReadingAtPath: jsonlURL.path) else { return nil }
+    defer { try? handle.close() }
+    guard let first = String(data: handle.readData(ofLength: 4096), encoding: .utf8)?
+            .split(separator: "\n", omittingEmptySubsequences: true).first,
+          let line = first.data(using: .utf8),
+          let metadata = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+          let timestamps = metadata["timestamps"] as? String else { return nil }
+    switch timestamps {
+    case "elapsed":
+        let startString = (metadata["meeting_started_at"] ?? metadata["recorded_at"]) as? String
+        guard let startString, let start = Recorder.isoFormatter.date(from: startString) else { return nil }
+        return .elapsed(from: start)
+    case "time-of-day":
+        return .timeOfDay
+    default:
+        return nil
+    }
+}
+
+/// Append bytes so they land contiguously at the true end of file however
+/// many times the file grew since anyone opened it: one O_APPEND descriptor
+/// and one write loop. This is what lets an immediate `people-snapshot`
+/// record into the live transcript while the daemon holds its own (also
+/// O_APPEND — see FileSink) handle on the same files.
+func appendAtomically(_ data: Data, toFileAtPath path: String) throws {
+    guard !data.isEmpty else { return }
+    let fd = path.withCString { open($0, O_WRONLY | O_APPEND) }
+    guard fd >= 0 else {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                      userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
+    }
+    defer { close(fd) }
+    try data.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) in
+        guard var base = ptr.baseAddress else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL),
+                          userInfo: [NSLocalizedDescriptionKey: "empty buffer"])
+        }
+        var remaining = ptr.count
+        while remaining > 0 {
+            let written = write(fd, base, remaining)
+            if written < 0 {
+                if errno == EINTR { continue }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                              userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
+            }
+            remaining -= written
+            base = base.advanced(by: written)
+        }
+    }
+}
+
+/// What `meeting-capture people-snapshot` did with the live transcript.
+enum RosterRecordOutcome: Equatable {
+    /// Lines appended to both files; carries the transcript line.
+    case recorded(String)
+    /// No live transcript (nothing recording); the printed reading is the
+    /// whole output.
+    case noLiveTranscript
+    /// The transcript exists but its mode is unreadable, or the event would
+    /// not serialize; printed only.
+    case unreadableTranscript(String)
+    /// The jsonl and/or text write failed; carries what landed where.
+    case writeFailed(String)
+}
+
+/// Append a just-read roster to the live transcript, stamped exactly as the
+/// daemon would stamp it, and mark the daemon's join-time capture done so
+/// the same room isn't recorded twice. Print-first, record-second: the
+/// terminal reading never depends on the files. The jsonl is the source of
+/// truth — once it has the event the marker drops even if the text half
+/// below fails, so the daemon must not record the room again.
+func recordRosterToTranscript(_ snapshot: RosterSnapshot, at date: Date,
+                              stateDirectory: String) -> RosterRecordOutcome {
+    guard let urls = liveTranscriptURLs(stateDirectory: stateDirectory) else {
+        return .noLiveTranscript
+    }
+    guard let mode = transcriptTimestampMode(jsonlURL: urls.jsonl) else {
+        return .unreadableTranscript("cannot read the transcript's timestamp mode; printed only")
+    }
+    let names = snapshot.people.map(\.name)
+    var extra: [String: Any] = [
+        "people": names,
+        "count": names.count,
+        "confirmed": snapshot.confirmed,
+    ]
+    if let expected = snapshot.expected { extra["roster_count"] = expected }
+    guard let rendered = renderEvent(kind: "people", speaker: "",
+                                     body: RosterSnapshot.summary(names: names, expected: snapshot.expected),
+                                     at: date, mode: mode, extra: extra) else {
+        return .unreadableTranscript("could not render the roster event; printed only")
+    }
+    do {
+        try appendAtomically(Data(rendered.json.utf8), toFileAtPath: urls.jsonl.path)
+    } catch {
+        return .writeFailed("\(urls.jsonl.path): \(error.localizedDescription)")
+    }
+    markRosterDone(stateDirectory: stateDirectory)
+    do {
+        try appendAtomically(Data((rendered.line + "\n").utf8), toFileAtPath: urls.text.path)
+    } catch {
+        return .writeFailed("event recorded to \(urls.jsonl.path) but not to \(urls.text.path): \(error.localizedDescription)")
+    }
+    return .recorded(rendered.line)
+}
+
 /// Append whatever appeared past `offset` in a growing file to `sink`, and
 /// return the offset to resume from. Existence is checked with a throwing
 /// call (only genuine not-found counts as absent); seek and read use the
@@ -4456,7 +4644,7 @@ signal(SIGTERM) { _ in stopRequested = true }
 /// `meeting-capture people-snapshot`: one roster, printed. The daemon records
 /// the same snapshot itself (see Session.maintainRoster); this is for when you
 /// want one right now, or want to see whether the reading works at all.
-func peopleSnapshot(app: MeetingApp, pid: pid_t, json: Bool) -> Never {
+func peopleSnapshot(app: MeetingApp, pid: pid_t, json: Bool, stateDirectory: String) -> Never {
     let snapshot: RosterSnapshot
     switch app.captureRoster(pid: pid, deadline: nil) {
     case .captured(let captured): snapshot = captured
@@ -4477,6 +4665,17 @@ func peopleSnapshot(app: MeetingApp, pid: pid_t, json: Bool) -> Never {
     } else {
         print(snapshot.headline)
         for person in snapshot.people { print("  \(person.name)") }
+    }
+    // Print-first, record-second: the terminal reading never depends on the
+    // files. Immediate by design — this command takes the pointer now rather
+    // than waiting for a lull; roster-now is the polite version.
+    switch recordRosterToTranscript(snapshot, at: Date(), stateDirectory: stateDirectory) {
+    case .recorded:
+        status("recorded the participant list to the live transcript")
+    case .noLiveTranscript:
+        break // printed output is the whole result; nothing recording
+    case .unreadableTranscript(let why), .writeFailed(let why):
+        status(why)
     }
     exit(0)
 }
@@ -4511,7 +4710,8 @@ if options.subcommand == "people-snapshot" {
     guard let target else {
         fail(candidates.map(\.displayName).joined(separator: " or ") + " is not running")
     }
-    peopleSnapshot(app: target.app, pid: target.pid, json: options.jsonToStdout)
+    peopleSnapshot(app: target.app, pid: target.pid, json: options.jsonToStdout,
+                   stateDirectory: options.stateDirectory)
 }
 if options.subcommand == "roster-now" {
     // No Accessibility permission needed: this only drops a request file the

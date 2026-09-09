@@ -172,7 +172,12 @@ join-time capture.
 
 `meeting-capture people-snapshot` is the same reading on demand, independent
 of the recorder lock: it prints names alphabetically, and `--json` adds each
-app's participant keys for machine use. With no `--app` it asks whichever
+app's participant keys for machine use. When the daemon is recording, it also
+appends the list to the live transcript immediately — stamped exactly as the
+daemon stamps, with the daemon's own join-time capture standing down so the
+room isn't recorded twice. Immediate means immediate: unlike the daemon flow
+it does not wait for a lull, so `meeting-capture roster-now` remains the
+polite version for when you're mid-sentence. With no `--app` it asks whichever
 roster-capable app is running. A clean result says it was confirmed against
 the panel's own count; a changing meeting or an expansion failure says exactly
 how many were loaded instead of presenting a partial list as complete. The

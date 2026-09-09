@@ -1239,6 +1239,99 @@ do {
     try? FileManager.default.removeItem(atPath: dir)
 }
 
+// --- immediate people-snapshot recording --------------------------------
+// renderEvent is the single renderer behind Recorder.record and the
+// standalone path: byte-identical by construction, locked by comparison.
+do {
+    let jsonl = MemorySink(path: "/tmp/j.jsonl"), text = MemorySink(path: "/tmp/t.txt")
+    let mode = TimestampMode.elapsed(from: epoch)
+    let r = Recorder(options: Options(), startedAt: epoch, mode: mode,
+                     jsonlURL: URL(fileURLWithPath: jsonl.path),
+                     textURL: URL(fileURLWithPath: text.path),
+                     jsonl: jsonl, text: text)
+    let extra: [String: Any] = ["people": ["B", "A"], "count": 2, "confirmed": false]
+    let outcome = r.record(kind: "people", speaker: "", body: "2 in the meeting: B, A",
+                           at: epoch, extra: extra)
+    guard let rendered = renderEvent(kind: "people", speaker: "", body: "2 in the meeting: B, A",
+                                     at: epoch, mode: mode, extra: extra) else {
+        expectTrue(false, "renderEvent renders a people event")
+        exit(failures == 0 ? 0 : 1)
+    }
+    expectEqual(outcome, WriteOutcome.written(rendered.line),
+                "record and renderEvent agree on the transcript line")
+    expectTrue(jsonl.string.hasSuffix(rendered.json),
+               "record and renderEvent agree on the jsonl bytes")
+    expectTrue(rendered.json.contains("\"elapsed\":\"00:00:00\""),
+               "elapsed mode stamps from the reference date")
+    expectEqual(rendered.line, "[\(clockStamp(epoch))] (people) 2 in the meeting: B, A",
+                "the standalone line needs no recorder to match")
+}
+
+// A handle opened before another writer grew the file must still land at
+// EOF. Against the old seek-once FileSink this reads back "a\nc\n" — the
+// standalone roster silently eaten by the daemon's next caption.
+do {
+    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mc-oappend-\(UUID().uuidString).txt")
+    FileManager.default.createFile(atPath: url.path, contents: Data("a\n".utf8))
+    guard let sink = FileSink(url: url) else {
+        expectTrue(false, "FileSink opens a real writable file")
+        exit(failures == 0 ? 0 : 1)
+    }
+    try? appendAtomically(Data("b\n".utf8), toFileAtPath: url.path)
+    try? sink.append(Data("c\n".utf8))
+    expectEqual(try? String(contentsOf: url, encoding: .utf8), "a\nb\nc\n",
+                "a retained handle appends at true EOF, never clobbers")
+    var threw = false
+    do { try appendAtomically(Data("x".utf8), toFileAtPath: url.path + ".missing") } catch { threw = true }
+    expectTrue(threw, "atomic append throws on an unopenable path")
+    try? FileManager.default.removeItem(at: url)
+}
+
+// The full standalone path against a fabricated live session: resolve the
+// `current` pointer, recover the mode, stamp like the daemon, mark done.
+do {
+    let dir = NSTemporaryDirectory() + "/mc-live-\(UUID().uuidString)"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let idle = RosterSnapshot(people: [], expected: nil)
+    expectEqual(recordRosterToTranscript(idle, at: epoch, stateDirectory: dir),
+                RosterRecordOutcome.noLiveTranscript, "nothing recording means print-only")
+    expectTrue(!FileManager.default.fileExists(atPath: dir + "/roster-done"),
+               "no transcript, no marker")
+    let txt = dir + "/m.txt", jsonl = dir + "/m.jsonl"
+    let meta = "{\"type\":\"metadata\",\"timestamps\":\"elapsed\",\"recorded_at\":\"\(Recorder.isoFormatter.string(from: epoch))\"}\n"
+    FileManager.default.createFile(atPath: txt, contents: nil)
+    FileManager.default.createFile(atPath: jsonl, contents: Data(meta.utf8))
+    try? txt.write(toFile: dir + "/current", atomically: true, encoding: .utf8)
+    let snap = RosterSnapshot(people: [RosterPerson(name: "A", key: "1"),
+                                       RosterPerson(name: "B", key: "2")], expected: 3)
+    expectEqual(recordRosterToTranscript(snap, at: epoch, stateDirectory: dir),
+                .recorded("[\(clockStamp(epoch))] (people) 2 in the meeting (roster says 3; 2 loaded): A, B"),
+                "the roster lands as a daemon-shaped people line")
+    let lines = (try? String(contentsOfFile: jsonl, encoding: .utf8))?
+        .split(separator: "\n", omittingEmptySubsequences: true) ?? []
+    let event = lines.last.flatMap { $0.data(using: .utf8) }
+        .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    expectEqual(event?["type"] as? String, "people", "the jsonl event is typed")
+    expectEqual(event?["people"] as? [String], ["A", "B"], "names ride along for machines")
+    expectEqual(event?["count"] as? Int, 2, "count is the loaded head")
+    expectEqual(event?["confirmed"] as? Bool, false, "a short roster is never presented as complete")
+    expectEqual(event?["roster_count"] as? Int, 3, "the panel's own head count is kept")
+    expectEqual(event?["elapsed"] as? String, "00:00:00", "stamped from the transcript's own start")
+    expectTrue(FileManager.default.fileExists(atPath: dir + "/roster-done"),
+               "recording marks the join-time capture done")
+    expectTrue(consumeRosterDone(at: dir), "the daemon consumes the marker")
+    expectTrue(!consumeRosterDone(at: dir), "each marker fires exactly once")
+    // A transcript whose mode is unreadable is print-only, never guessed at.
+    try? "not json\n".write(toFile: jsonl, atomically: true, encoding: .utf8)
+    let bad = recordRosterToTranscript(snap, at: epoch, stateDirectory: dir)
+    if case .unreadableTranscript = bad {
+        expectTrue(true, "garbage metadata falls back to print-only")
+    } else {
+        expectTrue(false, "garbage metadata falls back to print-only")
+    }
+    try? FileManager.default.removeItem(atPath: dir)
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")
