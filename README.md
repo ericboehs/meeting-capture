@@ -158,10 +158,17 @@ precisely to scroll, and anything else moving it is a person. It then stops,
 keeps what it has, and retries later.
 
 If people are still arriving and the names do not match the panel's head count,
-it retries (up to three attempts, two minutes apart) and records the best it
-managed, saying how short it is. This is the one thing that will create a
+that partial list is the answer — the transcript says how short it is rather
+than retrying on a timer. Only an outright failure retries (up to three
+attempts, two minutes apart). This is the one thing that will create a
 transcript for an otherwise silent meeting: who was there is worth keeping even
 when nobody captioned anything.
+
+`meeting-capture roster-now` records the list again on demand: the daemon picks
+the request up on its next poll and appends a `people` event to the live
+transcript at the next quiet moment — it never interrupts. Run it with no
+meeting in progress and the request simply merges into the next meeting's
+join-time capture.
 
 `meeting-capture people-snapshot` is the same reading on demand, independent
 of the recorder lock: it prints names alphabetically, and `--json` adds each
