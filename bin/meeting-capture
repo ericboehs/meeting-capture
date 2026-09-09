@@ -52,7 +52,7 @@ struct Options {
     var pid: pid_t?
     var app: String?
     /// A positional first argument selects a one-shot subcommand instead of
-    /// the daemon's watch loop ("people-snapshot").
+    /// the daemon's watch loop ("people-snapshot", "roster-now").
     var subcommand: String?
     var stateDirectory: String = {
         let base = ProcessInfo.processInfo.environment["XDG_STATE_HOME"]
@@ -80,8 +80,9 @@ func usage() -> String {
       --popout-chat        open the meeting chat so it is recorded without
                            anyone opening the panel by hand; in Teams it also
                            gets a window of its own
-      --people-snapshot    Teams: record who is in the meeting, once, about a
-                           minute in (waits for a lull; never interrupts)
+      --people-snapshot    Teams: record who is in the meeting, once, about
+                           90 seconds in (waits for a lull; never interrupts;
+                           re-read on demand with roster-now)
       --interval <ms>      poll interval while in a meeting (default 250)
       --idle-interval <ms> poll interval while waiting for one (default 2000)
       --dir <path>         output directory (default $XDG_DATA_HOME/meeting-capture)
@@ -95,6 +96,12 @@ func usage() -> String {
     people-snapshot      Teams only: open the People panel, expand the list,
                          and print everyone in the meeting, confirmed against
                          the panel's own head count. --json for machine output.
+
+    roster-now           ask the running daemon to record the participant list
+                         again at the next quiet moment. Appends a people
+                         event to the live transcript (or queues for the next
+                         meeting when idle). The daemon needs --people-snapshot
+                         for this to do anything.
 
       -h, --help           this help
 
@@ -112,7 +119,7 @@ func parseOptions() -> Options {
     var options = Options()
     var args = Array(CommandLine.arguments.dropFirst())
     // A positional first argument is a subcommand, not a flag.
-    if let first = args.first, first == "people-snapshot" {
+    if let first = args.first, first == "people-snapshot" || first == "roster-now" {
         options.subcommand = first
         args.removeFirst()
     }
@@ -3348,16 +3355,22 @@ final class Session {
     private var timelineResolved = false
     private var nextTimelineCheck = Date.distantPast
     /// Roster bookkeeping. ONE recorded roster per meeting: read once the
-    /// joining rush has settled, retried only while it comes back short of
-    /// the head count Teams itself prints.
+    /// joining rush has settled. A partial roster (people still joining) is
+    /// accepted as the answer — re-reads are on demand (`meeting-capture
+    /// roster-now`), never on a timer. Only outright failures retry.
     private let rosterInbox = RosterInbox()
     private var rosterRunning = false
     private var rosterDone = false
+    /// An explicit re-read request waiting for its lull. Set by consuming
+    /// the roster-now file; cleared when its snapshot lands (or its hunt
+    /// expires, or its attempts run out).
+    private var rosterRequested = false
     private var rosterAttempts = 0
     private var nextRosterAttempt: Date
     /// When to stop hunting for a quiet moment and accept that this meeting
-    /// goes unrostered.
-    private let rosterGiveUpAt: Date
+    /// goes unrostered. Refreshed by each explicit request, so a re-read
+    /// asked for late in a long meeting still gets its own hunt.
+    private var rosterGiveUpAt: Date
     /// How long after joining the first roster is read. People are still
     /// arriving in the first seconds of a call, and a roster taken then is
     /// both wrong and certain to disagree with the head count. It also leaves
@@ -3634,22 +3647,33 @@ final class Session {
     /// the last attempt is spent — so a transcript holds exactly one roster,
     /// and a short one says how short it is.
     private func maintainRoster(pid: pid_t, now: Date) {
+        // On-demand re-read: `meeting-capture roster-now` drops this file and
+        // the session consumes it next poll. An explicit request gets a fresh
+        // attempt budget and its own hunt window, and skips the join-time
+        // settle wait — but still waits for a lull below; never interrupts.
+        // A stale file (requested while idle) simply merges into the
+        // join-time capture, which is the same single read either way.
+        if !rosterRequested, consumeRosterRequest(at: options.stateDirectory) {
+            rosterRequested = true
+            rosterAttempts = 0
+            nextRosterAttempt = now
+            rosterGiveUpAt = now.addingTimeInterval(Session.rosterHuntSeconds)
+        }
         if let outcome = rosterInbox.take() {
             rosterRunning = false
             switch outcome {
             case .captured(let snapshot):
                 rosterAttempts += 1
-                nextRosterAttempt = now.addingTimeInterval(Session.rosterRetrySeconds)
-                // An unconfirmed roster is usually a meeting still filling up.
-                // Take it as the answer only when there are no tries left.
-                if snapshot.confirmed || rosterAttempts >= Session.rosterMaxAttempts {
-                    writeRoster(snapshot, at: now)
-                    rosterDone = true
-                }
+                // One read per meeting: a partial roster (people still
+                // joining) is the answer, not a reason to retry.
+                writeRoster(snapshot, at: now)
+                rosterRequested = false
+                rosterDone = true
             case .failed(let why):
                 rosterAttempts += 1
                 nextRosterAttempt = now.addingTimeInterval(Session.rosterRetrySeconds)
                 guard rosterAttempts >= Session.rosterMaxAttempts else { return }
+                rosterRequested = false
                 rosterDone = true
                 if !options.quiet {
                     status("could not read the \(meetingApp.displayName) participant list: \(why)")
@@ -3660,14 +3684,20 @@ final class Session {
             }
             return
         }
-        guard meetingApp.supportsRosterSnapshot, !rosterDone, !rosterRunning else { return }
+        guard meetingApp.supportsRosterSnapshot, !rosterRunning else { return }
+        // The join-time flow runs once; afterwards only explicit requests do.
+        guard !rosterDone || rosterRequested else { return }
         guard rosterAttempts < Session.rosterMaxAttempts else { return }
         // Hunting for a lull cannot go on all day; say so rather than leaving
         // a silent gap where the roster should be.
         if now >= rosterGiveUpAt {
+            let wasReread = rosterRequested && rosterDone
+            rosterRequested = false
             rosterDone = true
             if !options.quiet {
-                status("never found a quiet moment to read the \(meetingApp.displayName) participant list; this meeting has no roster")
+                status(wasReread
+                    ? "never found a quiet moment to re-read the \(meetingApp.displayName) participant list"
+                    : "never found a quiet moment to read the \(meetingApp.displayName) participant list; this meeting has no roster")
             }
             return
         }
@@ -4209,6 +4239,38 @@ func removeStateFile(_ path: String) {
     catch { status("cannot remove \(path): \(error.localizedDescription)") }
 }
 
+/// Request-file protocol for on-demand roster re-reads (`meeting-capture
+/// roster-now`). A bare `roster-now` file in the state directory means
+/// "capture the participant list again at the next lull"; the session
+/// consumes it on its next poll, so each file fires exactly once.
+func rosterRequestPath(in stateDirectory: String) -> String {
+    stateDirectory + "/roster-now"
+}
+
+/// Queue a re-read request. Returns the user-facing line, or nil when the
+/// request file itself could not be written. When a meeting is live (the
+/// `current` pointer exists only then) the capture happens at the next
+/// quiet moment; when idle it merges into the next meeting's join-time
+/// capture, which is the same single read either way.
+func requestRoster(stateDirectory: String) -> String? {
+    try? FileManager.default.createDirectory(
+        atPath: stateDirectory, withIntermediateDirectories: true)
+    let path = rosterRequestPath(in: stateDirectory)
+    guard FileManager.default.createFile(atPath: path, contents: nil) else { return nil }
+    if FileManager.default.fileExists(atPath: stateDirectory + "/current") {
+        return "roster requested \u{2014} recording at the next quiet moment (never interrupts)"
+    }
+    return "no meeting in progress \u{2014} the roster will be captured when the next one settles"
+}
+
+/// Consume a pending re-read request if present. True exactly once per file.
+func consumeRosterRequest(at stateDirectory: String) -> Bool {
+    let path = rosterRequestPath(in: stateDirectory)
+    guard FileManager.default.fileExists(atPath: path) else { return false }
+    try? FileManager.default.removeItem(atPath: path)
+    return true
+}
+
 /// Append whatever appeared past `offset` in a growing file to `sink`, and
 /// return the offset to resume from. Existence is checked with a throwing
 /// call (only genuine not-found counts as absent); seek and read use the
@@ -4450,6 +4512,15 @@ if options.subcommand == "people-snapshot" {
         fail(candidates.map(\.displayName).joined(separator: " or ") + " is not running")
     }
     peopleSnapshot(app: target.app, pid: target.pid, json: options.jsonToStdout)
+}
+if options.subcommand == "roster-now" {
+    // No Accessibility permission needed: this only drops a request file the
+    // daemon's session consumes on its next poll.
+    guard let note = requestRoster(stateDirectory: options.stateDirectory) else {
+        fail("could not write \(rosterRequestPath(in: options.stateDirectory))")
+    }
+    print(note)
+    exit(0)
 }
 let live = LiveView(options: options)
 

@@ -1216,6 +1216,29 @@ do {
                "a resting hand does not count as the user being busy")
 }
 
+// --- on-demand roster requests ------------------------------------------
+// The request file is the whole protocol: roster-now drops it, the session
+// consumes it next poll. Each file fires exactly once.
+do {
+    let dir = NSTemporaryDirectory() + "/mc-roster-req-\(UUID().uuidString)"
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    expectTrue(!consumeRosterRequest(at: dir), "no file means no request")
+    let idle = requestRoster(stateDirectory: dir)
+    expectTrue(idle != nil && idle!.contains("no meeting"),
+               "an idle request queues for the next meeting")
+    expectTrue(FileManager.default.fileExists(atPath: dir + "/roster-now"),
+               "the request lands as a bare file in the state directory")
+    expectTrue(consumeRosterRequest(at: dir), "the session consumes the pending request")
+    expectTrue(!consumeRosterRequest(at: dir), "each request file fires exactly once")
+    // A live meeting advertises itself with the `current` pointer.
+    FileManager.default.createFile(atPath: dir + "/current", contents: nil)
+    let live = requestRoster(stateDirectory: dir)
+    expectTrue(live != nil && live!.contains("quiet moment"),
+               "a live request promises the next lull, never an interruption")
+    _ = consumeRosterRequest(at: dir)
+    try? FileManager.default.removeItem(atPath: dir)
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")

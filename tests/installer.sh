@@ -156,8 +156,10 @@ reset_launchctl 0 99
 rc=0; err=$(restart_agent "gui/501" "com.example.agent" "/tmp/agent.plist" 2>&1) || rc=$?
 check "a daemon that will not start fails the install" "1" "$rc"
 check "bootstrap is not retried forever" "5" "$(count_calls bootstrap)"
-check "the launchctl diagnostic is surfaced" "0" \
-  "$(case $err in *"Input/output error"*) echo 0 ;; *) echo "missing: $err" ;; esac)"
+# No case-in-$() here: bash 3.2 (CI's /bin/bash) closes the substitution at
+# the pattern's own paren. [[ == ]] matches the same way on every bash.
+if [[ $err == *"Input/output error"* ]]; then diag=0; else diag="missing: $err"; fi
+check "the launchctl diagnostic is surfaced" "0" "$diag"
 
 unset -f launchctl sleep
 

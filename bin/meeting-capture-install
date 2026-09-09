@@ -15,6 +15,11 @@ set -euo pipefail
 label="com.ericboehs.meeting-capture"
 source_script="${BASH_SOURCE[0]%/*}/meeting-capture"
 binary="$HOME/.local/bin/meeting-capture-daemon"
+# Same build, friendlier name: the one-shot subcommands (people-snapshot,
+# roster-now) run from here. A copy, not a link, so each path keeps its own
+# TCC identity — roster-now needs no Accessibility grant (it only drops a
+# file), while people-snapshot will ask once for this path the first time.
+cli="$HOME/.local/bin/meeting-capture"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/meeting-capture"
 stamp="$state_dir/source.sha256"
@@ -205,6 +210,9 @@ if [[ ! -x $binary || ! -f $stamp || $(cat "$stamp") != "$build_hash" ]]; then
   rebuilt=true
 else
   echo "$binary is current, skipping build"
+fi
+if [[ $rebuilt == true || ! -x $cli ]]; then
+  cp -f "$binary" "$cli"
 fi
 
 cat > "$plist" <<PLIST
