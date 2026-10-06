@@ -163,6 +163,44 @@ check "the launchctl diagnostic is surfaced" "0" "$diag"
 
 unset -f launchctl sleep
 
+# --- meeting_in_progress / refuse_mid_meeting ------------------------------
+
+STATE=$(mktemp -d)
+DAEMON_STATE=running
+launchctl() { [[ $1 == print ]] && printf '\tstate = %s\n' "$DAEMON_STATE"; }
+transcript="$STATE/20261006_110421-teams-sync.txt"
+
+rc=0; meeting_in_progress "$STATE" gui/501/x >/dev/null || rc=$?
+check "no pointer: no meeting" "1" "$rc"
+
+echo "$transcript" > "$STATE/current"
+rc=0; meeting_in_progress "$STATE" gui/501/x >/dev/null || rc=$?
+check "pointer to a missing transcript: no meeting" "1" "$rc"
+
+touch "$transcript"
+out=$(meeting_in_progress "$STATE" gui/501/x)
+check "recording daemon: meeting, transcript named" "$transcript" "$out"
+
+DAEMON_STATE="not running"
+rc=0; meeting_in_progress "$STATE" gui/501/x >/dev/null || rc=$?
+check "pointer left by a dead daemon: no meeting" "1" "$rc"
+
+DAEMON_STATE=running
+rc=0; err=$(refuse_mid_meeting "$STATE" gui/501/x false install 2>&1) || rc=$?
+check "install refuses mid-meeting" "1" "$rc"
+if [[ $err == *"$transcript"* && $err == *--force* ]]; then msg=0; else msg="got: $err"; fi
+check "refusal names the transcript and --force" "0" "$msg"
+
+rc=0; refuse_mid_meeting "$STATE" gui/501/x true install 2>/dev/null || rc=$?
+check "--force overrides the refusal" "0" "$rc"
+
+rm -f "$STATE/current"
+rc=0; refuse_mid_meeting "$STATE" gui/501/x false install 2>/dev/null || rc=$?
+check "no meeting: install proceeds" "0" "$rc"
+
+unset -f launchctl
+rm -rf "$STATE"
+
 # --- Summary --------------------------------------------------------------
 
 total=$((pass + fail))

@@ -50,6 +50,11 @@ tail -f ~/.local/state/meeting-capture/launchd.log
 
 Uninstall with `./bin/meeting-capture-install uninstall`.
 
+Installing, uninstalling and reauthorizing all restart the daemon, which
+would split a meeting being recorded into two transcripts. So while one is
+being recorded they refuse, naming the transcript; pass `--force` to go ahead
+anyway.
+
 ### Granting once instead of after every build
 
 macOS ties an Accessibility grant to the binary's code signature. Ad-hoc signing

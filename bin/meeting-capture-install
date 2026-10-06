@@ -73,6 +73,33 @@ find_sign_id() {
 
 settings_pane="x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
+# Restarting the daemon mid-meeting splits the transcript in two, and the
+# fresh session re-reads the captions still on screen, so the seam repeats
+# itself. The daemon publishes $state_dir/current while it records and removes
+# it when the meeting ends; a crash can leave it behind, so the daemon must
+# also be running. Prints the live transcript and returns 0 while one is being
+# recorded.
+meeting_in_progress() { # meeting_in_progress <state_dir> <domain/label>
+  local pointer=$1/current transcript
+  [[ -f $pointer ]] || return 1
+  transcript=$(<"$pointer")
+  [[ -n $transcript && -f $transcript ]] || return 1
+  launchctl print "$2" 2>/dev/null | grep -q 'state = running' || return 1
+  printf '%s\n' "$transcript"
+}
+
+# Refuse to stop a recording daemon unless forced. Usage: refuse_mid_meeting
+# <state_dir> <domain/label> <force> <action>
+refuse_mid_meeting() {
+  local transcript
+  [[ $3 == true ]] && return 0
+  transcript=$(meeting_in_progress "$1" "$2") || return 0
+  echo "error: a meeting is being recorded; $4 would restart the daemon and split it:" >&2
+  echo "  $transcript" >&2
+  echo "retry after the meeting ends, or pass --force" >&2
+  return 1
+}
+
 # Stop the agent and start it again.
 #
 # `launchctl bootout` returns before launchd has finished tearing the service
@@ -106,7 +133,23 @@ if [[ -n ${MC_INSTALL_LIB_ONLY:-} ]]; then
   return 0 2>/dev/null || exit 0
 fi
 
-case "${1:-install}" in
+# --force may appear anywhere: `install --force`, `--force uninstall`.
+force=false
+args=()
+for arg in "$@"; do
+  if [[ $arg == --force ]]; then force=true; else args+=("$arg"); fi
+done
+set -- "${args[@]+"${args[@]}"}"
+
+action=${1:-install}
+case $action in
+  install | uninstall | reauthorize)
+    # Checked before building: swiftc overwrites the running binary in place.
+    refuse_mid_meeting "$state_dir" "gui/$UID/$label" "$force" "$action" || exit 1
+    ;;
+esac
+
+case "$action" in
   uninstall)
     launchctl bootout "gui/$UID/$label" 2>/dev/null || true
     rm -rf "$plist" "$binary" "$stamp"
@@ -176,7 +219,7 @@ case "${1:-install}" in
     ;;
   install) ;;
   *)
-    echo "usage: ${0##*/} [install|reauthorize|signing-cert|uninstall]" >&2
+    echo "usage: ${0##*/} [install|reauthorize|signing-cert|uninstall] [--force]" >&2
     exit 1
     ;;
 esac
