@@ -679,6 +679,29 @@ do {
     expectTrue(jsonl.string.contains("\"lost_events\":0"), "recovery means zero events reported lost")
 }
 
+// Caption history lands before the live captions held back while it was
+// read, tagged as history, with the line both sources caught written once.
+do {
+    let clock = FakeClock(start: epoch, step: 0)
+    let s = injectedSession(clock: clock)
+    let jsonl = MemorySink(path: "/tmp/history.jsonl")
+    let text = MemorySink(path: "/tmp/history.txt")
+    s.recorder = Recorder(options: Options(), startedAt: epoch, mode: .elapsed(from: epoch),
+                          jsonlURL: URL(fileURLWithPath: jsonl.path),
+                          textURL: URL(fileURLWithPath: text.path),
+                          jsonl: jsonl, text: text)
+    s.heldCaptions = [("T", "I think it's this clustering, yeah, so.", epoch.addingTimeInterval(5), [:]),
+                      ("E", "Live after joining.", epoch.addingTimeInterval(9), [:])]
+    s.concludeHistory([SegmentKey(speaker: "T", text: "Howdy howdy."),
+                       SegmentKey(speaker: "T", text: "I think it's this clustering, yeah, so.")])
+    let lines = jsonl.string.split(separator: "\n").filter { $0.contains("\"caption\"") }
+    expectEqual(lines.count, 3, "history + held, overlap written once")
+    expectTrue(lines.first?.contains("Howdy howdy.") == true && lines.first?.contains("\"history\":true") == true,
+               "history comes first and is tagged")
+    expectTrue(lines.last?.contains("Live after joining.") == true, "held captions follow history")
+    expectTrue(s.heldCaptions.isEmpty, "held captions released")
+}
+
 // Retry backoff is deterministic under the injected clock: doubles from 1s,
 // capped at 30s, and won't fire before nextRetry.
 do {
@@ -1057,6 +1080,39 @@ do {
                 "DM huddle title as AX reports it")
     expectEqual(slackHuddleTitle("- \(ws) - Slack"), "Slack huddle",
                 "empty name falls back")
+
+    // Caption history: panel rows, page stitching, overlap with live capture.
+    let k = { (s: String, t: String) in SegmentKey(speaker: s, text: t) }
+    expectEqual(slackPanelRow(["Travis Taylor", "Howdy howdy."]), k("Travis Taylor", "Howdy howdy."),
+                "panel row is speaker then text")
+    expectEqual(slackPanelRow(["Captions are being generated in English (US).", "Change huddle language"]), nil,
+                "panel header is not a row")
+    expectEqual(slackPanelRow(["Travis Taylor"]), nil, "speaker alone is not a row")
+
+    let a = k("T", "one"), b = k("E", "two"), c = k("T", "three"), d = k("E", "four"), e = k("T", "five")
+    expectEqual(mergeCaptionPages([[a, b, c], [b, c, d], [c, d, e]]), [a, b, c, d, e],
+                "overlapping pages stitch in order")
+    expectEqual(mergeCaptionPages([[a, b, c, d], [b, c], [d, e]]), [a, b, c, d, e],
+                "a page inside what is held adds nothing")
+    expectEqual(mergeCaptionPages([[a, b], [d, e]]), [a, b, d, e],
+                "a page that jumped past the overlap is still kept")
+    expectEqual(mergeCaptionPages([[a, k("E", "Yeah.")], [k("E", "Yeah."), c, k("E", "Yeah.")]]),
+                [a, k("E", "Yeah."), c, k("E", "Yeah.")],
+                "a repeated short line survives stitching")
+
+    let said = k("T", "I think it's this clustering, yeah, so.")
+    expectEqual(trimCaptionHistory([a, b, said], against: [said]), [a, b],
+                "history line already held live is dropped")
+    expectEqual(trimCaptionHistory([a, k("T", "Older words. I think it's this clustering, yeah, so.")],
+                                   against: [said]),
+                [a, k("T", "Older words.")],
+                "merged panel row keeps the words before the live ones")
+    expectEqual(trimCaptionHistory([a, k("E", "Yeah, sure thing"), b], against: [k("E", "Yeah.")]),
+                [a, k("E", "Yeah, sure thing"), b],
+                "a short live phrase does not match inside an older row")
+    expectEqual(trimCaptionHistory([a, b], against: [k("T", "two")]), [a, b],
+                "same words from another speaker are not a match")
+    expectEqual(trimCaptionHistory([a, b], against: []), [a, b], "nothing live keeps everything")
 
     let zoom = "zoom.us.app/Contents/MacOS/zoom.us"
     expectTrue(processMatches(pattern: zoom,

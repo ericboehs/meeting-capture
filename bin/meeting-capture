@@ -1055,6 +1055,13 @@ protocol MeetingApp {
     /// cleared here rather than leaking across meetings.
     func resetCaptureState()
 
+    /// Captions spoken before we joined, read from the app's own transcript
+    /// panel. Called once per poll until it returns non-nil: each call may do
+    /// one step of slow work (switching a tab, scrolling a page) so the poll
+    /// loop never stalls on it. Returns the history oldest-first when done,
+    /// [] when there is none to read. Runs under UIAutomation.
+    func captionHistoryStep(_ app: AXUIElement) -> [SegmentKey]?
+
     /// Called every poll while a meeting is being recorded, so an app can keep
     /// the surfaces it reads from readable — Teams stops updating a meeting
     /// window that another window completely covers, and its chat panel may
@@ -1141,6 +1148,8 @@ extension MeetingApp {
     func chatContainer(_ app: AXUIElement) -> AXUIElement? { nil }
     func chatMessages(in container: AXUIElement) -> [ChatMessage] { [] }
     func resetCaptureState() {}
+    // No app but Slack keeps a scrollable transcript we can read back.
+    func captionHistoryStep(_ app: AXUIElement) -> [SegmentKey]? { [] }
     // Only Teams parks a covered window; everyone else keeps rendering.
     func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
                           popOutCaptions: Bool, popOutChat: Bool) {}
@@ -2380,6 +2389,68 @@ func slackHuddleCandidates(titles: [String]) -> [Int] {
     return huddles + eligible.filter { !huddles.contains($0) }
 }
 
+/// One Captions-panel row from its static texts: [speaker, text…]. The panel
+/// header ("Captions are being generated…", "Change huddle language") and
+/// anything without both a speaker and words is not a row.
+func slackPanelRow(_ texts: [String]) -> SegmentKey? {
+    guard texts.count >= 2 else { return nil }
+    let speaker = texts[0]
+    let text = texts.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespaces)
+    guard !text.isEmpty, !speaker.hasPrefix("Captions are being generated"),
+          text != "Change huddle language" else { return nil }
+    return SegmentKey(speaker: speaker, text: text)
+}
+
+/// Stitch pages read top to bottom out of a virtualized list into one run.
+/// Consecutive pages overlap; a page wholly inside what is already held adds
+/// nothing. Pages that do not overlap at all are appended (a jump too far
+/// for the overscan), which can only lose order, never words.
+func mergeCaptionPages(_ pages: [[SegmentKey]]) -> [SegmentKey] {
+    var merged: [SegmentKey] = []
+    for page in pages where !page.isEmpty {
+        if page.count <= merged.count,
+           (0...(merged.count - page.count)).contains(where: { Array(merged[$0..<$0 + page.count]) == page }) {
+            continue
+        }
+        var overlap = 0
+        for k in stride(from: min(merged.count, page.count), through: 1, by: -1)
+        where Array(merged.suffix(k)) == Array(page.prefix(k)) {
+            overlap = k
+            break
+        }
+        merged += page.dropFirst(overlap)
+    }
+    return merged
+}
+
+/// Drop the end of the panel history that live capture already holds, so a
+/// sentence is not written once from each. Only the last few rows are
+/// considered: the overlay keeps about five events. Slack merges consecutive
+/// utterances by one speaker into a single panel row, so a row may hold older
+/// words followed by the live ones — keep the older part.
+func trimCaptionHistory(_ history: [SegmentKey], against live: [SegmentKey]) -> [SegmentKey] {
+    guard !live.isEmpty else { return history }
+    var result = history
+    let floor = max(0, history.count - (live.count + 4))
+    let words = { (s: String) in s.split(separator: " ").count }
+    for index in stride(from: history.count - 1, through: floor, by: -1) {
+        let row = history[index]
+        let matches = live.filter { $0.speaker == row.speaker && !$0.text.isEmpty }
+        // Substring matches need a few words: "Yeah." is inside everything.
+        if matches.contains(where: { $0.text == row.text
+                || (words(row.text) >= 3 && $0.text.contains(row.text)) }) {
+            result = Array(history[..<index])
+        } else if let hit = matches.filter({ words($0.text) >= 3 })
+                    .compactMap({ row.text.range(of: $0.text) })
+                    .min(by: { $0.lowerBound < $1.lowerBound }) {
+            let older = row.text[..<hit.lowerBound].trimmingCharacters(in: .whitespaces)
+            result = Array(history[..<index])
+            if !older.isEmpty { result.append(SegmentKey(speaker: row.speaker, text: older)) }
+        }
+    }
+    return result
+}
+
 /// A meeting name from a huddle window title. Observed forms:
 ///   "Huddle: #channel - Workspace - Slack \u{1F3A4}"
 ///   "Huddle with Travis Taylor"
@@ -2574,6 +2645,129 @@ final class SlackApp: MeetingApp {
         liveSequence = 0
         previousLiveText = ""
         history.reset()
+        historyPhase = .toTop
+        historyPages = []
+        historyStill = 0
+        historyMarker = nil
+        historyPressedTab = false
+        historyLocateTries = 0
+    }
+
+    // MARK: Caption history
+    //
+    // The Captions tab in the huddle's side panel keeps the whole huddle, so a
+    // late join can read back what it missed. Untested assumptions, logged
+    // so the next huddle shows which held: the list is Slack's virtual list
+    // (c-virtual_list__*), Chromium honours AXScrollToVisible on its rows,
+    // and the vertical scroll bar's AXValue is settable as a fallback.
+
+    private enum HistoryPhase { case toTop, collect }
+    private var historyPhase = HistoryPhase.toTop
+    private var historyPages: [[SegmentKey]] = []
+    /// Polls in a row on which the list did not move; three means an end.
+    private var historyStill = 0
+    private var historyMarker: SegmentKey?
+    private var historyPressedTab = false
+    private var historyLocateTries = 0
+    private let virtualListClass = "c-virtual_list__scroll_container"
+    private let virtualItemClass = "c-virtual_list__item"
+
+    func captionHistoryStep(_ app: AXUIElement) -> [SegmentKey]? {
+        guard let window = huddleWindow(app) else { return nil }
+        guard let list = captionsPanelList(window) else {
+            // Switching tabs is normally the user's business, but reading the
+            // huddle so far is worth one switch to Captions.
+            if !historyPressedTab, let tab = findElement(from: window, where: isCaptionsTab) {
+                historyPressedTab = true
+                AXUIElementPerformAction(tab, kAXPressAction as CFString)
+                status("selected Slack's Captions tab to read the huddle so far")
+            }
+            historyLocateTries += 1
+            if historyLocateTries == 40 { status("Slack caption history: no Captions list found; skipping") }
+            return historyLocateTries >= 40 ? [] : nil
+        }
+        let rows = panelRows(list)
+        switch historyPhase {
+        case .toTop:
+            if settled(on: rows.first?.key) || rows.isEmpty {
+                historyPhase = .collect
+                historyStill = 0
+                historyMarker = nil
+                return nil
+            }
+            scroll(toward: rows.first?.element, in: list, up: true)
+            return nil
+        case .collect:
+            historyPages.append(rows.map(\.key))
+            if settled(on: rows.last?.key) || rows.isEmpty {
+                let merged = mergeCaptionPages(historyPages)
+                status("Slack caption history: read \(merged.count) row(s) over \(historyPages.count) page(s)")
+                return merged
+            }
+            scroll(toward: rows.last?.element, in: list, up: false)
+            return nil
+        }
+    }
+
+    /// True once the list's edge row has held still for three polls.
+    private func settled(on edge: SegmentKey?) -> Bool {
+        if edge == historyMarker { historyStill += 1 } else { historyStill = 0; historyMarker = edge }
+        return historyStill >= 3
+    }
+
+    private func isCaptionsTab(_ element: AXUIElement) -> Bool {
+        axDomID(element) == "captions" && axString(element, kAXRoleAttribute) == "AXRadioButton"
+    }
+
+    /// The Captions tab's list, only while that tab is the one showing.
+    private func captionsPanelList(_ window: AXUIElement) -> AXUIElement? {
+        guard let tab = findElement(from: window, where: isCaptionsTab),
+              ((axAttribute(tab, kAXValueAttribute) as? NSNumber)?.intValue ?? 1) == 1
+        else { return nil }
+        // Climb from the tab to the panel that holds it, then look down for
+        // the list. Nearest first, so a list elsewhere in the window loses.
+        var node = axParent(tab)
+        for _ in 0..<10 {
+            guard let here = node else { break }
+            if let list = findElement(from: here, where: {
+                axClasses($0).contains { $0.hasPrefix(self.virtualListClass) }
+            }) { return list }
+            node = axParent(here)
+        }
+        return nil
+    }
+
+    private func panelRows(_ list: AXUIElement) -> [(element: AXUIElement, key: SegmentKey)] {
+        var items: [AXUIElement] = []
+        func collect(_ element: AXUIElement, depth: Int) {
+            guard depth < 12 else { return }
+            if axClasses(element).contains(where: { $0.hasPrefix(virtualItemClass) }) {
+                items.append(element)
+                return
+            }
+            for child in axChildren(element) { collect(child, depth: depth + 1) }
+        }
+        collect(list, depth: 0)
+        if items.isEmpty { items = axChildren(list) }
+        return items.compactMap { item in slackPanelRow(axStaticTexts(item)).map { (item, $0) } }
+    }
+
+    /// Bring the edge row into view, which makes the virtual list render the
+    /// rows beyond it. A row already in view does not move the list, so once
+    /// that stalls, nudge the scroll bar instead.
+    private func scroll(toward row: AXUIElement?, in list: AXUIElement, up: Bool) {
+        if historyStill == 0, let row,
+           AXUIElementPerformAction(row, "AXScrollToVisible" as CFString) == .success {
+            return
+        }
+        var area: AXUIElement? = list
+        while let node = area, axString(node, kAXRoleAttribute) != kAXScrollAreaRole { area = axParent(node) }
+        guard let area, let raw = axAttribute(area, kAXVerticalScrollBarAttribute),
+              CFGetTypeID(raw) == AXUIElementGetTypeID() else { return }
+        let bar = raw as! AXUIElement
+        guard let value = (axAttribute(bar, kAXValueAttribute) as? NSNumber)?.doubleValue else { return }
+        let next = up ? max(0, value - 0.05) : min(1, value + 0.05)
+        AXUIElementSetAttributeValue(bar, kAXValueAttribute as CFString, next as CFNumber)
     }
 
     // Settled events carry positional seg: ids that name one specific utterance
@@ -3369,6 +3563,13 @@ final class Session {
     // ^ internal so fault tests can count lost items without stderr capture
     private var seenChatIDs = Set<String>()
     private var chatBaselineDone: Bool
+    /// Until the app's caption history has been read (or given up on), live
+    /// captions are held back so the transcript stays in spoken order.
+    private var historyPending: Bool
+    private var historyDeadline: Date
+    var heldCaptions: [(speaker: String, body: String, at: Date, extra: [String: Any])] = []
+    /// How long a history read may hold live captions back.
+    static let historyBudgetSeconds: TimeInterval = 60
     private var captionAttempts = 0
     private var warnedCaptionsUnreachable = false
     /// finish() must be idempotent: it runs both on leave detection and on exit,
@@ -3489,6 +3690,8 @@ final class Session {
         self.rosterGiveUpAt = clock.now()
             .addingTimeInterval(Session.rosterSettleSeconds + Session.rosterHuntSeconds)
         chatBaselineDone = options.includeChatBacklog
+        historyPending = options.captureCaptions
+        historyDeadline = clock.now().addingTimeInterval(Session.historyBudgetSeconds)
         // A marker from a previous meeting must not suppress this one's
         // join-time capture; markers only ever apply to the live meeting.
         try? FileManager.default.removeItem(atPath: rosterDonePath(in: options.stateDirectory))
@@ -3612,6 +3815,10 @@ final class Session {
     /// than written. Queued == committed for dedup purposes — the backlog is
     /// drained by retryPendingWrites and finish(), never dropped silently.
     private func emit(kind: String, speaker: String, body: String, at date: Date, extra: [String: Any]) {
+        if historyPending && kind == "caption" {
+            heldCaptions.append((speaker, body, date, extra))
+            return
+        }
         guard pendingWrites.isEmpty else {
             pendingWrites.append(.event(
                 kind: kind, speaker: speaker, body: body, at: date, extra: extra))
@@ -3712,8 +3919,48 @@ final class Session {
                                         popOutChat: options.popOutChat)
             UIAutomation.leave()
         }
+        if historyPending { advanceHistory(app: app, now: now) }
         if options.captureCaptions { pollCaptions(now: now) }
         if options.captureChat { pollChat(now: now) }
+    }
+
+    /// One step of reading what was said before we joined. Under the UI lock
+    /// because the app may switch tabs or scroll; losing the lock just means
+    /// trying again next poll.
+    private func advanceHistory(app: AXUIElement, now: Date) {
+        var history: [SegmentKey]?
+        if UIAutomation.tryEnter() {
+            history = meetingApp.captionHistoryStep(app)
+            UIAutomation.leave()
+        }
+        if history == nil {
+            guard clock.now() >= historyDeadline else { return }
+            status("gave up reading \(meetingApp.displayName)'s caption history after \(Int(Session.historyBudgetSeconds))s")
+        }
+        concludeHistory(history ?? [])
+    }
+
+    /// Write the history, minus whatever live capture already holds, then
+    /// release the live captions held back meanwhile.
+    func concludeHistory(_ history: [SegmentKey]) {
+        historyPending = false
+        let live = heldCaptions.map { SegmentKey(speaker: $0.speaker, text: $0.body) }
+            + captionOrder.compactMap { activeCaptions[$0] }.map { SegmentKey(speaker: $0.speaker, text: $0.text) }
+        let kept = trimCaptionHistory(history, against: live)
+        if !kept.isEmpty {
+            status("recovered \(kept.count) caption line(s) spoken before joining")
+        }
+        // Spoken before we joined, at times the panel does not show: stamp
+        // them with the join, and say so in the jsonl.
+        for line in kept {
+            emit(kind: "caption", speaker: line.speaker, body: line.text,
+                 at: timelineStart, extra: ["history": true])
+        }
+        let held = heldCaptions
+        heldCaptions = []
+        for line in held {
+            emit(kind: "caption", speaker: line.speaker, body: line.body, at: line.at, extra: line.extra)
+        }
     }
 
     /// Record who was in the meeting, once.
@@ -4201,6 +4448,9 @@ final class Session {
     func finish(at date: Date) {
         guard !finished else { return }
         finished = true
+        // Leaving mid-read: nothing more will be read, but held captions must
+        // still be written.
+        if historyPending { concludeHistory([]) }
         live.erase()
         // Finalize every pending utterance. finalizeCaption hands failures to
         // the ordered backlog, and no poll follows a finish — so drain that

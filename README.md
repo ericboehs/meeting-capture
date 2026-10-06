@@ -406,6 +406,11 @@ The daemon polls the accessibility tree of each supported app:
      tracked through its revisions.
      The overlay is also absent whenever nobody is talking, which says nothing
      about whether captions are on.
+     On joining, the daemon also reads back the huddle so far from the side
+     panel's Captions tab, selecting that tab if another is showing, and
+     scrolling the list top to bottom. Those lines are written first, stamped
+     with the join time and marked `"history": true`; live captions are held
+     back until then (at most a minute) so the transcript stays in order.
    - **Google Meet** keeps one block per speaker holding a list of sentences,
      appending as each finishes and revising only the last. Nothing carries a
      DOM id, so a sentence is identified by its position in that list rather
