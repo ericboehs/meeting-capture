@@ -1636,6 +1636,22 @@ func pointerTakenBack(now: CGPoint, parked: CGPoint) -> Bool {
     abs(now.x - parked.x) > 4 || abs(now.y - parked.y) > 4
 }
 
+/// Every Participants panel in the window: expansion opens the full list
+/// beside (or over) the short one, and virtualized roots swap on scroll, so
+/// a panel reference held across iterations goes stale. Callers re-resolve
+/// through here and read from the fullest panel — rows dedup by key, so the
+/// only cost of switching is re-reading overlap.
+func fullestRosterPanel(in window: AXUIElement) -> AXUIElement? {
+    var panels: [AXUIElement] = []
+    func collect(_ element: AXUIElement, depth: Int) {
+        guard depth < 80 else { return }
+        if axDescription(element) == "Participants" { panels.append(element); return }
+        for child in axChildren(element) { collect(child, depth: depth + 1) }
+    }
+    collect(window, depth: 0)
+    return panels.max(by: { rosterPeople(in: $0).count < rosterPeople(in: $1).count })
+}
+
 /// Open the full attendee list. Success is that the control has gone, not
 /// that its label changed: labels here drift on their own as people come and
 /// go, and treating a drifting label as progress is exactly how the old pager
@@ -1651,6 +1667,19 @@ func pressRosterExpander(_ expander: (element: AXUIElement, text: String),
     if let row {
         AXUIElementPerformAction(row, kAXPressAction as CFString)
         usleep(1_000_000)
+        if opened() { return true }
+    }
+    // Click what the user would click: the expander text itself, at its own
+    // frame. The pressable-ancestor fallback below can land on a huge
+    // container whose center does nothing, and the row above does not always
+    // offer AXPress (measured live: an AXRow with no Press action, press
+    // always failing, roster stuck at the first viewport).
+    let (eorigin, esize) = axFrame(expander.element)
+    if esize.width > 0 && esize.height > 0 {
+        bringToFront(pid: pid, window: window)
+        clickThroughWindowServer(at: CGPoint(x: eorigin.x + esize.width / 2,
+                                             y: eorigin.y + esize.height / 2))
+        usleep(1_200_000)
         if opened() { return true }
     }
     var pressable: AXUIElement? = expander.element
@@ -1779,7 +1808,7 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
             resized = axSetSize(window, CGSize(width: originalSize.width,
                                                height: display.maxY - windowFrame.origin.y))
             usleep(800_000)
-            panel = rosterPanel(in: window) ?? panel
+            panel = fullestRosterPanel(in: window) ?? panel
             mergeViewport()
         }
 
@@ -1799,9 +1828,14 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
         for _ in 0..<400 {
             if let expected, seen.count >= expected { break }
             if let deadline, Date() >= deadline { break }
+            // The tree moves under us — expansion opens new panels and
+            // virtualized roots swap on scroll — so never search a held
+            // reference; re-resolve and read from the fullest panel.
+            panel = fullestRosterPanel(in: window) ?? panel
             if let expander = rosterExpander(in: panel),
                pressRosterExpander(expander, panel: panel, window: window, pid: pid) {
                 stale = 0
+                panel = fullestRosterPanel(in: window) ?? panel
                 mergeViewport()
                 continue
             }
