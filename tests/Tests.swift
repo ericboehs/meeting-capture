@@ -1033,6 +1033,31 @@ do {
                                bundle: "/Applications/Slack.app/Contents/Frameworks/Slack Helper.app"),
                "Slack Helper is not the meeting UI")
 
+    // Huddle window: found by its Leave button, so every secondary window is
+    // a candidate — a DM huddle reported no "Huddle" in its AX title at all.
+    let ws = "VA OIT VA.gov Teams | Platforms | AI | Products"
+    expectEqual(slackHuddleCandidates(titles: [
+                    "Travis Taylor (DM) - \(ws) - Slack [Main] \u{1F3E0}\u{1F50A}",
+                    "- \(ws) - Slack",
+                    "Travis Taylor - \(ws) - Slack",
+                ]), [1, 2], "DM huddle window is a candidate; main window skipped")
+    expectEqual(slackHuddleCandidates(titles: [
+                    "general - \(ws) - Slack [Main]",
+                    "- \(ws) - Slack",
+                    "Huddle: #eert - \(ws) - Slack \u{1F3A4}",
+                ]), [2, 1], "Huddle-titled windows are searched first")
+    expectEqual(slackHuddleCandidates(titles: ["x - Slack [Main]"]), [],
+                "main window alone means no search")
+
+    expectEqual(slackHuddleTitle("Huddle: #eert - \(ws) - Slack \u{1F3A4}"), "#eert",
+                "channel huddle title")
+    expectEqual(slackHuddleTitle("Huddle with Travis Taylor"), "Travis Taylor",
+                "DM huddle title as drawn")
+    expectEqual(slackHuddleTitle("Travis Taylor - \(ws) - Slack"), "Travis Taylor",
+                "DM huddle title as AX reports it")
+    expectEqual(slackHuddleTitle("- \(ws) - Slack"), "Slack huddle",
+                "empty name falls back")
+
     let zoom = "zoom.us.app/Contents/MacOS/zoom.us"
     expectTrue(processMatches(pattern: zoom,
                               executable: "/Applications/zoom.us.app/Contents/MacOS/zoom.us",

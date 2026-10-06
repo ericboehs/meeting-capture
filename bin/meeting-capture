@@ -2370,6 +2370,33 @@ final class TeamsApp: MeetingApp {
 
 // MARK: - Slack
 
+/// Which Slack windows might hold a huddle, in the order to search them:
+/// "Huddle…"-titled windows first (the cheap, common case), then any other
+/// secondary window. The main workspace window, marked "[Main]", is skipped —
+/// its tree is huge and a popped-out huddle never lives there.
+func slackHuddleCandidates(titles: [String]) -> [Int] {
+    let eligible = titles.indices.filter { !titles[$0].contains("[Main]") }
+    let huddles = eligible.filter { titles[$0].hasPrefix("Huddle") }
+    return huddles + eligible.filter { !huddles.contains($0) }
+}
+
+/// A meeting name from a huddle window title. Observed forms:
+///   "Huddle: #channel - Workspace - Slack \u{1F3A4}"
+///   "Huddle with Travis Taylor"
+///   "Travis Taylor - Workspace - Slack"
+/// Keep the channel or person, drop the prefix and trailing chrome.
+func slackHuddleTitle(_ raw: String) -> String {
+    var title = raw
+    for prefix in ["Huddle: ", "Huddle with "] where title.hasPrefix(prefix) {
+        title = String(title.dropFirst(prefix.count))
+    }
+    var parts = (" " + title).components(separatedBy: " - ")
+    if parts.count > 1, parts.last!.hasPrefix("Slack") { parts.removeLast() }
+    if parts.count > 1 { parts.removeLast() }  // the workspace
+    let name = parts.joined(separator: " - ").trimmingCharacters(in: .whitespaces)
+    return name.isEmpty ? "Slack huddle" : name
+}
+
 // Slack is Electron: its tree starts switched off until woken, and its
 // controls then carry DOM ids ("captions" tab) or AXIdentifier-style labels;
 // its caption overlay is found by class list. All serve as anchors.
@@ -2406,33 +2433,50 @@ final class SlackApp: MeetingApp {
     /// would collapse a repeated phrase into one utterance.
     private var history = SegmentHistory()
 
-    /// A huddle gets its own window, and the Leave button only exists while
-    /// one is up. Search that window only: walking the whole Slack workspace
-    /// every two seconds, looking for a huddle that is not happening, is why
-    /// a sitting-open Slack showed up as 10–27% of a core.
+    /// The Leave button only exists while a huddle is up, so it — not the
+    /// window title — is what identifies the huddle window. Titles proved
+    /// unreliable: channel huddles read "Huddle: #channel - …", but a DM
+    /// huddle's window reported "Travis Taylor - Workspace - Slack" over AX.
     func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
         guard let window = huddleWindow(app) else { return nil }
-        return findElement(from: window) {
+        return leaveButton(in: window)
+    }
+
+    func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String {
+        guard let window = huddleWindow(app) else { return "Slack huddle" }
+        return slackHuddleTitle(axString(window, kAXTitleAttribute))
+    }
+
+    /// The window last found holding a huddle, checked first so a running
+    /// huddle costs one subtree walk per poll rather than one per window.
+    private var cachedHuddleWindow: AXUIElement?
+
+    private func leaveButton(in window: AXUIElement) -> AXUIElement? {
+        findElement(from: window) {
             axString($0, kAXRoleAttribute) == kAXButtonRole
                 && axDescription($0) == leaveDescription
         }
     }
 
-    /// The window is titled "Huddle: #channel - Workspace - Slack \u{1F3A4}". Keep the
-    /// channel, drop the decoration.
-    func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String {
-        guard let window = huddleWindow(app) else { return "Slack huddle" }
-        var title = axString(window, kAXTitleAttribute)
-        if let range = title.range(of: "Huddle: ") { title = String(title[range.upperBound...]) }
-        // Trailing " - Workspace - Slack \u{1F3A4}" is chrome, not part of the name.
-        if let dash = title.range(of: " - ", options: .backwards) { title = String(title[..<dash.lowerBound]) }
-        title = title.trimmingCharacters(in: .whitespaces)
-        return title.isEmpty ? "Slack huddle" : title
-    }
-
+    /// Search the huddle-looking windows only, never the main workspace
+    /// window: walking the whole workspace every two seconds, looking for a
+    /// huddle that is not happening, is why a sitting-open Slack showed up as
+    /// 10–27% of a core.
     private func huddleWindow(_ app: AXUIElement) -> AXUIElement? {
-        let windows = axAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
-        return windows.first { axString($0, kAXTitleAttribute).hasPrefix("Huddle:") }
+        let windows = axWindows(app)
+        if let cached = cachedHuddleWindow,
+           windows.contains(where: { CFEqual($0, cached) }),
+           leaveButton(in: cached) != nil {
+            return cached
+        }
+        cachedHuddleWindow = nil
+        let titles = windows.map { axString($0, kAXTitleAttribute) }
+        for index in slackHuddleCandidates(titles: titles)
+        where leaveButton(in: windows[index]) != nil {
+            cachedHuddleWindow = windows[index]
+            return windows[index]
+        }
+        return nil
     }
 
     private func captionsTab(_ app: AXUIElement) -> AXUIElement? {
