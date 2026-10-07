@@ -327,11 +327,17 @@ func windowLayer(pid: pid_t, frame: (origin: CGPoint, size: CGSize)) -> Int? {
 /// process (`postToPid`) — the button reports success and nothing happens — so
 /// a real click is the only thing that works on its caption controls. The
 /// caller is responsible for putting the pointer and the front app back.
-func clickThroughWindowServer(at point: CGPoint) {
+///
+/// `abortIf` is asked once the pointer has arrived — the last moment before
+/// anything is pressed — and a true answer sends no click. Use verifiedClick,
+/// which supplies it, rather than calling this directly.
+@discardableResult
+func clickThroughWindowServer(at point: CGPoint, abortIf abort: () -> Bool = { false }) -> Bool {
     let source = CGEventSource(stateID: .combinedSessionState)
     CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
             mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
     usleep(150_000)
+    if abort() { return false }
     let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
                        mouseCursorPosition: point, mouseButton: .left)
     let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp,
@@ -341,6 +347,7 @@ func clickThroughWindowServer(at point: CGPoint) {
     down?.post(tap: .cghidEventTap)
     usleep(80_000)
     up?.post(tap: .cghidEventTap)
+    return true
 }
 
 /// Make an app genuinely frontmost before a real click or shortcut. Merely
@@ -350,7 +357,7 @@ func clickThroughWindowServer(at point: CGPoint) {
 /// permission this tool already requires.
 @discardableResult
 func bringToFront(pid: pid_t, window: AXUIElement? = nil) -> NSRunningApplication? {
-    let prior = NSWorkspace.shared.frontmostApplication
+    let prior = frontApplication()
     let app = AXUIElementCreateApplication(pid)
     AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
     if let window { AXUIElementPerformAction(window, kAXRaiseAction as CFString) }
@@ -362,6 +369,219 @@ func restoreFrontmost(_ prior: NSRunningApplication?) {
     guard let prior else { return }
     let app = AXUIElementCreateApplication(prior.processIdentifier)
     AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+}
+
+// MARK: - Where synthetic input lands
+//
+// A real click or wheel goes to whatever window is on top at that point, not
+// to the app that asked for it. Fronting an app is only a request macOS can
+// refuse, a streaming list can move a button between finding it and pressing
+// it, the screen can lock mid-meeting, and a person can switch apps with the
+// keyboard at any moment. So every synthetic click and scroll proves,
+// immediately before it is sent, that it will land in the window it is meant
+// for — and sends nothing otherwise. (The same discipline as wrangle's
+// revalidation before dispatch.) A skipped attempt comes round again; a click
+// in someone else's window cannot be taken back.
+
+func sessionLocked() -> Bool {
+    let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+    return (session?["CGSSessionScreenIsLocked"] as? Bool) == true
+}
+
+/// The app the keyboard belongs to, asked of the accessibility system on
+/// every call. NSWorkspace learns about activations from notifications
+/// delivered on the main run loop — Apple documents this for
+/// runningApplications — and this daemon never runs one, so its answer may
+/// be stale.
+func focusedApplicationPID() -> pid_t? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(),
+                                        kAXFocusedApplicationAttribute as CFString, &value) == .success,
+          let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+    var pid: pid_t = 0
+    return AXUIElementGetPid(value as! AXUIElement, &pid) == .success ? pid : nil
+}
+
+/// The app in front now, to put back afterwards. Prefers the accessibility
+/// system's live answer, and says (once per pair) when NSWorkspace disagrees —
+/// that line is the evidence for whether NSWorkspace goes stale here.
+func frontApplication() -> NSRunningApplication? {
+    let workspace = NSWorkspace.shared.frontmostApplication
+    guard let pid = focusedApplicationPID(),
+          let live = NSRunningApplication(processIdentifier: pid) else { return workspace }
+    if let workspace, workspace.processIdentifier != pid {
+        let stale = workspace.localizedName ?? "pid \(workspace.processIdentifier)"
+        let actual = live.localizedName ?? "pid \(pid)"
+        InputLog.note("NSWorkspace says \(stale) is in front, the accessibility system says \(actual); "
+                      + "putting back \(actual)", every: .infinity)
+    }
+    return live
+}
+
+/// Nil when `pid` has the keyboard, otherwise who does.
+func frontmostRefusal(_ pid: pid_t) -> InputRefusal? {
+    if let focused = focusedApplicationPID() {
+        if focused == pid { return nil }
+        return .notFrontmost(NSRunningApplication(processIdentifier: focused)?.localizedName ?? "another app")
+    }
+    let app = AXUIElementCreateApplication(pid)
+    if (axAttribute(app, kAXFrontmostAttribute) as? NSNumber)?.boolValue == true { return nil }
+    return .notFrontmost("another app")
+}
+
+/// One window as the window server lists it.
+struct ScreenWindow: Equatable {
+    let pid: pid_t
+    let owner: String
+    let layer: Int
+    let alpha: Double
+    let bounds: CGRect
+}
+
+/// Every on-screen window, frontmost first: the order the window server uses
+/// to decide which window input at a point belongs to.
+func screenWindows() -> [ScreenWindow] {
+    let listed = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                            kCGNullWindowID) as? [[String: Any]] ?? []
+    return listed.compactMap { window in
+        guard let pid = window[kCGWindowOwnerPID as String] as? pid_t,
+              let layer = window[kCGWindowLayer as String] as? Int,
+              let bounds = window[kCGWindowBounds as String] as? [String: CGFloat],
+              let x = bounds["X"], let y = bounds["Y"],
+              let width = bounds["Width"], let height = bounds["Height"] else { return nil }
+        return ScreenWindow(pid: pid, owner: window[kCGWindowOwnerName as String] as? String ?? "an unnamed app",
+                            layer: layer, alpha: window[kCGWindowAlpha as String] as? Double ?? 1,
+                            bounds: CGRect(x: x, y: y, width: width, height: height))
+    }
+}
+
+/// From the screen saver's level up, windows belong to the system — the lock
+/// screen's shields, the cursor — and are listed above every app even when
+/// they show nothing. Measured on a locked Mac: loginwindow at 2001–2004 and
+/// Window Server at 2147483646, all full-screen. Skipping them judges the app
+/// windows on their own; the lock, when they do matter, is checked separately.
+let systemWindowLevel = Int(CGWindowLevelForKey(.screenSaverWindow))
+
+/// The window input at `point` would land in: the frontmost visible window
+/// containing it, below the system's levels. Pure, so it is testable.
+func windowUnder(_ point: CGPoint, in windows: [ScreenWindow]) -> ScreenWindow? {
+    windows.first {
+        $0.layer >= 0 && $0.layer < systemWindowLevel && $0.alpha > 0 && $0.bounds.contains(point)
+    }
+}
+
+/// AX and the window server describe the same window to within a point. Two
+/// points of slack, as wrangle allows, rather than demanding exact equality.
+func framesMatch(_ first: CGRect, _ second: CGRect, tolerance: CGFloat = 2) -> Bool {
+    abs(first.minX - second.minX) <= tolerance && abs(first.minY - second.minY) <= tolerance
+        && abs(first.width - second.width) <= tolerance && abs(first.height - second.height) <= tolerance
+}
+
+/// Why synthetic input was not sent. Each is a reason to stand down for now.
+enum InputRefusal: Equatable, CustomStringConvertible {
+    case locked
+    case notFrontmost(String)
+    case noFrame
+    case outsideWindow
+    case offscreen
+    case covered(String)
+
+    var description: String {
+        switch self {
+        case .locked: return "the screen is locked"
+        case .notFrontmost(let app): return "macOS kept \(app) in front"
+        case .noFrame: return "it has no place on screen"
+        case .outsideWindow: return "it lies outside its window"
+        case .offscreen: return "its window is not on screen here"
+        case .covered(let other): return "\(other) is on top of it"
+        }
+    }
+}
+
+/// Would input at `point` land in the window with frame `windowFrame`, owned
+/// by `pid`? Nil means yes. Pure, so it is testable.
+func inputRefusal(at point: CGPoint, pid: pid_t, windowFrame: CGRect,
+                  windows: [ScreenWindow]) -> InputRefusal? {
+    guard windowFrame.width > 0, windowFrame.height > 0 else { return .offscreen }
+    guard windowFrame.contains(point) else { return .outsideWindow }
+    guard let under = windowUnder(point, in: windows) else { return .offscreen }
+    if under.pid == pid, framesMatch(under.bounds, windowFrame) { return nil }
+    return .covered(under.pid == pid ? "another \(under.owner) window" : under.owner)
+}
+
+/// The same question asked of the screen as it is right now.
+func liveInputRefusal(at point: CGPoint, in window: AXUIElement, pid: pid_t) -> InputRefusal? {
+    if sessionLocked() { return .locked }
+    let (origin, size) = axFrame(window)
+    return inputRefusal(at: point, pid: pid, windowFrame: CGRect(origin: origin, size: size),
+                        windows: screenWindows())
+}
+
+/// Bring the app forward and wait, briefly, until it really is in front.
+func frontAndConfirm(pid: pid_t, window: AXUIElement) -> InputRefusal? {
+    if sessionLocked() { return .locked }
+    bringToFront(pid: pid, window: window)
+    var refusal = frontmostRefusal(pid)
+    for _ in 0..<4 where refusal != nil {
+        usleep(150_000)
+        refusal = frontmostRefusal(pid)
+    }
+    return refusal
+}
+
+/// Click `element`, inside `window`, through the window server — but only
+/// after proving the click will land there. Right before pressing, the
+/// screen must be unlocked, the app must really be in front, and the window
+/// server must agree the point belongs to this very window: not something
+/// covering it, not another Space, not another of the app's own windows. The
+/// element's frame is read after fronting, so a raise, a widen or a
+/// streaming list cannot move it out from under the click, and everything is
+/// asked once more after the pointer arrives. Otherwise nothing is clicked,
+/// the reason is logged, and the caller's next attempt comes later.
+@discardableResult
+func verifiedClick(_ element: AXUIElement, in window: AXUIElement, pid: pid_t, what: String) -> Bool {
+    func refuse(_ reason: InputRefusal) -> Bool {
+        InputLog.note("did not click \(what): \(reason)")
+        return false
+    }
+    if let reason = frontAndConfirm(pid: pid, window: window) { return refuse(reason) }
+    let (origin, size) = axFrame(element)
+    guard size.width > 0, size.height > 0 else { return refuse(.noFrame) }
+    let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
+    if let reason = liveInputRefusal(at: point, in: window, pid: pid) { return refuse(reason) }
+    var late: InputRefusal?
+    let clicked = clickThroughWindowServer(at: point, abortIf: {
+        late = liveInputRefusal(at: point, in: window, pid: pid) ?? frontmostRefusal(pid)
+        return late != nil
+    })
+    if let late { return refuse(late) }
+    return clicked
+}
+
+/// Admits a given message at most once per interval. Pure, so it is testable.
+struct RepeatFilter {
+    private var lastAdmitted: [String: Date] = [:]
+
+    mutating func admit(_ message: String, at now: Date, every interval: TimeInterval) -> Bool {
+        if let last = lastAdmitted[message], now.timeIntervalSince(last) < interval { return false }
+        lastAdmitted[message] = now
+        return true
+    }
+}
+
+/// Where refused input is reported. A roster read can meet the same refusal
+/// hundreds of times, so each message is logged at most once a minute. Shared
+/// by the poll thread and the roster's background thread, hence the lock.
+enum InputLog {
+    private static let lock = NSLock()
+    private static var filter = RepeatFilter()
+
+    static func note(_ message: String, every interval: TimeInterval = 60) {
+        lock.lock()
+        let admitted = filter.admit(message, at: Date(), every: interval)
+        lock.unlock()
+        if admitted { status(message) }
+    }
 }
 
 /// One automated interaction at a time, process-wide.
@@ -1598,17 +1818,29 @@ func rosterCount(in panel: AXUIElement) -> Int? {
 
 /// One overlapping virtualized-list step. Pixel wheel deltas are what
 /// Chromium accepts; line deltas changed clipping without advancing rows.
-/// Scroll the roster, and report where the pointer was parked to do it.
-@discardableResult
-func scrollRoster(_ panel: AXUIElement, direction: Int32) -> CGPoint {
+/// Scroll the roster, and report where the pointer was parked to do it — or
+/// nil, sending nothing more, once the meeting window is no longer what is
+/// under that point. A wheel goes to whatever window is there, and the
+/// pointer check below only notices a hand on the mouse: someone who
+/// switches apps with the keyboard leaves the pointer parked over THEIR
+/// window, and the next wheel would scroll it.
+func scrollRoster(_ panel: AXUIElement, direction: Int32,
+                  in window: AXUIElement, pid: pid_t) -> CGPoint? {
     let root = findElement(from: panel, where: { axDescription($0) == "Attendees" }) ?? panel
     let (origin, size) = axFrame(root)
     let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height * 0.6)
+    func blocked() -> Bool {
+        guard let reason = liveInputRefusal(at: point, in: window, pid: pid) else { return false }
+        InputLog.note("stopped scrolling Teams' attendee list: \(reason)")
+        return true
+    }
+    if blocked() { return nil }
     let source = CGEventSource(stateID: .combinedSessionState)
     CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
             mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
     usleep(150_000)
     for _ in 0..<2 {
+        if blocked() { return nil }
         let wheel = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
                             wheelCount: 1, wheel1: direction * 350, wheel2: 0, wheel3: 0)
         wheel?.location = point
@@ -1673,12 +1905,12 @@ func pressRosterExpander(_ expander: (element: AXUIElement, text: String),
     // frame. The pressable-ancestor fallback below can land on a huge
     // container whose center does nothing, and the row above does not always
     // offer AXPress (measured live: an AXRow with no Press action, press
-    // always failing, roster stuck at the first viewport).
-    let (eorigin, esize) = axFrame(expander.element)
-    if esize.width > 0 && esize.height > 0 {
-        bringToFront(pid: pid, window: window)
-        clickThroughWindowServer(at: CGPoint(x: eorigin.x + esize.width / 2,
-                                             y: eorigin.y + esize.height / 2))
+    // always failing, roster stuck at the first viewport). The frame is read
+    // inside verifiedClick, after fronting: rows keep streaming in, and one
+    // read before the 350ms front can be a row out of date.
+    let expanderSize = axFrame(expander.element).size
+    if expanderSize.width > 0 && expanderSize.height > 0,
+       verifiedClick(expander.element, in: window, pid: pid, what: "Teams' attendee list expander") {
         usleep(1_200_000)
         if opened() { return true }
     }
@@ -1687,11 +1919,9 @@ func pressRosterExpander(_ expander: (element: AXUIElement, text: String),
           !axActionNames(element).contains(kAXPressAction) {
         pressable = axParent(element)
     }
-    guard let pressable else { return false }
-    bringToFront(pid: pid, window: window)
-    let (origin, size) = axFrame(pressable)
-    clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
-                                         y: origin.y + size.height / 2))
+    guard let pressable,
+          verifiedClick(pressable, in: window, pid: pid, what: "the control around Teams' attendee list expander")
+    else { return false }
     usleep(1_200_000)
     return opened()
 }
@@ -1730,28 +1960,32 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
     guard let window = meetingWindow else {
         return .failed("no Microsoft Teams meeting is running")
     }
+    // A locked screen takes every click itself. Nothing is fronted or spent
+    // while it lasts; the next quiet moment after unlocking gets a turn.
+    if sessionLocked() { return .deferred("the screen is locked") }
     // Clicking a window on another Space would drag the user's screen over to
     // it. Wait for a moment when the window is actually here.
     guard windowLayer(pid: pid, frame: axFrame(window)) != nil else {
         return .deferred("the meeting window is not on this Space")
     }
 
-    let priorApp = NSWorkspace.shared.frontmostApplication
+    let priorApp = frontApplication()
     let priorPointer = CGEvent(source: nil)?.location
     let originalSize = axFrame(window).size
     let panelExisted = rosterPanel(in: window) != nil
     var resized = false
     var mustClosePanel = false
 
-    func togglePanel() {
+    /// False only when a click was refused as unsafe. A missing button is
+    /// left to the polling below, as it always was.
+    @discardableResult
+    func togglePanel() -> Bool {
         guard let roster = findElement(from: window, where: {
             axDomID($0) == "roster-button"
-        }) else { return }
-        bringToFront(pid: pid, window: window)
-        let (origin, size) = axFrame(roster)
-        clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
-                                             y: origin.y + size.height / 2))
+        }) else { return true }
+        guard verifiedClick(roster, in: window, pid: pid, what: "Teams' People button") else { return false }
         usleep(700_000)
+        return true
     }
     // Every exit path leaves the meeting exactly as it was found.
     defer {
@@ -1771,15 +2005,21 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
         for _ in 0..<6 where rosterPanel(in: window) != nil { usleep(300_000) }
     }
     var opened = false
+    // A refused click is not retried here: whatever kept it from being safe
+    // (another app in front, something on top of the button) is still true a
+    // second later, and each try would take the front app again. The
+    // attempt fails, bounded by the snapshot's own retry limit.
+    var refused = false
     for _ in 0..<3 where !opened {
-        togglePanel()
+        guard togglePanel() else { refused = true; break }
         for _ in 0..<8 {
             if rosterPanel(in: window) != nil { opened = true; break }
             usleep(350_000)
         }
     }
     guard opened, var panel = rosterPanel(in: window) else {
-        return .failed("the People panel did not open")
+        return .failed(refused ? "clicking the People button was not safe (see the line above)"
+                               : "the People panel did not open")
     }
     // Leave it open only if that is how it was found.
     mustClosePanel = !panelExisted
@@ -1839,7 +2079,8 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
                 mergeViewport()
                 continue
             }
-            var parked = scrollRoster(panel, direction: -1)
+            guard var parked = scrollRoster(panel, direction: -1, in: window, pid: pid)
+            else { interrupted = true; break }
             usleep(450_000)
             var gained = mergeViewport()
             if pointerTakenBack(from: parked) { interrupted = true; break }
@@ -1847,7 +2088,9 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
                 // Apparently the bottom. Wait for the fetch this scroll has
                 // most likely just asked for, then nudge it again.
                 usleep(1_400_000)
-                parked = scrollRoster(panel, direction: -1)
+                guard let nudged = scrollRoster(panel, direction: -1, in: window, pid: pid)
+                else { interrupted = true; break }
+                parked = nudged
                 usleep(600_000)
                 gained = mergeViewport()
                 if pointerTakenBack(from: parked) { interrupted = true; break }
@@ -1862,7 +2105,8 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
         // the downward pass, and brings the title row back into the tree.
         stale = 0
         for _ in 0..<80 where stale < 3 && !interrupted {
-            let parked = scrollRoster(panel, direction: 1)
+            guard let parked = scrollRoster(panel, direction: 1, in: window, pid: pid)
+            else { interrupted = true; break }
             usleep(300_000)
             stale = mergeViewport() == 0 ? stale + 1 : 0
             if pointerTakenBack(from: parked) { interrupted = true }
@@ -1871,7 +2115,7 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
         // Nothing to show for an interrupted read is worth retrying rather
         // than recording; a partial one is worth keeping, and says so.
         if interrupted, people.isEmpty {
-            return .deferred("the pointer was needed elsewhere")
+            return .deferred("the pointer or the meeting window was needed elsewhere")
         }
     }
 
@@ -2141,7 +2385,7 @@ final class TeamsApp: MeetingApp {
         // Nothing to pop out until the panel exists.
         guard findElement(from: app, where: { captionPanelIDs.contains(axDomID($0)) }) != nil
             || findElement(from: app, where: isCaptionEntry) != nil else { return }
-        guard popOutAttempts < 2, now >= nextPopOutAttempt else { return }
+        guard popOutAttempts < 2, now >= nextPopOutAttempt, !sessionLocked() else { return }
         popOutAttempts += 1
         nextPopOutAttempt = now.addingTimeInterval(60)
         popOutCaptions(app, pid: pid)
@@ -2161,7 +2405,7 @@ final class TeamsApp: MeetingApp {
             unminimize(window)
             return
         }
-        guard chatPopOutAttempts < 2, now >= nextChatPopOutAttempt else { return }
+        guard chatPopOutAttempts < 2, now >= nextChatPopOutAttempt, !sessionLocked() else { return }
         chatPopOutAttempts += 1
         nextChatPopOutAttempt = now.addingTimeInterval(60)
         popOutChat(app, pid: pid)
@@ -2169,10 +2413,13 @@ final class TeamsApp: MeetingApp {
 
     /// Open the chat panel if it is closed, then press the button in its
     /// header that gives it a window. Both are real clicks for the same
-    /// reason as the captions pop-out: Teams' WebView ignores AXPress.
+    /// reason as the captions pop-out: Teams' WebView ignores AXPress. Both
+    /// are looked for in the meeting window, since that is the window each
+    /// click is verified against.
     private func popOutChat(_ app: AXUIElement, pid: pid_t) {
+        guard let window = standardWindow(app) else { return }
         let priorPointer = CGEvent(source: nil)?.location
-        let priorApp = bringToFront(pid: pid, window: standardWindow(app))
+        let priorApp = bringToFront(pid: pid, window: window)
         defer {
             if let priorPointer {
                 CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
@@ -2181,14 +2428,14 @@ final class TeamsApp: MeetingApp {
             restoreFrontmost(priorApp)
         }
 
-        var panel = findElement(from: app) { axDomID($0) == chatPanelID }
+        var panel = findElement(from: window) { axDomID($0) == chatPanelID }
         if panel == nil {
-            guard let chatButton = findElement(from: app, where: { axDomID($0) == chatButtonID })
+            guard let chatButton = findElement(from: window, where: { axDomID($0) == chatButtonID }),
+                  verifiedClick(chatButton, in: window, pid: pid, what: "Teams' chat button")
             else { return }
-            press(chatButton)
             for _ in 0..<10 where panel == nil {
                 usleep(400_000)
-                panel = findElement(from: app) { axDomID($0) == chatPanelID }
+                panel = findElement(from: window) { axDomID($0) == chatPanelID }
             }
         }
         guard let panel else {
@@ -2203,20 +2450,13 @@ final class TeamsApp: MeetingApp {
             status("could not find Teams' chat pop-out control; chat will be read from the meeting window")
             return
         }
-        press(button)
+        guard verifiedClick(button, in: window, pid: pid, what: "Teams' chat pop-out control") else { return }
         for _ in 0..<12 {
             usleep(500_000)
             guard chatWindow(app) != nil else { continue }
             status("opened Teams' meeting chat in its own window")
             return
         }
-    }
-
-    /// Click an element where it sits on screen.
-    private func press(_ element: AXUIElement) {
-        let (origin, size) = axFrame(element)
-        clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
-                                             y: origin.y + size.height / 2))
     }
 
     /// Tuck a pop-out window off the edge of the second display, leaving a
@@ -2275,12 +2515,15 @@ final class TeamsApp: MeetingApp {
             restoreFrontmost(priorApp)
         }
 
-        guard let button else {
+        // Found before any widening, and up to three seconds ago: Teams
+        // reflows its toolbar as the window grows. Find it again now, in the
+        // window the click is verified against, rather than press a held one.
+        guard button != nil,
+              let target = findElement(from: window, where: { axDomID($0) == popOutButtonID }) else {
             status("could not find Teams' captions pop-out control; captions will pause whenever the meeting window is fully covered")
             return
         }
-        let (origin, size) = axFrame(button)
-        clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2))
+        guard verifiedClick(target, in: window, pid: pid, what: "Teams' captions pop-out control") else { return }
         for _ in 0..<12 {
             usleep(500_000)
             if let popped = captionsWindow(app) {
@@ -2321,11 +2564,9 @@ final class TeamsApp: MeetingApp {
         for _ in 0..<2 {
             usleep(300_000)
             guard let layer = windowLayer(pid: pid, frame: axFrame(window)), layer > 0,
-                  let button = findElement(from: window, where: { axDomID($0) == pinButtonID })
+                  let button = findElement(from: window, where: { axDomID($0) == pinButtonID }),
+                  verifiedClick(button, in: window, pid: pid, what: "the pin on Teams' captions window")
             else { return }
-            let (origin, size) = axFrame(button)
-            clickThroughWindowServer(at: CGPoint(x: origin.x + size.width / 2,
-                                                 y: origin.y + size.height / 2))
         }
     }
 
@@ -3106,15 +3347,31 @@ func captureMeetRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
         let (origin, size) = axFrame(panel)
         let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
         let priorPointer = CGEvent(source: nil)?.location
+        // A wheel goes to whatever window is under the pointer, and this path
+        // never brings Meet forward — so scroll only while Meet's own window
+        // is what is there. Covered, on another Space, or the screen locked,
+        // and the list stays short and says so rather than scroll someone
+        // else's window.
+        var blocked = false
+        func mayScroll() -> Bool {
+            guard !blocked else { return false }
+            if let reason = liveInputRefusal(at: point, in: window, pid: pid) {
+                InputLog.note("stopped scrolling Google Meet's participant list: \(reason)")
+                blocked = true
+            }
+            return !blocked
+        }
         var stale = 0
         for _ in 0..<80 {
             if seen.count >= need { break }
             if let deadline, Date() >= deadline { break }
+            guard mayScroll() else { break }
             scrollWheel(at: point, direction: -1)
             stale = merge() == 0 ? stale + 1 : 0
             if stale >= 4 { break }
         }
         for _ in 0..<80 where stale < 4 {
+            guard mayScroll() else { break }
             scrollWheel(at: point, direction: 1)
             stale = merge() == 0 ? stale + 1 : 0
         }

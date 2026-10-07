@@ -136,10 +136,13 @@ screen to it — it just looks again every couple of seconds, and after twenty
 minutes of never finding a gap it says so rather than leaving a silent hole.
 
 That is all Teams' price, not Meet's. Meet's side panel answers AXPress, so
-nothing is taken from you at all: no window comes forward, no pointer moves,
-no window is resized, and the snapshot does not wait for a lull. It opens the
-panel, reads the list, and puts back whatever the side panel was showing —
-including the chat panel, which shares that space.
+nothing is taken from you: no window comes forward, no window is resized, and
+the snapshot does not wait for a lull. It opens the panel, reads the list, and
+puts back whatever the side panel was showing — including the chat panel,
+which shares that space. The one exception is a fallback for a list that shows
+fewer names than its own head count (never yet needed; at 59 people the list
+was complete at rest): it parks the pointer over the list to scroll it, and
+only while Meet's own window is what is under the pointer.
 
 A large roster is expanded on a background thread, so captions keep being
 recorded the whole time it works. Teams' long list is a slow trickle rather
@@ -160,7 +163,10 @@ Because a patient read can run for a minute, it gives the pointer back the
 moment you want it. Idle clocks cannot tell it apart from us once we are the
 ones moving the pointer, so it watches position instead: it parks the pointer
 precisely to scroll, and anything else moving it is a person. It then stops,
-keeps what it has, and retries later.
+keeps what it has, and retries later. It stops the same way when the meeting
+window is no longer what is under the parked pointer — switching apps from the
+keyboard is enough — since a scroll goes to whatever window is there, and the
+next one would scroll yours.
 
 If people are still arriving and the names do not match the panel's head count,
 that partial list is the answer — the transcript says how short it is rather
@@ -290,6 +296,17 @@ bringing Teams to the front. The pointer and the previously frontmost app are
 put back afterwards. If the window is too narrow, Teams folds the pop-out
 control into an overflow menu that can't be opened through accessibility, so
 the window is widened for the click and set back to its old width.
+
+No real click is sent on hope. Fronting an app is only a request macOS can
+turn down, and a click goes to whatever window is on top at that point, so
+immediately before each one it confirms the screen is unlocked, Teams really
+did come to the front, and the window server would deliver the click to the
+meeting window itself — not a window covering the button, not another Space,
+not another Teams window. The control's position is read after fronting, and
+all of it is asked again once the pointer arrives. If anything fails, nothing
+is clicked, the log says why ("did not click Teams' captions pop-out control:
+macOS kept Slack in front"), and the next attempt comes later. A locked screen
+spends no attempts at all.
 
 Without the flag, a stalled call timer is reported in the log rather than left
 to look like a quiet meeting.

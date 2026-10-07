@@ -1413,6 +1413,79 @@ do {
     try? FileManager.default.removeItem(atPath: dir)
 }
 
+// --- Where synthetic input lands ---------------------------------------
+
+do {
+    let teams: pid_t = 100, other: pid_t = 200
+    let meeting = CGRect(x: 100, y: 100, width: 800, height: 600)
+    let button = CGPoint(x: 400, y: 650)
+    func window(_ pid: pid_t, _ owner: String, _ layer: Int, _ bounds: CGRect,
+                alpha: Double = 1) -> ScreenWindow {
+        ScreenWindow(pid: pid, owner: owner, layer: layer, alpha: alpha, bounds: bounds)
+    }
+    // Measured on a locked Mac: these are listed above every app window.
+    let shields = [
+        window(1, "Window Server", 2147483646, CGRect(x: 0, y: 0, width: 1440, height: 2560)),
+        window(2, "loginwindow", 2004, CGRect(x: 0, y: 0, width: 1440, height: 2560)),
+        window(2, "loginwindow", 2001, CGRect(x: -15000, y: -15000, width: 30000, height: 30000)),
+    ]
+    let meetingWindow = window(teams, "Microsoft Teams", 0, meeting)
+    func refusal(_ windows: [ScreenWindow], at point: CGPoint = button,
+                 frame: CGRect = meeting) -> InputRefusal? {
+        inputRefusal(at: point, pid: teams, windowFrame: frame, windows: windows)
+    }
+
+    expectEqual(systemWindowLevel, 1000, "system windows start at the screen saver's level")
+    expectEqual(windowUnder(button, in: shields + [meetingWindow]), meetingWindow,
+                "system shields listed above the apps are not what a click lands on")
+    expectEqual(refusal(shields + [meetingWindow]), nil, "the meeting window on top at the point: click")
+    expectEqual(windowUnder(button, in: [meetingWindow, window(other, "Slack", 0, meeting)]), meetingWindow,
+                "the frontmost window containing the point is the one that counts")
+
+    let slack = window(other, "Slack", 0, CGRect(x: 300, y: 500, width: 400, height: 400))
+    expectEqual(refusal([slack, meetingWindow]), .covered("Slack"),
+                "another app on top at the point refuses the click, by name")
+    let aside = window(other, "Slack", 0, CGRect(x: 1000, y: 100, width: 400, height: 400))
+    expectEqual(refusal([aside, meetingWindow]), nil, "a window elsewhere on screen is no obstacle")
+    let chat = window(teams, "Microsoft Teams", 0, CGRect(x: 350, y: 600, width: 300, height: 300))
+    expectEqual(refusal([chat, meetingWindow]), .covered("another Microsoft Teams window"),
+                "the app's own other window on top is still the wrong window")
+    let floating = window(other, "Zoom", 3, CGRect(x: 380, y: 630, width: 50, height: 50))
+    expectEqual(refusal([floating, meetingWindow]), .covered("Zoom"), "a floating window over the point refuses")
+    let pinned = window(teams, "Microsoft Teams", 3, meeting)
+    expectEqual(refusal([pinned]), nil, "a pinned (floating) target window is still the target")
+    expectEqual(refusal([window(other, "Overlay", 0, meeting, alpha: 0), meetingWindow]), nil,
+                "a fully transparent window is not counted")
+    expectEqual(refusal([window(other, "Desktop", -20, meeting), meetingWindow]), nil,
+                "a negative-layer window is not counted")
+
+    expectEqual(refusal([meetingWindow], at: CGPoint(x: 50, y: 50)), .outsideWindow,
+                "a target outside its own window is refused, not clicked through to whatever is there")
+    expectEqual(refusal(shields), .offscreen, "a window not on screen here (another Space) is refused")
+    expectEqual(refusal([meetingWindow], frame: .zero), .offscreen, "a window with no frame is refused")
+    expectEqual(refusal([window(teams, "Microsoft Teams", 0, meeting.offsetBy(dx: 2, dy: -2))]), nil,
+                "AX and the window server may disagree by two points")
+    expectEqual(refusal([window(teams, "Microsoft Teams", 0, meeting.offsetBy(dx: 3, dy: 0))]),
+                .covered("another Microsoft Teams window"), "three points apart is a different window")
+
+    expectEqual("\(InputRefusal.notFrontmost("Ghostty"))", "macOS kept Ghostty in front",
+                "a refusal reads as a reason in the log")
+    expectEqual("\(InputRefusal.covered("Slack"))", "Slack is on top of it", "covered names the coverer")
+}
+
+// --- RepeatFilter -------------------------------------------------------
+
+do {
+    var filter = RepeatFilter()
+    let t0 = Date(timeIntervalSince1970: 1_000)
+    expectTrue(filter.admit("a", at: t0, every: 60), "a first message is admitted")
+    expectTrue(!filter.admit("a", at: t0.addingTimeInterval(59), every: 60), "its repeat within the interval is held")
+    expectTrue(filter.admit("b", at: t0.addingTimeInterval(1), every: 60), "a different message is its own")
+    expectTrue(filter.admit("a", at: t0.addingTimeInterval(60), every: 60), "the same message after the interval")
+    expectTrue(filter.admit("once", at: t0, every: .infinity), "an infinite interval admits once")
+    expectTrue(!filter.admit("once", at: t0.addingTimeInterval(1e9), every: .infinity), "and never again")
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")
