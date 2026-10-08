@@ -216,6 +216,25 @@ do {
                 "a sibling that is not a suffix is not a chrome label")
 }
 
+// --- Teams chat classes ---------------------------------------------------
+// Class lists exactly as the live tree exposed them on 2026-10-08.
+
+do {
+    expectTrue(TeamsChatClasses.isBody(["fui-ChatMessage__body", "fui-Primitive"]),
+               "someone else's message body is chat")
+    expectTrue(TeamsChatClasses.isBody(["fui-ChatMyMessage__body"]),
+               "your own message body is chat too: Teams draws it with ChatMyMessage")
+    expectTrue(TeamsChatClasses.isAuthor(["fui-ChatMyMessage__author"]),
+               "and your own message has an author part to read the name from")
+    expectTrue(TeamsChatClasses.isAuthor(["fui-ChatMessage__author"]), "as everyone else's does")
+    expectTrue(!TeamsChatClasses.isBody(["fui-ChatMessageCompact__body"]),
+               "a caption is not a chat message")
+    expectTrue(!TeamsChatClasses.isBody(["fui-ChatControlMessage"]),
+               "nor is a control message such as someone joining")
+    expectTrue(!TeamsChatClasses.isBody(["fui-ChatMyMessage__timestamp", "fui-ChatMessage__author"]),
+               "nor any other part of a message")
+}
+
 // --- SegmentHistory -----------------------------------------------------
 // Caption surfaces without ids (Meet blocks, Slack overlay events) get their
 // identity from position in the conversation. Repeated utterances must stay

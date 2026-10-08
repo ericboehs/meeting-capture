@@ -2183,6 +2183,25 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
 
 // MARK: - Microsoft Teams
 
+/// Teams draws the meeting chat with Fluent UI's Chat components, and they
+/// come in two kinds: ChatMessage for everyone else and ChatMyMessage for
+/// your own, with the same parts (body, author, timestamp) under a different
+/// class prefix. Only the first was recognised, so every message you sent was
+/// silently skipped while everyone else's was recorded. Your own author part
+/// holds your display name, the same name Teams gives you in captions.
+///
+/// Captions are drawn with ChatMessageCompact, which must not count as chat.
+enum TeamsChatClasses {
+    private static let kinds = ["fui-ChatMessage__", "fui-ChatMyMessage__"]
+
+    static func isBody(_ classes: [String]) -> Bool { has("body", in: classes) }
+    static func isAuthor(_ classes: [String]) -> Bool { has("author", in: classes) }
+
+    private static func has(_ part: String, in classes: [String]) -> Bool {
+        classes.contains { name in kinds.contains { name == $0 + part } }
+    }
+}
+
 /// Teams renders its UI in a Chromium WebView, which exposes DOM ids and class
 /// lists through the accessibility tree, so we can anchor on those.
 ///
@@ -2228,7 +2247,10 @@ final class TeamsApp: MeetingApp {
     /// Opens the chat panel in the meeting window.
     private let chatButtonID = "chat-button"
     /// A rendered chat message. The panel can be open with none of them yet.
-    private let chatBodyClass = "fui-ChatMessage__body"
+    /// See TeamsChatClasses for why there are two kinds.
+    private func isChatBody(_ element: AXUIElement) -> Bool {
+        TeamsChatClasses.isBody(axClasses(element))
+    }
     /// The pop-out window's pin (⌃⌘T) control. Teams pops the window out
     /// pinned; see unpin for why it doesn't stay that way.
     private let pinButtonID = "window-always-on-top-button"
@@ -2385,7 +2407,7 @@ final class TeamsApp: MeetingApp {
     private func chatWindow(_ app: AXUIElement) -> AXUIElement? {
         axWindows(app).first { window in
             findElement(from: window, where: { axDomID($0) == "hangup-button" }) == nil
-                && findElement(from: window, where: { axClasses($0).contains(chatBodyClass) }) != nil
+                && findElement(from: window, where: isChatBody) != nil
         }
     }
 
@@ -2686,7 +2708,7 @@ final class TeamsApp: MeetingApp {
     func chatContainer(_ app: AXUIElement) -> AXUIElement? {
         func list(in root: AXUIElement) -> AXUIElement? {
             findElement(from: root, where: {
-                axDomID($0).hasPrefix("message-body-") && axClasses($0).contains(chatBodyClass)
+                axDomID($0).hasPrefix("message-body-") && isChatBody($0)
             }).flatMap { axParent($0).flatMap(axParent) }
         }
         if let window = chatWindow(app), let container = list(in: window) { return container }
@@ -2698,9 +2720,9 @@ final class TeamsApp: MeetingApp {
         return rows.compactMap { row -> ChatMessage? in
             let parts = axChildren(row)
             guard let body = parts.first(where: {
-                axClasses($0).contains(chatBodyClass) && axDomID($0).hasPrefix("message-body-")
+                isChatBody($0) && axDomID($0).hasPrefix("message-body-")
             }) else { return nil }
-            let author = parts.first { axClasses($0).contains("fui-ChatMessage__author") }.map { axText($0) } ?? ""
+            let author = parts.first { TeamsChatClasses.isAuthor(axClasses($0)) }.map { axText($0) } ?? ""
             let text = axText(body).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
             let id = String(axDomID(body).dropFirst("message-body-".count))
