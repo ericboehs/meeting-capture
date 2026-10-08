@@ -1092,13 +1092,21 @@ struct CaptionEntry {
 ///
 /// These apps append, so the visible settled segments are normally the exact
 /// tail of the history. If the window ever moves past what history still
-/// holds, it re-anchors on the longest overlap so positions keep counting up
-/// rather than restarting and rewriting the conversation. Keys are a struct
-/// rather than joined strings: a speaker name containing the would-be
+/// holds, it re-anchors where most of the window agrees, so positions keep
+/// counting up rather than restarting and rewriting the conversation. Keys are
+/// a struct rather than joined strings: a speaker name containing the would-be
 /// delimiter must not be able to impersonate a different utterance.
-struct SegmentKey: Equatable {
+struct SegmentKey: Hashable {
     let speaker: String
     let text: String
+
+    /// Whether this is `original` with its opening words cut off: the same
+    /// speaker, and a strictly shorter tail of the same text. That is what
+    /// Meet does to the oldest caption still on screen (see anchor(for:)).
+    func isFrontTrimmed(from original: SegmentKey) -> Bool {
+        speaker == original.speaker && !text.isEmpty
+            && text.count < original.text.count && original.text.hasSuffix(text)
+    }
 }
 
 final class SegmentHistory {
@@ -1107,6 +1115,17 @@ final class SegmentHistory {
     private var dropped = 0
     /// The widest window absorbed so far, which sets how much has to be kept.
     private var widest = 0
+
+    /// A window that lined up with nothing and was numbered as all new.
+    struct Unaligned: Equatable {
+        let window: Int
+        /// How many of its segments the history already held. Mostly-known
+        /// is the signature of a bug — the same words written again under new
+        /// positions — rather than a burst of new speech.
+        let alreadyRecorded: Int
+    }
+    /// Set by the last absorb when it took that path, nil otherwise.
+    private(set) var lastUnaligned: Unaligned?
 
     /// Fold the visible settled segments into the history; returns the absolute
     /// position of the first one. The rest number on from there, and the
@@ -1117,6 +1136,7 @@ final class SegmentHistory {
     /// on screen, so it reuses its position. The apps using this class keep
     /// several segments visible at once, which disambiguates in practice.
     func absorb(_ settled: [SegmentKey]) -> Int {
+        lastUnaligned = nil
         guard !settled.isEmpty else { return dropped + keys.count }
         widest = max(widest, settled.count)
         for overlap in stride(from: min(keys.count, settled.count), through: 1, by: -1)
@@ -1138,6 +1158,9 @@ final class SegmentHistory {
             return base
         }
         // No overlap with anything remembered: all of these are new.
+        let remembered = Set(keys)
+        lastUnaligned = Unaligned(window: settled.count,
+                                  alreadyRecorded: settled.filter { remembered.contains($0) }.count)
         keys.append(contentsOf: settled)
         trim()
         return dropped + keys.count - settled.count
@@ -1152,19 +1175,43 @@ final class SegmentHistory {
     /// written again. Over six minutes that turned 128 utterances into 2,110
     /// lines.
     ///
-    /// So anchor on the oldest visible segment, the one least likely to still
-    /// be changing, and only accept a position most of the window agrees with.
-    /// Without that agreement a call where someone says "Yeah." twice would
-    /// staple the second one over the first.
+    /// So every visible segment votes for where the window would start if it
+    /// were in its right place, and a position is accepted only when most of
+    /// the window agrees with it. Without that agreement a call where someone
+    /// says "Yeah." twice would staple the second one over the first.
+    ///
+    /// This used to anchor on the oldest visible segment alone, as the one
+    /// least likely to still be changing. It is, but it is also the one Meet
+    /// trims: once the panel is full, about once a minute, the oldest caption
+    /// still showing loses its opening words ("Uh, it's just. Join from the
+    /// wrong app!" became "Join from the wrong app!"). Nothing remembered
+    /// equalled that, so the whole window looked new and was written again —
+    /// on a 30-minute call, 13 bursts of ~85 lines, one a minute, for 1,296
+    /// lines holding 288 utterances. Now no single segment can veto a
+    /// position, and the oldest one still agrees when it is the tail of what
+    /// is remembered there.
     private func anchor(for settled: [SegmentKey]) -> Int? {
+        var positions: [SegmentKey: [Int]] = [:]
+        for (index, key) in keys.enumerated() { positions[key, default: []].append(index) }
+        var votes: [Int: Int] = [:]
+        for (offset, key) in settled.enumerated() {
+            for index in positions[key] ?? [] where index >= offset {
+                votes[index - offset, default: 0] += 1
+            }
+        }
+        for (index, key) in keys.enumerated() where settled[0].isFrontTrimmed(from: key) {
+            votes[index, default: 0] += 1
+        }
+        // Ties go to the later position: the window is the newest part of the
+        // conversation.
         var best: (index: Int, matches: Int)?
-        for index in stride(from: keys.count - 1, through: 0, by: -1) where keys[index] == settled[0] {
+        for (index, matches) in votes {
             let overlap = min(keys.count - index, settled.count)
-            guard overlap > 1 else { continue }
-            let matches = zip(keys[index...], settled.prefix(overlap))
-                .reduce(0) { $0 + ($1.0 == $1.1 ? 1 : 0) }
-            guard matches * 2 > overlap else { continue }
-            if best == nil || matches > best!.matches { best = (index, matches) }
+            guard overlap > 1, matches * 2 > overlap else { continue }
+            if best == nil || matches > best!.matches
+                || (matches == best!.matches && index > best!.index) {
+                best = (index, matches)
+            }
         }
         return best?.index
     }
@@ -1195,7 +1242,17 @@ final class SegmentHistory {
         keys = []
         dropped = 0
         widest = 0
+        lastUnaligned = nil
     }
+}
+
+/// Say so when a window that was mostly recorded already gets numbered as new:
+/// the transcript repeats from that point. Counts only, never caption text.
+func reportUnaligned(_ history: SegmentHistory, app: String) {
+    guard let miss = history.lastUnaligned, miss.window >= 8,
+          miss.alreadyRecorded * 2 > miss.window else { return }
+    status("\(app)'s caption window (\(miss.window) segments, \(miss.alreadyRecorded) already recorded) "
+           + "did not line up with the transcript and was written again; the transcript repeats here")
 }
 
 struct ChatMessage {
@@ -2904,6 +2961,7 @@ final class SlackApp: MeetingApp {
         // written out. Reporting both and letting the recorder collapse them
         // loses nothing when that happens.
         let base = history.absorb(settled.map { SegmentKey(speaker: $0.speaker, text: $0.text) })
+        reportUnaligned(history, app: displayName)
         var entries = settled.enumerated().map {
             CaptionEntry(id: "seg:\(base + $0.offset)", speaker: $0.element.speaker, text: $0.element.text)
         }
@@ -3586,6 +3644,7 @@ final class MeetApp: MeetingApp {
         // All but the last are settled. Fold them into the history, which is
         // what absolute positions are counted against.
         let base = history.absorb(visible.dropLast().map { SegmentKey(speaker: $0.speaker, text: $0.text) })
+        reportUnaligned(history, app: displayName)
         return visible.enumerated().map { offset, entry in
             CaptionEntry(id: "seg:\(base + offset)", speaker: entry.speaker, text: entry.text)
         }

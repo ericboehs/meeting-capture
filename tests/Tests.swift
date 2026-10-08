@@ -222,6 +222,71 @@ do {
 // distinct — a single "Yeah." said twice was the bug that produced this class.
 
 do {
+    // Meet trims old captions off the front of the panel — and not only whole
+    // segments: once it is full, about once a minute, the oldest caption still
+    // showing loses its opening words. Measured on a 30-minute call, every one
+    // of those trims made the whole window look new: 13 bursts of ~85 lines,
+    // 1,296 lines for 288 utterances.
+    func line(_ i: Int) -> SegmentKey {
+        SegmentKey(speaker: i % 2 == 0 ? "Alex Teal" : "You", text: "Sentence one of \(i). Sentence two of \(i).")
+    }
+    func trimmed(_ i: Int) -> SegmentKey {
+        SegmentKey(speaker: line(i).speaker, text: "Sentence two of \(i).")
+    }
+    let h = SegmentHistory()
+    let all = (0..<90).map(line)
+    expectEqual(h.absorb(all), 0, "a full panel sits at the start")
+    expectEqual(h.absorb([trimmed(0)] + all.dropFirst()), 0,
+                "the oldest caption losing its opening words moves nothing")
+    expectTrue(h.lastUnaligned == nil, "and is not reported as a window that failed to line up")
+    expectEqual(h.absorb([trimmed(0)] + all.dropFirst() + [line(90)]), 0,
+                "the trimmed form is what is remembered, so the next poll lines up directly")
+    expectEqual(h.absorb([trimmed(6)] + all[7...] + [line(90), line(91)]), 6,
+                "a minute later: whole captions gone and the new oldest one trimmed")
+    expectEqual(h.absorb([SegmentKey(speaker: line(6).speaker, text: "of 6.")] + all[7...] + [line(90), line(91)]), 6,
+                "trimmed again, further")
+}
+
+do {
+    // A trim is the same speaker's words cut short, nothing looser.
+    let h = SegmentHistory()
+    let rest = (1...5).map { SegmentKey(speaker: "B", text: "line \($0)") }
+    _ = h.absorb([SegmentKey(speaker: "A", text: "Okay. Yeah.")] + rest)
+    expectEqual(h.absorb([SegmentKey(speaker: "Z", text: "Yeah.")] + rest), 0,
+                "a different speaker's tail still anchors on the rest of the window")
+    let short = SegmentHistory()
+    _ = short.absorb([SegmentKey(speaker: "A", text: "Okay. Yeah."), SegmentKey(speaker: "B", text: "b")])
+    expectEqual(short.absorb([SegmentKey(speaker: "A", text: "Yeah."), SegmentKey(speaker: "C", text: "c")]), 2,
+                "in a two-segment window a matching tail alone is not agreement: \"Yeah.\" again is new")
+}
+
+do {
+    // No single segment can veto a position any more. Whatever makes the
+    // oldest visible one unrecognisable — a trim, a garbled speaker — the rest
+    // of the window still says where it is.
+    let h = SegmentHistory()
+    let all = (0..<20).map { SegmentKey(speaker: "S\($0 % 3)", text: "line \($0)") }
+    _ = h.absorb(all)
+    let garbled = [SegmentKey(speaker: "", text: "???")] + all[4...]
+    expectEqual(h.absorb(garbled), 3, "an unrecognisable oldest segment takes the place it sits in")
+    expectTrue(h.lastUnaligned == nil, "which is lining up, not writing the window again")
+    expectEqual(h.absorb(Array(all[4...]) + [SegmentKey(speaker: "S0", text: "new")]), 4,
+                "and the window carries on from there")
+}
+
+do {
+    // When a window does fail to line up, say how much of it was already
+    // recorded: mostly-known means a bug, not a burst of new speech.
+    let h = SegmentHistory()
+    _ = h.absorb([SegmentKey(speaker: "V", text: "x")])
+    _ = h.absorb([SegmentKey(speaker: "W", text: "y"), SegmentKey(speaker: "V", text: "x")])
+    expectEqual(h.lastUnaligned, SegmentHistory.Unaligned(window: 2, alreadyRecorded: 1),
+                "an unaligned window reports its size and how much was already recorded")
+    _ = h.absorb([SegmentKey(speaker: "V", text: "x"), SegmentKey(speaker: "Q", text: "z")])
+    expectTrue(h.lastUnaligned == nil, "a window that lines up clears the report")
+}
+
+do {
     let h = SegmentHistory()
     expectEqual(h.absorb([SegmentKey(speaker: "Grace", text: "Yeah.")]), 0, "first segment sits at position 0")
     // Same words again: the window now shows two settled segments, both new.
