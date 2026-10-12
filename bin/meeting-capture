@@ -3154,6 +3154,27 @@ final class SlackApp: MeetingApp {
 
 // MARK: - Zoom
 
+/// Zoom's floating screen-share chrome. Sharing your screen shrinks the meeting
+/// window to a mini gallery and swaps its toolbar, Leave button included, for
+/// these two windows (the controls, and the "You are screen sharing / Stop
+/// share" pill), so a meeting with your share up has no `leave` anywhere. These
+/// are Zoom's internal window names, not localized UI text, and both windows
+/// close when the share stops or the meeting ends. Verified on Zoom 7.1.9.
+let zoomShareChromeTitles: Set<String> = ["zoom share toolbar window", "zoom share statusbar window"]
+
+/// The first window that is Zoom's screen-share chrome, if any.
+func zoomShareChromeIndex(titles: [String]) -> Int? {
+    titles.firstIndex { zoomShareChromeTitles.contains($0) }
+}
+
+/// While you share, captions move out of the meeting window's "Closed caption
+/// subtitles" table into a floating window described e.g. "Closed caption
+/// subtitles, 1129 pixels from bottom edge, 2622 pixels from right edge". It
+/// exposes no children, so it cannot be read, but it does mean captions are on.
+func zoomFloatingCaptionsWindow(description: String) -> Bool {
+    description.hasPrefix("Closed caption subtitles,")
+}
+
 /// Zoom is a native app, so there are no DOM ids, but it labels its controls
 /// with AXIdentifier (`leave`, `captions`, `chat`) and its caption list with a
 /// description, which serve the same purpose.
@@ -3164,9 +3185,17 @@ struct ZoomApp: MeetingApp {
 
     private let captionTableDescription = "Closed caption subtitles"
 
-    /// The End/Leave button exists only during a call.
+    /// The End/Leave button exists only during a call, except while you share
+    /// your screen, when the share chrome replaces it (see zoomShareChromeTitles).
+    /// Without that fallback, starting a share ended the session ten seconds later.
     func meetingAnchor(_ app: AXUIElement) -> AXUIElement? {
-        findElement(from: app) { axIdentifier($0) == "leave" }
+        if let leave = findElement(from: app, where: { axIdentifier($0) == "leave" }) {
+            return leave
+        }
+        let windows = axWindows(app)
+        guard let index = zoomShareChromeIndex(titles: windows.map { axString($0, kAXTitleAttribute) })
+        else { return nil }
+        return windows[index]
     }
 
     /// Every Zoom window is called "Zoom Meeting", so use the topic button in
@@ -3236,9 +3265,13 @@ struct ZoomApp: MeetingApp {
 
     /// Zoom's caption list only exists while captions are on, which makes it a
     /// reliable signal — unlike the toolbar button, which vanishes with the
-    /// toolbar whenever the pointer leaves the window.
+    /// toolbar whenever the pointer leaves the window. The floating window that
+    /// replaces it during a screen share counts too: missing it would have
+    /// requestCaptions pressing the share toolbar's More every 8 seconds, on the
+    /// screen being shared, for captions that are already on.
     func captionsPanelOpen(_ app: AXUIElement) -> Bool {
         captionsContainer(app) != nil
+            || axWindows(app).contains { zoomFloatingCaptionsWindow(description: axDescription($0)) }
     }
 
     /// No synthetic keystroke needed: the button is pressable, and its

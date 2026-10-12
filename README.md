@@ -407,7 +407,10 @@ The daemon polls the accessibility tree of each supported app:
    button in Slack, a `Leave call` button in Meet). Its absence for ten
    consecutive seconds ends the session —
    the control also disappears briefly during UI transitions, hence the
-   debounce.
+   debounce. Zoom drops its Leave button while you share your screen, so
+   there its floating share toolbar counts too; captions are not readable
+   during a share, though (Zoom moves them into a floating window with no
+   accessibility content), so the transcript resumes when the share ends.
 2. **Read the captions**, and decide when an utterance is finished. The apps
    differ here, which is why `MeetingApp` gets a say:
 

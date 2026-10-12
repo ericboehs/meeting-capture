@@ -1069,6 +1069,42 @@ do {
                 "the clamp is cumulative, so the pending block reads in order within itself")
 }
 
+// --- Zoom: sharing your screen is not leaving the meeting -----------------
+//
+// Regression: sharing swaps Zoom's toolbar, Leave button included, for floating
+// share chrome, so the daemon logged `left "…", ending session` ten seconds
+// into every share and recorded nothing more. Window titles from Zoom 7.1.9,
+// read live mid-share.
+
+do {
+    let sharing = [
+        "zoom share statusbar window",
+        "zoom share toolbar window",
+        "zoom annotation entrypoint",
+        "Annotation - Zoom",
+        "",
+        "Zoom Meeting",
+    ]
+    expectEqual(zoomShareChromeIndex(titles: sharing), 0, "share chrome counts as a meeting")
+    expectEqual(zoomShareChromeIndex(titles: ["Zoom Meeting", "zoom share toolbar window"]), 1,
+                "share toolbar alone counts")
+    expectEqual(zoomShareChromeIndex(titles: ["Zoom Meeting", ""]), nil,
+                "a meeting window without share chrome needs its Leave button")
+    expectEqual(zoomShareChromeIndex(titles: ["Zoom Workplace", "Settings"]), nil,
+                "idle Zoom is no meeting")
+    expectEqual(zoomShareChromeIndex(titles: ["Zoom Share Toolbar Window"]), nil,
+                "titles match exactly")
+
+    // While sharing, captions float in a window of their own. Recognizing it
+    // keeps auto-captions from pressing More on the screen being shared.
+    expectTrue(zoomFloatingCaptionsWindow(
+                   description: "Closed caption subtitles, 1129 pixels from bottom edge, 2622 pixels from right edge"),
+               "floating captions window means captions are on")
+    expectTrue(!zoomFloatingCaptionsWindow(description: "Closed caption subtitles"),
+               "the docked caption table is not the floating window")
+    expectTrue(!zoomFloatingCaptionsWindow(description: ""), "an undescribed window is not captions")
+}
+
 // --- A row that resumes after being written owes only its new tail --------
 //
 // Regression (Zoom): with two people talking, Zoom keeps a live, still-growing
