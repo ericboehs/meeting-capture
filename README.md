@@ -220,7 +220,10 @@ whenever the pointer leaves the window — there's no menu item or preference to
 reach it another way, and a synthetic mouse-move doesn't fool it. So for Zoom
 this is opportunistic: it waits and acts the moment the toolbar next appears.
 Moving your mouse over the window once is enough. Turning captions on yourself
-works just as well; capture doesn't depend on any of this.
+works just as well; capture doesn't depend on any of this. While you share your
+screen it presses nothing: the only route to captions then is the share
+toolbar's More, whose menu would open on the screen everyone is watching, so it
+waits for the share to end.
 
 It checks the captions panel chrome rather than whether captions are visible,
 because apps clear the text after a few seconds of silence, and it stops trying

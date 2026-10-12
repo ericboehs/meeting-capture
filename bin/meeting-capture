@@ -3175,6 +3175,17 @@ func zoomFloatingCaptionsWindow(description: String) -> Bool {
     description.hasPrefix("Closed caption subtitles,")
 }
 
+/// Whether auto-captions may reach for Zoom's captions control. Not while you
+/// share: the share toolbar has no captions button, only `more`, whose menu
+/// would open on the very screen being shared. And mid-share "captions look
+/// off" is not to be trusted anyway, since Zoom recreates the floating captions
+/// window (it moved between reads, and the daemon called captions off at
+/// 09:16:49 on 2026-10-12 with them plainly running). Captions are turned on,
+/// if still needed, once the share ends and the meeting toolbar is back.
+func zoomMayRequestCaptions(windowTitles: [String]) -> Bool {
+    zoomShareChromeIndex(titles: windowTitles) == nil
+}
+
 /// Zoom is a native app, so there are no DOM ids, but it labels its controls
 /// with AXIdentifier (`leave`, `captions`, `chat`) and its caption list with a
 /// description, which serve the same purpose.
@@ -3277,10 +3288,16 @@ struct ZoomApp: MeetingApp {
     /// No synthetic keystroke needed: the button is pressable, and its
     /// description says which way it will toggle. Two obstacles, though: the
     /// toolbar leaves the tree entirely when the pointer isn't over the window,
-    /// and unless pinned, captions live in the More overflow.
+    /// and unless pinned, captions live in the More overflow. Nothing is pressed
+    /// while you share your screen (see zoomMayRequestCaptions).
     func requestCaptions(pid: pid_t) -> CaptionRequest {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 5.0)
+
+        // Unreachable spends no attempt, so this is retried every few seconds
+        // and goes ahead on the first check after the share ends.
+        guard zoomMayRequestCaptions(windowTitles: axWindows(app).map { axString($0, kAXTitleAttribute) })
+        else { return .unreachable }
 
         // Zoom only puts captions in the toolbar once they are running, so a
         // pinned button that doesn't offer to show them means they are on.

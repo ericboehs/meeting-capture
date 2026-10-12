@@ -1103,6 +1103,18 @@ do {
     expectTrue(!zoomFloatingCaptionsWindow(description: "Closed caption subtitles"),
                "the docked caption table is not the floating window")
     expectTrue(!zoomFloatingCaptionsWindow(description: ""), "an undescribed window is not captions")
+
+    // Auto-captions keeps its hands off Zoom while you share: the only way to
+    // captions then is the share toolbar's More, a menu that would open on the
+    // screen being shared.
+    expectTrue(!zoomMayRequestCaptions(windowTitles: sharing),
+               "no reaching for captions while you share")
+    expectTrue(!zoomMayRequestCaptions(windowTitles: ["zoom share statusbar window", "Zoom Meeting"]),
+               "the Stop share pill alone still means you are sharing")
+    expectTrue(zoomMayRequestCaptions(windowTitles: ["Zoom Meeting"]),
+               "captions may be requested once the share ends")
+    expectTrue(zoomMayRequestCaptions(windowTitles: []),
+               "a hollow window list does not block the request")
 }
 
 // --- A row that resumes after being written owes only its new tail --------
