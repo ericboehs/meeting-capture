@@ -428,14 +428,18 @@ The daemon polls the accessibility tree of each supported app:
 
    - **Teams** clears old captions, keeping about three on screen. An utterance
      is done when its node id disappears.
-   - **Zoom** appends rows and keeps them, so nothing would ever "disappear". A
-     row is done once a newer row appears beneath it; the idle timer is the
-     backstop for the newest row (twelve seconds, since a pause mid-speech
-     looks just like silence). Every app with such a timer treats its newest
-     utterance the same way. Note what this does and does not buy: leaving a
+   - **Zoom** appends rows and keeps them, so nothing would ever "disappear".
+     A newer row does not end an older one either: when two people talk at
+     once Zoom keeps a live, still-growing row for each, so a row is done only
+     once it goes quiet (six seconds, twelve for the newest, since a pause
+     mid-speech looks just like silence). A row is one speaker's run of
+     speech, so like Meet's segments it is written a sentence at a time while
+     it grows, and when it grows again after going quiet the new words arrive
+     as sentences too. Note what this does and does not buy: leaving a
      meeting or stopping the daemon gracefully flushes pending lines via
-     finish(), but a crash or SIGKILL writes nothing — the timer only limits
-     how long the final words would have sat unwritten in the ordinary case.
+     finish(), but a crash or SIGKILL writes nothing. Writing sentence by
+     sentence shrinks what a crash can cost to the last sentence or two of
+     each row.
    - **Slack** overlays about five events on the video tiles and fades them,
      replacing the element on every revision — so one sentence arrives as a
      succession of elements sharing no id. Faded events are identified by their

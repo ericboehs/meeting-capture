@@ -789,7 +789,11 @@ enum CaptionSentences {
     ///     now sit (the last 48 characters of them, or 32 or 16 if the trim
     ///     cut into those);
     ///  3. revised near its end: resume at the start of the word the revision
-    ///     landed in, as long as at least half of `written` is intact.
+    ///     landed in, as long as at least half of `written` (and at least 20
+    ///     characters) is intact. The floor matters where an element can be
+    ///     reused for a different utterance (Zoom's rows are told apart by
+    ///     element hash): "I think so." becoming "I think that's wrong." must
+    ///     count as new text, not lose "I think".
     /// nil when none of these hold: the text was replaced and owes all of it.
     static func resumeIndex(in text: String, after written: String) -> String.Index? {
         if written.isEmpty { return text.startIndex }
@@ -798,7 +802,7 @@ enum CaptionSentences {
             if let found = text.range(of: String(written.suffix(anchorLength))) { return found.upperBound }
         }
         let common = zip(text, written).prefix { $0 == $1 }.count
-        guard common * 2 >= written.count else { return nil }
+        guard common >= 20, common * 2 >= written.count else { return nil }
         var index = text.index(text.startIndex, offsetBy: common)
         while index > text.startIndex, !text[text.index(before: index)].isWhitespace {
             index = text.index(before: index)
@@ -3507,6 +3511,13 @@ struct ZoomApp: MeetingApp {
     // quiet is the only reliable end-of-utterance signal Zoom gives us, so
     // rows finalize on idle alone.
     var idleFinalizeSeconds: TimeInterval? { 6 }
+
+    /// A row is one speaker's run of speech and keeps growing for as long as
+    /// they talk (and again after it went idle), so write it a sentence at a
+    /// time, like Meet's segments (see CaptionSentences). This also replaces
+    /// the "continues" tail a row used to get when it grew after being
+    /// written: the new words now arrive as sentences of their own.
+    var writesCaptionsBySentence: Bool { true }
 }
 
 // MARK: - Google Meet

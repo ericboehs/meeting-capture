@@ -1707,6 +1707,8 @@ do {
                 "a revision near the end resumes at the start of the revised word")
     expectTrue(CS.resumeIndex(in: "something else entirely", after: "so you can submit receipts") == nil,
                "replaced text owes all of it")
+    expectTrue(CS.resumeIndex(in: "I think that's wrong.", after: "I think so.") == nil,
+               "a reused row with a short shared start is new text, not a revision (Zoom rows go by element hash)")
 
     // Each stretch of text remembers when it appeared.
     let t = Date(timeIntervalSince1970: 1_800_000_000)
@@ -1719,74 +1721,131 @@ do {
                 "a revision re-times only from where it differs")
 }
 
+/// Deterministic pseudo-random numbers, so a synthetic talk is the same every run.
+struct LCG {
+    var state: UInt64
+    mutating func next(_ bound: Int) -> Int {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        return Int((state >> 33) % UInt64(bound))
+    }
+}
+
+/// A made-up talk, grown a few words per poll the way live captions arrive,
+/// with recognition-style revisions at the tail.
+final class TalkGrower {
+    static let vocabulary = ["the", "plan", "year", "covers", "eligible", "expenses", "you", "can", "submit",
+                             "receipts", "for", "care", "before", "January", "runout", "period", "of", "ninety",
+                             "days", "and", "funds", "roll", "over", "up", "to", "a", "limit", "so", "keep",
+                             "track", "your", "account", "balance", "every", "month", "because", "reimbursement",
+                             "takes", "about", "two", "weeks", "which", "means", "budget", "ahead", "when",
+                             "school", "starts", "again"]
+    let tokens: [String]
+    /// Token index where each sentence begins.
+    let sentenceStarts: [Int]
+    /// Token index of the last word of each sentence but the final one, ascending.
+    let boundaries: [Int]
+    private(set) var shown = 0
+    /// Token index -> when it first appeared.
+    private(set) var firstSeen: [Int: Date] = [:]
+    private var rng: LCG
+
+    init(seed: UInt64, length minimum: Int) {
+        var rng = LCG(state: seed)
+        var tokens: [String] = [], starts: [Int] = []
+        while tokens.joined(separator: " ").count < minimum {
+            starts.append(tokens.count)
+            var words = (0..<(4 + rng.next(27))).map { _ in TalkGrower.vocabulary[rng.next(TalkGrower.vocabulary.count)] }
+            if rng.next(10) == 0 { words.insert(contentsOf: ["Dr.", "Lee", "said"], at: min(2, words.count)) }
+            if rng.next(10) == 0 { words.insert(contentsOf: ["about", "$2.50"], at: words.count / 2) }
+            words[0] = words[0].prefix(1).uppercased() + words[0].dropFirst()
+            words[words.count - 1] += [".", ".", ".", ".", ".", ".", "?", "?", "!"][rng.next(9)]
+            tokens += words
+        }
+        self.tokens = tokens
+        sentenceStarts = starts
+        boundaries = starts.dropFirst().map { $0 - 1 }
+        self.rng = rng
+    }
+
+    var text: String { tokens.joined(separator: " ") }
+    var sentenceCount: Int { sentenceStarts.count }
+    var done: Bool { shown >= tokens.count }
+    /// What has been shown so far, read correctly.
+    var settled: String { tokens[0..<shown].joined(separator: " ") }
+
+    /// Show a few more words (never past `limit`), as recognition shows them
+    /// at first: a sentence break appears as a comma, and the newest word is
+    /// sometimes misheard for a poll.
+    func step(at now: Date, limit: Int? = nil) -> String {
+        let previous = shown
+        shown = min(limit ?? tokens.count, shown + 2 + rng.next(4))
+        if shown > previous { for index in previous..<shown { firstSeen[index] = now } }
+        var display = Array(tokens[0..<shown])
+        if let boundary = boundaries.first(where: { $0 >= previous - 1 && $0 < shown - 1 }) {
+            display[boundary] = String(display[boundary].dropLast()) + ","
+            display[boundary + 1] = display[boundary + 1].lowercased()
+        } else if shown > 0, rng.next(4) == 0, !boundaries.contains(shown - 1) {
+            display[shown - 1] = "uh"
+        }
+        return display.joined(separator: " ")
+    }
+
+    /// Token count through the end of the first sentence ending at or after `token`.
+    func throughSentence(at token: Int) -> Int {
+        (boundaries.first { $0 >= token } ?? tokens.count - 1) + 1
+    }
+}
+
+/// A session recording into memory, with live captions flowing straight through.
+func captionSession(_ app: MeetingApp, at t0: Date) -> (Session, MemorySink) {
+    let s = injectedSession(clock: FakeClock(start: t0, step: 0.25), app: app)
+    try? FileManager.default.createDirectory(atPath: s.options.stateDirectory, withIntermediateDirectories: true)
+    let jsonl = MemorySink(path: "/tmp/sentences.jsonl")
+    s.recorder = Recorder(options: Options(), startedAt: t0, mode: .timeOfDay,
+                          jsonlURL: URL(fileURLWithPath: jsonl.path), textURL: URL(fileURLWithPath: "/tmp/sentences.txt"),
+                          jsonl: jsonl, text: MemorySink(path: "/tmp/sentences.txt"))
+    s.concludeHistory([]) // nothing to recover
+    return (s, jsonl)
+}
+
+func captionLines(_ jsonl: MemorySink) -> [[String: Any]] {
+    jsonl.string.split(separator: "\n").compactMap {
+        (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any]
+    }.filter { $0["type"] as? String == "caption" }
+}
+
+/// How many lines are stamped more than a second away from when their
+/// sentence's first word appeared. A line's real start is `started_at` when
+/// the transcript held `ts` back so the clock never runs backwards (two
+/// people talking at once).
+func offStamps(_ lines: [[String: Any]], _ talk: TalkGrower) -> Int {
+    let iso = ISO8601DateFormatter()
+    return zip(lines, talk.sentenceStarts).filter { line, start in
+        guard let ts = ((line["started_at"] ?? line["ts"]) as? String).flatMap(iso.date(from:)),
+              let spoken = talk.firstSeen[start] else { return true }
+        return abs(ts.timeIntervalSince(spoken)) > 1.0
+    }.count + abs(lines.count - talk.sentenceCount)
+}
+
 // The real thing: a 14K-character monologue in one segment, grown a few words
 // per poll with recognition-style revisions, then another speaker.
 do {
-    struct LCG {
-        var state: UInt64
-        mutating func next(_ bound: Int) -> Int {
-            state = state &* 6364136223846793005 &+ 1442695040888963407
-            return Int((state >> 33) % UInt64(bound))
-        }
-    }
-    // Made-up benefits talk, built from a fixed vocabulary.
-    let vocabulary = ["the", "plan", "year", "covers", "eligible", "expenses", "you", "can", "submit",
-                      "receipts", "for", "care", "before", "January", "runout", "period", "of", "ninety",
-                      "days", "and", "funds", "roll", "over", "up", "to", "a", "limit", "so", "keep",
-                      "track", "your", "account", "balance", "every", "month", "because", "reimbursement",
-                      "takes", "about", "two", "weeks", "which", "means", "budget", "ahead", "when",
-                      "school", "starts", "again"]
-    var rng = LCG(state: 42)
-    var tokens: [String] = []
-    var sentenceStarts: [Int] = [] // token index where each sentence begins
-    var monologue = ""
-    while monologue.count < 14_400 {
-        sentenceStarts.append(tokens.count)
-        let length = 4 + rng.next(27)
-        var words = (0..<length).map { _ in vocabulary[rng.next(vocabulary.count)] }
-        if rng.next(10) == 0 { words.insert(contentsOf: ["Dr.", "Lee", "said"], at: min(2, words.count)) }
-        if rng.next(10) == 0 { words.insert(contentsOf: ["about", "$2.50"], at: words.count / 2) }
-        words[0] = words[0].prefix(1).uppercased() + words[0].dropFirst()
-        let end = [".", ".", ".", ".", ".", ".", "?", "?", "!"][rng.next(9)]
-        words[words.count - 1] += end
-        tokens += words
-        monologue = tokens.joined(separator: " ")
-    }
-    let sentenceCount = sentenceStarts.count
-    let boundaries = Set(sentenceStarts.dropFirst().map { $0 - 1 }) // last token of each sentence
+    let monologue = TalkGrower(seed: 42, length: 14_400).text
+    let sentenceCount = TalkGrower(seed: 42, length: 14_400).sentenceCount
+    let sentenceStarts = TalkGrower(seed: 42, length: 14_400).sentenceStarts
 
     func run(trimAt trimToken: Int?) -> (lines: [[String: Any]], beforeB: Int, longestLive: Int, firstSeen: [Int: Date]) {
+        let talk = TalkGrower(seed: 42, length: 14_400)
         let t0 = Date(timeIntervalSince1970: 1_800_000_000)
-        let clock = FakeClock(start: t0, step: 0.25)
-        let app = ScriptedApp()
-        let s = injectedSession(clock: clock, app: app)
-        try? FileManager.default.createDirectory(atPath: s.options.stateDirectory, withIntermediateDirectories: true)
-        let jsonl = MemorySink(path: "/tmp/sentences.jsonl")
-        s.recorder = Recorder(options: Options(), startedAt: t0, mode: .timeOfDay,
-                              jsonlURL: URL(fileURLWithPath: jsonl.path), textURL: URL(fileURLWithPath: "/tmp/sentences.txt"),
-                              jsonl: jsonl, text: MemorySink(path: "/tmp/sentences.txt"))
-        s.concludeHistory([]) // nothing to recover; live captions flow straight through
-        var shown = 0, now = t0, longestLive = 0, trimmedChars = 0
-        var firstSeen: [Int: Date] = [:] // token index -> when it first appeared
-        while shown < tokens.count {
-            let previous = shown
-            shown = min(tokens.count, shown + 2 + rng.next(4))
-            for index in previous..<shown { firstSeen[index] = now }
-            var display = Array(tokens[0..<shown])
-            // Recognition revises the tail: a sentence break first shows as a
-            // comma, and the newest word is sometimes misheard for a poll.
-            if let boundary = boundaries.first(where: { $0 >= previous - 1 && $0 < shown - 1 }) {
-                display[boundary] = String(display[boundary].dropLast()) + ","
-                display[boundary + 1] = display[boundary + 1].lowercased()
-            } else if rng.next(4) == 0, !boundaries.contains(shown - 1) {
-                display[shown - 1] = "uh"
-            }
-            if let trimToken, shown > trimToken + 400 {
+        let (s, jsonl) = captionSession(ScriptedApp(), at: t0)
+        var now = t0, longestLive = 0, trimmedChars = 0
+        while !talk.done {
+            let display = talk.step(at: now)
+            if let trimToken, talk.shown > trimToken + 400 {
                 // Meet trims old words off the front, mid-sentence.
-                trimmedChars = tokens[0..<trimToken].joined(separator: " ").count + 1
+                trimmedChars = talk.tokens[0..<trimToken].joined(separator: " ").count + 1
             }
-            let text = String(display.joined(separator: " ").dropFirst(trimmedChars))
-            s.ingestCaptions([CaptionEntry(id: "seg:0", speaker: "Kelsey", text: text)], now: now)
+            s.ingestCaptions([CaptionEntry(id: "seg:0", speaker: "Kelsey", text: String(display.dropFirst(trimmedChars)))], now: now)
             let live = (try? String(contentsOfFile: s.options.stateDirectory + "/live", encoding: .utf8)) ?? ""
             longestLive = max(longestLive, live.count)
             now = now.addingTimeInterval(0.25)
@@ -1802,10 +1861,7 @@ do {
         s.ingestCaptions([CaptionEntry(id: "seg:0", speaker: "Kelsey", text: finalText),
                           CaptionEntry(id: "seg:1", speaker: "Justin", text: "Thanks, that helps.")], now: now)
         s.finish(at: now.addingTimeInterval(1))
-        let lines = jsonl.string.split(separator: "\n").compactMap {
-            (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any]
-        }.filter { $0["type"] as? String == "caption" }
-        return (lines, beforeB, longestLive, firstSeen)
+        return (captionLines(jsonl), beforeB, longestLive, talk.firstSeen)
     }
 
     let plain = run(trimAt: nil)
@@ -1846,6 +1902,58 @@ do {
     let trimmedRun = run(trimAt: sentenceStarts[sentenceCount / 3] + 5)
     let trimmedTexts = trimmedRun.lines.filter { $0["speaker"] as? String == "Kelsey" }.compactMap { $0["text"] as? String }
     expectEqual(trimmedTexts.joined(separator: " "), monologue, "a front trim mid-talk loses and repeats nothing")
+}
+
+// Zoom: rows are one speaker's run of speech and keep growing. A long row,
+// another speaker's row growing alongside it, a quiet spell long enough to
+// write both out on idle, and then the long row growing again (Zoom keeps
+// extending a row after it went idle).
+do {
+    let ada = TalkGrower(seed: 7, length: 6_000)
+    let grace = TalkGrower(seed: 99, length: 600)
+    let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+    let (s, jsonl) = captionSession(ZoomApp(), at: t0)
+    var now = t0
+    func poll(_ ada: String, _ grace: String?) {
+        var rows = [CaptionEntry(id: "row-ada", speaker: "Ada Lovelace", text: ada)]
+        if let grace { rows.append(CaptionEntry(id: "row-grace", speaker: "Grace Hopper", text: grace)) }
+        s.ingestCaptions(rows, now: now)
+        now = now.addingTimeInterval(0.25)
+    }
+    func lines(of speaker: String) -> [[String: Any]] { captionLines(jsonl).filter { $0["speaker"] as? String == speaker } }
+
+    let pauseAt = ada.throughSentence(at: ada.tokens.count * 4 / 5)
+    let graceFrom = ada.tokens.count / 3
+    while ada.shown < pauseAt {
+        let adaText = ada.step(at: now, limit: pauseAt)
+        let graceText: String? = ada.shown < graceFrom ? nil : (grace.done ? grace.settled : grace.step(at: now))
+        poll(adaText, graceText)
+    }
+    let spokenBeforePause = ada.sentenceStarts.filter { $0 < pauseAt }.count
+    let writtenWhileTalking = lines(of: "Ada Lovelace").count
+    for _ in 0..<60 { poll(ada.settled, grace.settled) } // 15 quiet seconds: both rows go idle
+    let writtenByPause = lines(of: "Ada Lovelace").count
+    while !ada.done { poll(ada.step(at: now), grace.settled) }
+    for _ in 0..<4 { poll(ada.settled, grace.settled) }
+    s.finish(at: now)
+
+    let adaLines = lines(of: "Ada Lovelace"), graceLines = lines(of: "Grace Hopper")
+    let adaTexts = adaLines.compactMap { $0["text"] as? String }
+    expectEqual(adaTexts.joined(separator: " "), ada.text,
+                "Zoom: the long row is written once, in order, across the idle spell and the regrowth")
+    expectEqual(graceLines.compactMap { $0["text"] as? String }.joined(separator: " "), grace.text,
+                "Zoom: the row growing alongside it is written whole too")
+    expectEqual(adaTexts.count, ada.sentenceCount, "Zoom: one line per sentence (\(ada.sentenceCount))")
+    expectTrue((adaTexts.map(\.count).max() ?? 0) < 400, "Zoom: no giant line (longest \(adaTexts.map(\.count).max() ?? 0))")
+    expectTrue(writtenWhileTalking >= spokenBeforePause - 2,
+               "Zoom: sentences are written while the row is still growing (\(writtenWhileTalking) of \(spokenBeforePause))")
+    expectEqual(writtenByPause, spokenBeforePause, "Zoom: going idle writes the rest of the row")
+    expectEqual(offStamps(adaLines, ada), 0, "Zoom: every sentence is stamped within a second of when it was spoken")
+    expectTrue((adaLines + graceLines).allSatisfy { $0["continues"] == nil },
+               "Zoom: regrowth after idle arrives as sentences, not a continuation tail")
+    let all = captionLines(jsonl).map { $0["speaker"] as? String }
+    let firstGrace = all.firstIndex(of: "Grace Hopper") ?? -1, lastAda = all.lastIndex(of: "Ada Lovelace") ?? -1
+    expectTrue(firstGrace > 0 && firstGrace < lastAda, "Zoom: two rows growing at once are written side by side")
 }
 
 // --- Checking that a captions press took ------------------------------------
