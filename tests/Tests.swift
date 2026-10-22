@@ -706,13 +706,47 @@ final class StubMeetingApp: MeetingApp {
     func treeReadiness(_ app: AXUIElement) -> TreeReadiness { stubReadiness }
 }
 
-func injectedSession(clock: FakeClock) -> Session {
+func injectedSession(clock: FakeClock, app: MeetingApp = StubMeetingApp()) -> Session {
     var opts = Options()
     opts.quiet = true // LiveView goes non-interactive; status() still stderr
     // Never touch the real user state directory from tests.
     opts.stateDirectory = NSTemporaryDirectory() + "/mc-state-\(UUID().uuidString)"
     return Session(options: opts, live: LiveView(options: opts),
-                   meetingApp: StubMeetingApp(), title: "Test Meeting", clock: clock)
+                   meetingApp: app, title: "Test Meeting", clock: clock)
+}
+
+/// A Meet-like app whose captions state and press behaviour a test scripts.
+final class ScriptedApp: MeetingApp {
+    let id = "scripted"
+    let displayName = "Scripted"
+    let processPattern = "scripted"
+    var captionPressToggles = false
+    var captionsSurfaceIsTransient = false
+    var writesCaptionsBySentence = true
+    let finalizesWhenSuperseded = true
+    let idleFinalizeSeconds: TimeInterval? = 6
+    let reportsMeetingClock = false
+    let rendersWebContent = false
+    /// Captions state as the app would show it.
+    var captionsOn = false
+    /// Whether a press actually turns captions on (Meet at join on
+    /// 2026-10-22: accepted, and ignored).
+    var pressTakes = true
+    private(set) var presses: [Date] = []
+    var now = Date()
+    func meetingAnchor(_ app: AXUIElement) -> AXUIElement? { nil }
+    func meetingTitle(_ app: AXUIElement, anchor: AXUIElement?) -> String { "" }
+    func captionsContainer(_ app: AXUIElement) -> AXUIElement? { nil }
+    func captionEntries(in container: AXUIElement) -> [CaptionEntry] { [] }
+    func captionsPanelOpen(_ app: AXUIElement) -> Bool { captionsOn }
+    func requestCaptions(pid: pid_t) -> CaptionRequest {
+        if captionsOn { return .alreadyOn }
+        presses.append(now)
+        if pressTakes { captionsOn = true }
+        return .pressed
+    }
+    func hasStableIdentity(_ id: String) -> Bool { true }
+    func treeReadiness(_ app: AXUIElement) -> TreeReadiness { .webContent }
 }
 
 // Persistent failure: both sinks reject everything. finish() must burn
@@ -1616,6 +1650,270 @@ do {
     expectTrue(filter.admit("a", at: t0.addingTimeInterval(60), every: 60), "the same message after the interval")
     expectTrue(filter.admit("once", at: t0, every: .infinity), "an infinite interval admits once")
     expectTrue(!filter.admit("once", at: t0.addingTimeInterval(1e9), every: .infinity), "and never again")
+}
+
+// --- Writing a growing caption segment sentence by sentence --------------
+//
+// Regression (Meet, 2026-10-22): a speaker's whole uninterrupted run is ONE
+// growing text element, so a lunch-and-learn talk landed as a single
+// 14,400-character line, stamped with when it began, after sitting unwritten
+// for the whole stretch.
+
+do {
+    typealias CS = CaptionSentences
+    func sentences(_ text: String) -> (complete: [String], rest: String) {
+        let (complete, rest) = CS.split(text, from: text.startIndex)
+        return (complete.map { String(text[$0]).trimmingCharacters(in: .whitespaces) }, String(text[rest]))
+    }
+    expectEqual(sentences("Hello there. How are you? I'm fine").complete, ["Hello there.", "How are you?"],
+                "sentences end at a terminator followed by a space")
+    expectEqual(sentences("Hello there. How are you? I'm fine").rest, "I'm fine", "the unfinished sentence is the rest")
+    expectEqual(sentences("One. Two.").complete, ["One."],
+                "a terminator at the very end does not count yet: recognition may still revise it")
+    expectEqual(sentences("I saw Dr. Smith today. Then").complete, ["I saw Dr. Smith today."],
+                "an abbreviation does not end a sentence")
+    expectEqual(sentences("It costs $2.50 a month. Okay").complete, ["It costs $2.50 a month."],
+                "a decimal point does not end a sentence")
+    expectEqual(sentences("He said \"stop.\" Then we left. And").complete, ["He said \"stop.\"", "Then we left."],
+                "closing quotes stay with their sentence")
+    expectEqual(sentences("Wait... what?! Yes. No").complete, ["Wait...", "what?!", "Yes."],
+                "runs of terminators end one sentence")
+
+    // While a segment grows, its newest complete sentence is held back:
+    // recognition still revises the last words and punctuation.
+    let growing = CS.plan(text: "A one. B two. C thr", written: nil, final: false)
+    expectEqual(growing.lines.map(\.text), ["A one."], "the newest complete sentence waits")
+    expectEqual(growing.through, "A one.", "written through the end of the last line")
+    expectEqual(growing.lines.first?.start, 0, "lines know where they start")
+    let resumed = CS.plan(text: "A one. B two. C three. D", written: "A one.", final: false)
+    expectEqual(resumed.lines.map(\.text), ["B two."], "resumes after what was written")
+    expectEqual(resumed.lines.first?.start, 7, "and counts from the segment start")
+    let done = CS.plan(text: "A one. B two. C thr", written: "A one.", final: true)
+    expectEqual(done.lines.map(\.text), ["B two.", "C thr"], "once done, everything left is written")
+    expectTrue(CS.plan(text: "A one. B tw", written: nil, final: false).through == nil,
+               "nothing to write means no change")
+
+    // Where to pick up when the segment is no longer a simple extension.
+    let text = "so you can submit receipts for care before January. The runout period"
+    expectEqual(CS.resumeIndex(in: text, after: "so you can submit").map { text.distance(from: text.startIndex, to: $0) }, 17,
+                "a prefix resumes right after it")
+    let trimmed = "receipts for care before January. The runout period is ninety days"
+    let afterTrim = CS.resumeIndex(in: trimmed, after: "so you can submit receipts for care before January.")
+    expectEqual(afterTrim.map { String(trimmed[$0...]) }, " The runout period is ninety days",
+                "a front-trimmed segment resumes after the last words written")
+    let revised = "so you can submit receipts for care during January, and then"
+    let afterRevision = CS.resumeIndex(in: revised, after: "so you can submit receipts for care before January.")
+    expectEqual(afterRevision.map { String(revised[$0...]) }, "during January, and then",
+                "a revision near the end resumes at the start of the revised word")
+    expectTrue(CS.resumeIndex(in: "something else entirely", after: "so you can submit receipts") == nil,
+               "replaced text owes all of it")
+
+    // Each stretch of text remembers when it appeared.
+    let t = Date(timeIntervalSince1970: 1_800_000_000)
+    var u = Utterance(speaker: "K", text: "Hello", startedAt: t, changedAt: t, marks: [TextMark(offset: 0, at: t)])
+    u.revise(to: "Hello there", at: t.addingTimeInterval(2))
+    expectEqual(u.firstSeen(atOffset: 6), t.addingTimeInterval(2), "new words are timed when they appeared")
+    expectEqual(u.firstSeen(atOffset: 2), t, "old words keep their time")
+    u.revise(to: "Help there", at: t.addingTimeInterval(3))
+    expectEqual(u.marks, [TextMark(offset: 0, at: t), TextMark(offset: 3, at: t.addingTimeInterval(3))],
+                "a revision re-times only from where it differs")
+}
+
+// The real thing: a 14K-character monologue in one segment, grown a few words
+// per poll with recognition-style revisions, then another speaker.
+do {
+    struct LCG {
+        var state: UInt64
+        mutating func next(_ bound: Int) -> Int {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return Int((state >> 33) % UInt64(bound))
+        }
+    }
+    // Made-up benefits talk, built from a fixed vocabulary.
+    let vocabulary = ["the", "plan", "year", "covers", "eligible", "expenses", "you", "can", "submit",
+                      "receipts", "for", "care", "before", "January", "runout", "period", "of", "ninety",
+                      "days", "and", "funds", "roll", "over", "up", "to", "a", "limit", "so", "keep",
+                      "track", "your", "account", "balance", "every", "month", "because", "reimbursement",
+                      "takes", "about", "two", "weeks", "which", "means", "budget", "ahead", "when",
+                      "school", "starts", "again"]
+    var rng = LCG(state: 42)
+    var tokens: [String] = []
+    var sentenceStarts: [Int] = [] // token index where each sentence begins
+    var monologue = ""
+    while monologue.count < 14_400 {
+        sentenceStarts.append(tokens.count)
+        let length = 4 + rng.next(27)
+        var words = (0..<length).map { _ in vocabulary[rng.next(vocabulary.count)] }
+        if rng.next(10) == 0 { words.insert(contentsOf: ["Dr.", "Lee", "said"], at: min(2, words.count)) }
+        if rng.next(10) == 0 { words.insert(contentsOf: ["about", "$2.50"], at: words.count / 2) }
+        words[0] = words[0].prefix(1).uppercased() + words[0].dropFirst()
+        let end = [".", ".", ".", ".", ".", ".", "?", "?", "!"][rng.next(9)]
+        words[words.count - 1] += end
+        tokens += words
+        monologue = tokens.joined(separator: " ")
+    }
+    let sentenceCount = sentenceStarts.count
+    let boundaries = Set(sentenceStarts.dropFirst().map { $0 - 1 }) // last token of each sentence
+
+    func run(trimAt trimToken: Int?) -> (lines: [[String: Any]], beforeB: Int, longestLive: Int, firstSeen: [Int: Date]) {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = FakeClock(start: t0, step: 0.25)
+        let app = ScriptedApp()
+        let s = injectedSession(clock: clock, app: app)
+        try? FileManager.default.createDirectory(atPath: s.options.stateDirectory, withIntermediateDirectories: true)
+        let jsonl = MemorySink(path: "/tmp/sentences.jsonl")
+        s.recorder = Recorder(options: Options(), startedAt: t0, mode: .timeOfDay,
+                              jsonlURL: URL(fileURLWithPath: jsonl.path), textURL: URL(fileURLWithPath: "/tmp/sentences.txt"),
+                              jsonl: jsonl, text: MemorySink(path: "/tmp/sentences.txt"))
+        s.concludeHistory([]) // nothing to recover; live captions flow straight through
+        var shown = 0, now = t0, longestLive = 0, trimmedChars = 0
+        var firstSeen: [Int: Date] = [:] // token index -> when it first appeared
+        while shown < tokens.count {
+            let previous = shown
+            shown = min(tokens.count, shown + 2 + rng.next(4))
+            for index in previous..<shown { firstSeen[index] = now }
+            var display = Array(tokens[0..<shown])
+            // Recognition revises the tail: a sentence break first shows as a
+            // comma, and the newest word is sometimes misheard for a poll.
+            if let boundary = boundaries.first(where: { $0 >= previous - 1 && $0 < shown - 1 }) {
+                display[boundary] = String(display[boundary].dropLast()) + ","
+                display[boundary + 1] = display[boundary + 1].lowercased()
+            } else if rng.next(4) == 0, !boundaries.contains(shown - 1) {
+                display[shown - 1] = "uh"
+            }
+            if let trimToken, shown > trimToken + 400 {
+                // Meet trims old words off the front, mid-sentence.
+                trimmedChars = tokens[0..<trimToken].joined(separator: " ").count + 1
+            }
+            let text = String(display.joined(separator: " ").dropFirst(trimmedChars))
+            s.ingestCaptions([CaptionEntry(id: "seg:0", speaker: "Kelsey", text: text)], now: now)
+            let live = (try? String(contentsOfFile: s.options.stateDirectory + "/live", encoding: .utf8)) ?? ""
+            longestLive = max(longestLive, live.count)
+            now = now.addingTimeInterval(0.25)
+        }
+        // The finished segment, read correctly, then a pause.
+        let finalText = String(monologue.dropFirst(trimmedChars))
+        for _ in 0..<4 {
+            s.ingestCaptions([CaptionEntry(id: "seg:0", speaker: "Kelsey", text: finalText)], now: now)
+            now = now.addingTimeInterval(0.25)
+        }
+        let beforeB = jsonl.string.split(separator: "\n").filter { $0.contains("\"Kelsey\"") }.count
+        // Someone else speaks, which settles Kelsey's segment.
+        s.ingestCaptions([CaptionEntry(id: "seg:0", speaker: "Kelsey", text: finalText),
+                          CaptionEntry(id: "seg:1", speaker: "Justin", text: "Thanks, that helps.")], now: now)
+        s.finish(at: now.addingTimeInterval(1))
+        let lines = jsonl.string.split(separator: "\n").compactMap {
+            (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any]
+        }.filter { $0["type"] as? String == "caption" }
+        return (lines, beforeB, longestLive, firstSeen)
+    }
+
+    let plain = run(trimAt: nil)
+    let kelsey = plain.lines.filter { $0["speaker"] as? String == "Kelsey" }
+    let texts = kelsey.compactMap { $0["text"] as? String }
+    expectTrue(monologue.count >= 14_400, "the synthetic monologue is at least 14K characters (\(monologue.count))")
+    expectEqual(texts.joined(separator: " "), monologue, "every word written once, in order: nothing lost, nothing repeated")
+    expectEqual(texts.count, sentenceCount, "one line per sentence (\(sentenceCount)), abbreviations and decimals kept whole")
+    expectTrue((texts.map(\.count).max() ?? 0) < 400, "no giant line (longest \(texts.map(\.count).max() ?? 0) characters)")
+    expectTrue(plain.beforeB >= sentenceCount - 2,
+               "sentences are written while the speaker is still talking (\(plain.beforeB) of \(sentenceCount) before anyone else spoke; only the newest two wait)")
+    expectTrue(kelsey.allSatisfy { $0["continues"] == nil }, "sentence lines are not continuation tails the merge tool would glue back")
+    expectTrue(kelsey.allSatisfy { $0["node_id"] as? String == "seg:0" }, "each carries its segment's node_id")
+    expectTrue(plain.lines.last?["speaker"] as? String == "Justin", "the next speaker follows")
+    expectTrue(plain.longestLive < 1_000, "the live line holds only what is not written yet (longest \(plain.longestLive) characters)")
+
+    // Each line is stamped with when its first words appeared (to the second
+    // the transcript keeps), not with when the segment began.
+    let iso = ISO8601DateFormatter()
+    var offStamps = 0, endedBeforeStart = 0
+    for (index, line) in kelsey.enumerated() where index < sentenceStarts.count {
+        guard let ts = (line["ts"] as? String).flatMap(iso.date(from:)),
+              let spoken = plain.firstSeen[sentenceStarts[index]] else { offStamps += 1; continue }
+        if abs(ts.timeIntervalSince(spoken)) > 1.0 { offStamps += 1 }
+        if let ended = (line["ended_at"] as? String).flatMap(iso.date(from:)), ended < ts.addingTimeInterval(-1) {
+            endedBeforeStart += 1
+        }
+    }
+    expectEqual(offStamps, 0, "every sentence is stamped within a second of when it was spoken")
+    expectEqual(endedBeforeStart, 0, "no sentence ends before it starts")
+    let span = (kelsey.first?["ts"] as? String).flatMap(iso.date(from:)).flatMap { first in
+        (kelsey.last?["ts"] as? String).flatMap(iso.date(from:)).map { $0.timeIntervalSince(first) }
+    } ?? 0
+    expectTrue(span > 60, "stamps spread over the talk (\(Int(span))s), not one time for all of it")
+
+    // Meet trims old words off the front of a long segment mid-talk: what was
+    // already written must not be written again, and nothing goes missing.
+    let trimmedRun = run(trimAt: sentenceStarts[sentenceCount / 3] + 5)
+    let trimmedTexts = trimmedRun.lines.filter { $0["speaker"] as? String == "Kelsey" }.compactMap { $0["text"] as? String }
+    expectEqual(trimmedTexts.joined(separator: " "), monologue, "a front trim mid-talk loses and repeats nothing")
+}
+
+// --- Checking that a captions press took ------------------------------------
+//
+// Regression (Meet, 2026-10-22): two presses at join were accepted and
+// ignored, and the daemon gave up after the second. Captions stayed off until
+// they were turned on by hand four minutes later.
+
+do {
+    expectTrue(Session.captionPressIsCheckable(pressToggles: false, surfaceIsTransient: false), "Meet's labelled button can be checked")
+    expectTrue(!Session.captionPressIsCheckable(pressToggles: true, surfaceIsTransient: false), "Teams' toggle shortcut cannot")
+    expectTrue(!Session.captionPressIsCheckable(pressToggles: false, surfaceIsTransient: true), "Slack's speech-only overlay cannot")
+    expectEqual(Session.captionAttemptLimit(checkable: false), 2, "blind presses stop at two")
+    expectEqual(Session.captionAttemptLimit(checkable: true), 5, "checked presses get the backoff")
+    expectEqual(Session.captionRetryDelay(afterAttempt: 1), 10, "first retry soon")
+    expectEqual(Session.captionRetryDelay(afterAttempt: 9), 120, "later ones capped")
+
+    let pid: pid_t = 4242
+    let element = AXUIElementCreateApplication(pid)
+    /// Poll once a second for `seconds`, as the daemon's surface check does.
+    func drive(_ s: Session, _ app: ScriptedApp, from start: Int, seconds: Int, each: (Int) -> Void = { _ in }) {
+        for second in start..<(start + seconds) {
+            each(second)
+            app.now = s.startedAt.addingTimeInterval(TimeInterval(second))
+            s.ensureCaptionsOn(app: element, pid: pid, now: app.now)
+        }
+    }
+    func gaps(_ presses: [Date]) -> [Int] {
+        zip(presses.dropFirst(), presses).map { Int($0.timeIntervalSince($1).rounded()) }
+    }
+
+    // Ignored every time: press, check 3s later, back off, and stop at five.
+    do {
+        let app = ScriptedApp()
+        app.pressTakes = false
+        let s = injectedSession(clock: FakeClock(start: Date(), step: 0), app: app)
+        drive(s, app, from: 4, seconds: 900)
+        expectEqual(app.presses.count, 5, "an ignored press is retried, up to five presses")
+        expectEqual(gaps(app.presses), [13, 33, 63, 123], "each retry waits for the check, then backs off")
+    }
+    // Ignored once, then taken: two presses and done.
+    do {
+        let app = ScriptedApp()
+        app.pressTakes = false
+        let s = injectedSession(clock: FakeClock(start: Date(), step: 0), app: app)
+        drive(s, app, from: 4, seconds: 300) { _ in if app.presses.count == 1 { app.pressTakes = true } }
+        expectEqual(app.presses.count, 2, "a retry that takes ends the retries")
+        expectTrue(app.captionsOn, "captions end up on")
+    }
+    // Taken, then turned off again: turned back on.
+    do {
+        let app = ScriptedApp()
+        let s = injectedSession(clock: FakeClock(start: Date(), step: 0), app: app)
+        s.ledger.markPopulated(pid: pid)
+        drive(s, app, from: 4, seconds: 60) { second in if second == 30 { app.captionsOn = false } }
+        expectEqual(app.presses.count, 2, "captions that go off again are turned back on")
+        expectTrue(app.captionsOn, "and stay on")
+    }
+    // A blind toggle is never checked and never pressed more than twice.
+    do {
+        let app = ScriptedApp()
+        app.captionPressToggles = true
+        app.pressTakes = false
+        let s = injectedSession(clock: FakeClock(start: Date(), step: 0), app: app)
+        s.ledger.markPopulated(pid: pid)
+        drive(s, app, from: 4, seconds: 600)
+        expectEqual(app.presses.count, 2, "a toggle shortcut keeps its two blind tries")
+    }
 }
 
 // --- Summary ------------------------------------------------------------

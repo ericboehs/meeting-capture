@@ -213,6 +213,15 @@ side panel to captions, which is worth knowing if you were reading another tab
 in it. Meet's button says which way it goes
 ("Turn on captions" against "Turn off captions"), so it is never a guess.
 
+Because Meet's and Zoom's controls say which way they go, every press is also
+checked: three seconds later captions should be on. Meet once accepted two
+presses at the start of a call and ignored both, and captions stayed off until
+they were turned on by hand. So a press that didn't take is logged, along with
+what the button says, and pressed again after 10, 30, 60 and then 120 seconds,
+five presses in all. Captions that come on and later go off again are logged
+and turned back on. Teams' shortcut is a blind toggle and Slack's overlay only
+shows while someone talks, so neither can be checked, and both keep two tries.
+
 Zoom takes two extra steps. Unless you've pinned it, its captions control lives
 in the **More** overflow, so the button gets opened first and put back if the
 item isn't there. And Zoom drops its whole toolbar out of the accessibility tree
@@ -439,9 +448,20 @@ The daemon polls the accessibility tree of each supported app:
      scrolling the list top to bottom. Those lines are written first, stamped
      with the join time and marked `"history": true`; live captions are held
      back until then (at most a minute) so the transcript stays in order.
-   - **Google Meet** keeps one block per speaker holding a list of sentences,
-     appending as each finishes and revising only the last. Nothing carries a
-     DOM id, so a sentence is identified by its position in that list rather
+   - **Google Meet** keeps one block per speaker holding a list of segments,
+     appending as each finishes and revising only the last. A segment is a
+     run of speech up to a pause, not a sentence, so someone who talks without
+     stopping makes one segment that just keeps growing: a lunch-and-learn
+     talk once landed as a single 14,400-character line, written only when
+     someone else finally spoke. So Meet segments are written a sentence at a
+     time, each once a whole sentence has followed it (recognition keeps
+     revising the newest words and punctuation), and each stamped with when
+     its first words appeared. The lines share the segment's `node_id` but
+     are not `"continues"` tails, which the merge tool would glue back
+     together. When Meet trims old words off the front of a segment, writing
+     picks up after the last words already written, wherever they now sit.
+     Nothing carries a
+     DOM id, so a segment is identified by its position in that list rather
      than by its text — people say "Yeah." twice, and hashing would file that
      as one.
      The speaker's name is a block of its own, written just before the words,

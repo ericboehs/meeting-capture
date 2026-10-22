@@ -231,6 +231,18 @@ func findElement(from root: AXUIElement, depth: Int = 0, where match: (AXUIEleme
     return nil
 }
 
+/// Every match, depth-first, up to `limit`.
+func findElements(from root: AXUIElement, limit: Int, where match: (AXUIElement) -> Bool) -> [AXUIElement] {
+    var found: [AXUIElement] = []
+    func walk(_ element: AXUIElement, depth: Int) {
+        guard depth < 80, found.count < limit else { return }
+        if match(element) { found.append(element) }
+        for child in axChildren(element) { walk(child, depth: depth + 1) }
+    }
+    walk(root, depth: 0)
+    return found
+}
+
 func axWindows(_ app: AXUIElement) -> [AXUIElement] {
     axAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
 }
@@ -665,6 +677,153 @@ struct Utterance {
     var text: String
     var startedAt: Date
     var changedAt: Date
+    /// When each stretch of `text` first appeared, oldest first: a mark at
+    /// offset n means the characters from n on were first seen at `at`. Only
+    /// kept for apps that write a segment sentence by sentence, so each
+    /// sentence can be stamped with when it was spoken rather than when the
+    /// segment began.
+    var marks: [TextMark] = []
+
+    /// When the character at `offset` was first seen.
+    func firstSeen(atOffset offset: Int) -> Date {
+        marks.last { $0.offset <= offset }?.at ?? startedAt
+    }
+
+    /// Take a new reading of the text. Whatever differs from the last reading
+    /// counts as spoken now; the stretch before it keeps its time.
+    mutating func revise(to newText: String, at now: Date) {
+        let common = zip(text, newText).prefix { $0 == $1 }.count
+        marks.removeAll { $0.offset >= common }
+        if newText.count > common { marks.append(TextMark(offset: common, at: now)) }
+        text = newText
+    }
+}
+
+struct TextMark: Equatable {
+    let offset: Int
+    let at: Date
+}
+
+/// Writing a caption segment one sentence at a time.
+///
+/// Google Meet keeps a speaker's whole uninterrupted run of speech in ONE
+/// growing text element. A segment used to be written only once it was done,
+/// so a presenter who never paused became one line: measured live on
+/// 2026-10-22, a lunch-and-learn talk landed as a single 14,400-character
+/// line, stamped with when it began, after sitting unwritten for the whole
+/// stretch. These pieces let the session write each sentence once it has
+/// settled, stamped with when it was spoken.
+enum CaptionSentences {
+    /// One sentence to write: its text, and where it sits in the segment (in
+    /// characters), so it can be timed against Utterance.marks.
+    struct Line: Equatable {
+        let text: String
+        let start: Int
+        let end: Int
+    }
+
+    struct Plan {
+        let lines: [Line]
+        /// The segment's text up to the end of the last line: what has been
+        /// written once these land. nil when there is nothing to write.
+        let through: String?
+    }
+
+    static let terminators: Set<Character> = [".", "!", "?", "…"]
+    static let closers: Set<Character> = ["\"", "'", "”", "’", ")", "]"]
+    /// Words that end in a period without ending the sentence. Splitting on
+    /// them would only break a line mid-sentence (nothing is lost), but "Dr."
+    /// alone on a line reads like a bug.
+    static let abbreviations: Set<String> = [
+        "mr", "mrs", "ms", "dr", "st", "jr", "sr", "vs", "e.g", "i.e", "a.m", "p.m", "u.s"
+    ]
+
+    /// Split `text` from `start` into complete sentences and what follows the
+    /// last of them. A sentence ends at a run of terminators (plus any closing
+    /// quotes or brackets) followed by whitespace. A terminator at the very end
+    /// of the text does not count yet: the speaker may still be mid-word, and
+    /// recognition revises the end of a segment as it goes.
+    static func split(_ text: String, from start: String.Index)
+        -> (complete: [Range<String.Index>], rest: Range<String.Index>) {
+        let end = text.endIndex
+        func skipSpace(_ index: String.Index) -> String.Index {
+            var index = index
+            while index < end, text[index].isWhitespace { index = text.index(after: index) }
+            return index
+        }
+        var complete: [Range<String.Index>] = []
+        var sentenceStart = skipSpace(start)
+        var index = sentenceStart
+        while index < end {
+            guard terminators.contains(text[index]) else {
+                index = text.index(after: index)
+                continue
+            }
+            let terminator = index
+            var after = text.index(after: index)
+            while after < end, terminators.contains(text[after]) { after = text.index(after: after) }
+            while after < end, closers.contains(text[after]) { after = text.index(after: after) }
+            if after < end, text[after].isWhitespace,
+               !(text[terminator] == "." && endsInAbbreviation(text[sentenceStart..<terminator])) {
+                complete.append(sentenceStart..<after)
+                sentenceStart = skipSpace(after)
+                index = sentenceStart
+            } else {
+                index = after
+            }
+        }
+        return (complete, sentenceStart..<end)
+    }
+
+    static func endsInAbbreviation(_ text: Substring) -> Bool {
+        let word = text.split(whereSeparator: \.isWhitespace).last ?? ""
+        let bare = word.drop { "\"'(“‘[".contains($0) }.lowercased()
+        return abbreviations.contains(bare)
+    }
+
+    /// Where `text` picks up after `written`, which was taken from an earlier
+    /// reading of the same segment. Meet revises a segment in place and trims
+    /// old words off its front, so `written` is not always a prefix:
+    ///  1. still a prefix: resume right after it;
+    ///  2. front-trimmed: resume after the last words written, wherever they
+    ///     now sit (the last 48 characters of them, or 32 or 16 if the trim
+    ///     cut into those);
+    ///  3. revised near its end: resume at the start of the word the revision
+    ///     landed in, as long as at least half of `written` is intact.
+    /// nil when none of these hold: the text was replaced and owes all of it.
+    static func resumeIndex(in text: String, after written: String) -> String.Index? {
+        if written.isEmpty { return text.startIndex }
+        if text.hasPrefix(written) { return text.index(text.startIndex, offsetBy: written.count) }
+        for anchorLength in [48, 32, 16] where written.count >= anchorLength {
+            if let found = text.range(of: String(written.suffix(anchorLength))) { return found.upperBound }
+        }
+        let common = zip(text, written).prefix { $0 == $1 }.count
+        guard common * 2 >= written.count else { return nil }
+        var index = text.index(text.startIndex, offsetBy: common)
+        while index > text.startIndex, !text[text.index(before: index)].isWhitespace {
+            index = text.index(before: index)
+        }
+        return index
+    }
+
+    /// What to write of a segment now. While it is still being spoken
+    /// (`final` false), every complete sentence but the newest: recognition
+    /// keeps revising the last words and punctuation, and a sentence with a
+    /// whole sentence after it has settled. Once the segment is done,
+    /// everything left, unfinished sentence included.
+    static func plan(text: String, written: String?, final: Bool) -> Plan {
+        let resume = written.flatMap { resumeIndex(in: text, after: $0) } ?? text.startIndex
+        let (complete, rest) = split(text, from: resume)
+        var ranges = final ? complete : Array(complete.dropLast())
+        if final, !text[rest].allSatisfy(\.isWhitespace) { ranges.append(rest) }
+        guard let last = ranges.last else { return Plan(lines: [], through: nil) }
+        let lines = ranges.map { range in
+            Line(text: text[range].trimmingCharacters(in: .whitespacesAndNewlines),
+                 start: text.distance(from: text.startIndex, to: range.lowerBound),
+                 end: text.distance(from: text.startIndex, to: range.upperBound))
+        }.filter { !$0.text.isEmpty }
+        return Plan(lines: lines, through: String(text[..<last.upperBound]))
+    }
 }
 
 /// The scrolling terminal view: finished lines scroll up, in-progress speech
@@ -1324,6 +1483,14 @@ protocol MeetingApp {
     /// True when the captions control is a toggle (Teams' ⇧⌘A). A second
     /// press would turn them back off, so we must not retry blindly.
     var captionPressToggles: Bool { get }
+    /// What the captions control says right now, for the log when a press did
+    /// not turn captions on (e.g. `its button reads "Turn on captions"`), so
+    /// the next time an app ignores a press there is something to go on.
+    func captionsControlDescription(_ app: AXUIElement) -> String?
+    /// True when one caption segment can hold a long run of speech that keeps
+    /// growing, so it is written a sentence at a time as each one settles
+    /// rather than all at once when it is done (see CaptionSentences).
+    var writesCaptionsBySentence: Bool { get }
 
     func chatContainer(_ app: AXUIElement) -> AXUIElement?
     func chatMessages(in container: AXUIElement) -> [ChatMessage]
@@ -1406,6 +1573,8 @@ extension MeetingApp {
     func reportedElapsedSeconds(_ app: AXUIElement) -> TimeInterval? { nil }
     var reportsMeetingClock: Bool { false }
     var captionPressToggles: Bool { false }
+    func captionsControlDescription(_ app: AXUIElement) -> String? { nil }
+    var writesCaptionsBySentence: Bool { false }
     // Only Teams exposes a readable participant list so far.
     var supportsRosterSnapshot: Bool { false }
     // Assume the pessimistic case: a reader that takes the pointer.
@@ -3671,6 +3840,27 @@ final class MeetApp: MeetingApp {
         }
     }
 
+    /// Every captions button and what it says. On 2026-10-22 two presses at
+    /// join were accepted and captions never came on, while one pressed by hand
+    /// minutes later worked at once. Whether the first match was the wrong
+    /// element (a hidden duplicate) is exactly what this would have shown.
+    func captionsControlDescription(_ app: AXUIElement) -> String? {
+        let buttons = findElements(from: app, limit: 4) {
+            let label = axDescription($0)
+            return label == captionsOnLabel || label == captionsOffLabel
+        }
+        let labels = buttons.map { "\"\(axDescription($0))\"" }.joined(separator: ", ")
+        switch buttons.count {
+        case 0: return "no captions button in the tree"
+        case 1: return "its button reads \(labels)"
+        default: return "\(buttons.count) captions buttons, reading \(labels)"
+        }
+    }
+
+    /// A speaker's whole uninterrupted run is one growing segment (see
+    /// CaptionSentences), so write it sentence by sentence.
+    var writesCaptionsBySentence: Bool { true }
+
     /// Captions are one block per speaker - a name, then a group of text
     /// segments - laid out as alternating children. Segments are appended as
     /// sentences finish; only the last one is still being revised.
@@ -3994,6 +4184,36 @@ final class Session {
     static let historyBudgetSeconds: TimeInterval = 60
     private var captionAttempts = 0
     private var warnedCaptionsUnreachable = false
+    /// When to look whether the last press turned captions on. Set only for
+    /// apps whose captions state can be read back; checked once, then cleared.
+    private var captionPressCheckAt: Date?
+    /// When captions were last seen coming on, for the log when they go off.
+    private var captionsOnSince: Date?
+    /// How long after a press to look. Meet flips its button label within
+    /// half a second of a press that takes.
+    static let captionPressCheckSeconds: TimeInterval = 3
+    /// How long to wait before pressing again after a press that did not
+    /// take, by attempt. Its length sets how many presses a checkable app gets.
+    static let captionRetrySeconds: [TimeInterval] = [10, 30, 60, 120]
+
+    /// Whether a press can be checked: the control says which way it goes and
+    /// the captions stay on screen. Not Teams (a blind toggle shortcut, where
+    /// a second press turns captions back off) and not Slack (captions only
+    /// show while someone speaks, so silence looks like "off").
+    static func captionPressIsCheckable(pressToggles: Bool, surfaceIsTransient: Bool) -> Bool {
+        !pressToggles && !surfaceIsTransient
+    }
+
+    /// How many presses to spend: two blind tries, or one plus a retry for
+    /// every backoff step when each press is checked.
+    static func captionAttemptLimit(checkable: Bool) -> Int {
+        checkable ? 1 + captionRetrySeconds.count : 2
+    }
+
+    /// How long to wait after the given (1-based) attempt did not take.
+    static func captionRetryDelay(afterAttempt attempt: Int) -> TimeInterval {
+        captionRetrySeconds[min(max(attempt, 1), captionRetrySeconds.count) - 1]
+    }
     /// finish() must be idempotent: it runs both on leave detection and on exit,
     /// and running twice would double-flush and double-report.
     var finished = false
@@ -4566,9 +4786,16 @@ final class Session {
     }
 
     /// Turn captions on if the panel isn't up. Gives up quickly: toggling a
-    /// shortcut we can't verify is worse than missing a transcript.
-    private func ensureCaptionsOn(app: AXUIElement, pid: pid_t, now: Date) {
+    /// shortcut we can't verify is worse than missing a transcript. A press
+    /// that CAN be verified is: three seconds later, captions should be on.
+    /// If not, the app accepted the press and ignored it (Meet did, twice, at
+    /// the start of a call on 2026-10-22), so say so and press again later.
+    /// Internal so tests can drive it with a scripted app.
+    func ensureCaptionsOn(app: AXUIElement, pid: pid_t, now: Date) {
+        let name = meetingApp.displayName
         if meetingApp.captionsPanelOpen(app) {
+            captionPressCheckAt = nil
+            if !sawCaptions { captionsOnSince = now }
             sawCaptions = true
             return
         }
@@ -4583,13 +4810,41 @@ final class Session {
             guard ledger.isPopulated(pid: pid) else { return }
             sawCaptions = false
             captionAttempts = 0
+            captionPressCheckAt = nil
+            if !options.quiet {
+                let lasted = captionsOnSince.map { " \(Int(now.timeIntervalSince($0)))s after coming on" } ?? ""
+                status("\(name)'s captions went off\(lasted); turning them back on")
+            }
         }
-        guard captionAttempts < 2,
+        let checkable = Session.captionPressIsCheckable(
+            pressToggles: meetingApp.captionPressToggles,
+            surfaceIsTransient: meetingApp.captionsSurfaceIsTransient)
+        let limit = Session.captionAttemptLimit(checkable: checkable)
+        if let checkAt = captionPressCheckAt {
+            guard now >= checkAt else { return }
+            captionPressCheckAt = nil
+            if !options.quiet {
+                let control = meetingApp.captionsControlDescription(app).map { " (\($0))" } ?? ""
+                let late = Int(Session.captionPressCheckSeconds)
+                if captionAttempts < limit {
+                    let wait = Session.captionRetryDelay(afterAttempt: captionAttempts)
+                    status("\(name) accepted the captions press but captions are still off \(late)s later\(control); pressing again in \(Int(wait))s")
+                } else {
+                    status("\(name) has ignored \(captionAttempts) presses of its captions control\(control); turn captions on in the meeting to record what is said")
+                }
+            }
+            if captionAttempts < limit {
+                nextCaptionCheck = now.addingTimeInterval(Session.captionRetryDelay(afterAttempt: captionAttempts))
+            }
+            return
+        }
+        guard captionAttempts < limit,
               now.timeIntervalSince(startedAt) > 3,
               now >= nextCaptionCheck else { return }
         nextCaptionCheck = now.addingTimeInterval(8)
         switch meetingApp.requestCaptions(pid: pid) {
         case .alreadyOn:
+            if !sawCaptions { captionsOnSince = now }
             sawCaptions = true
             return
         case .unreachable:
@@ -4605,6 +4860,8 @@ final class Session {
             }
             if meetingApp.captionPressToggles && !ledger.isPopulated(pid: pid) {
                 sawCaptions = true
+            } else if checkable {
+                captionPressCheckAt = now.addingTimeInterval(Session.captionPressCheckSeconds)
             } else {
                 nextCaptionCheck = now.addingTimeInterval(20)
             }
@@ -4614,11 +4871,18 @@ final class Session {
     private func pollCaptions(now: Date) {
         guard let container = captionsContainer else { return }
         let entries = meetingApp.captionEntries(in: container)
-        if !entries.isEmpty { sawCaptions = true }
-        refreshWrittenLines(visibleIn: entries, now: now)
         if entries.isEmpty && axChildren(container).isEmpty {
             captionsContainer = nil // panel closed or re-rendered
         }
+        ingestCaptions(entries, now: now)
+    }
+
+    /// Take in one reading of the caption surface. Separate from pollCaptions
+    /// so tests can drive a session with scripted readings.
+    func ingestCaptions(_ entries: [CaptionEntry], now: Date) {
+        let bySentence = meetingApp.writesCaptionsBySentence
+        if !entries.isEmpty { sawCaptions = true }
+        refreshWrittenLines(visibleIn: entries, now: now)
         let visible = Set(entries.map(\.id))
         finalized.formIntersection(visible) // let ids be reused once they are gone
         finalizedText = finalizedText.filter { visible.contains($0.key) }
@@ -4641,11 +4905,17 @@ final class Session {
                     }
                 }
                 utterance.speaker = entry.speaker
-                utterance.text = entry.text
+                if bySentence {
+                    if utterance.text != entry.text { utterance.revise(to: entry.text, at: now) }
+                } else {
+                    utterance.text = entry.text
+                }
                 activeCaptions[entry.id] = utterance
             } else {
-                activeCaptions[entry.id] = Utterance(
+                var utterance = Utterance(
                     speaker: entry.speaker, text: entry.text, startedAt: now, changedAt: now)
+                if bySentence { utterance.marks = [TextMark(offset: 0, at: now)] }
+                activeCaptions[entry.id] = utterance
                 captionOrder.append(entry.id)
             }
         }
@@ -4673,11 +4943,27 @@ final class Session {
                 finalizeCaption(id, at: now)
             }
         }
+        // A segment still being spoken writes each sentence once it settles,
+        // instead of all at once when the speaker finally stops.
+        if bySentence {
+            for id in captionOrder {
+                guard let utterance = activeCaptions[id], utterance.changedAt == now else { continue }
+                writeSentences(of: utterance, id: id, final: false)
+            }
+        }
         guard recorder != nil || !captionOrder.isEmpty else { return }
         // Mirror every in-progress utterance; finished lines scroll above.
         let pending = Session.liveLines(captionOrder.compactMap { id -> Utterance? in
-            guard let utterance = activeCaptions[id],
+            guard var utterance = activeCaptions[id],
                   !supersededByActive(utterance, id: id) else { return nil }
+            // Only what is not written yet: the live line of a long segment
+            // would otherwise repeat every sentence already on disk.
+            if bySentence, let written = emittedText[id],
+               let resume = CaptionSentences.resumeIndex(in: utterance.text, after: written) {
+                let offset = utterance.text.distance(from: utterance.text.startIndex, to: resume)
+                utterance.startedAt = utterance.firstSeen(atOffset: offset)
+                utterance.text = String(utterance.text[resume...]).trimmingCharacters(in: .whitespaces)
+            }
             return utterance
         }, after: lastStamp)
         let shown = pending.enumerated().map { $0.offset == pending.count - 1 ? "\($0.element) ▍" : $0.element }
@@ -4829,6 +5115,27 @@ final class Session {
         return tail.isEmpty ? nil : tail
     }
 
+    /// Write the sentences of a segment that are ready (see
+    /// CaptionSentences.plan): the settled ones while it is still being
+    /// spoken, everything left once it is done. Each is stamped with when its
+    /// first words appeared, and carries the segment's node_id so a reader can
+    /// put the segment back together. Deliberately NOT "continues": the merge
+    /// tool stitches those onto their row, and would rebuild the very line
+    /// this exists to break up.
+    private func writeSentences(of utterance: Utterance, id: String, final: Bool) {
+        let plan = CaptionSentences.plan(text: utterance.text, written: emittedText[id], final: final)
+        guard let through = plan.through else { return }
+        for line in plan.lines {
+            let endedAt = utterance.firstSeen(atOffset: max(line.end - 1, line.start))
+            emit(kind: "caption", speaker: utterance.speaker, body: line.text,
+                 at: utterance.firstSeen(atOffset: line.start),
+                 extra: ["node_id": id, "ended_at": Recorder.isoFormatter.string(from: endedAt)])
+        }
+        // emit queues failed writes onto the ordered backlog, so the segment
+        // counts as written up to here either way.
+        emittedText[id] = through
+    }
+
     private func finalizeCaption(_ id: String, at date: Date) {
         guard let utterance = activeCaptions.removeValue(forKey: id) else { return }
         captionOrder.removeAll { $0 == id }
@@ -4836,6 +5143,12 @@ final class Session {
         finalizedText[id] = utterance.text
         guard !utterance.text.isEmpty else { return }
         guard !supersededByActive(utterance, id: id), !alreadyWritten(utterance, id: id, now: date) else { return }
+        if meetingApp.writesCaptionsBySentence {
+            writeSentences(of: utterance, id: id, final: true)
+            written.append(WrittenLine(speaker: utterance.speaker, text: utterance.text, at: date))
+            if written.count > 40 { written.removeFirst(written.count - 40) }
+            return
+        }
         // A row picking up where it left off contributes only its new tail.
         guard let body = Session.unwrittenPart(of: utterance.text, alreadyEmitted: emittedText[id])
         else { return }
