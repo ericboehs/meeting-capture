@@ -697,6 +697,47 @@ struct Utterance {
         if newText.count > common { marks.append(TextMark(offset: common, at: now)) }
         text = newText
     }
+
+    /// Whether `new` is a later reading of the same utterance as `old`, rather
+    /// than a different one put up in the same element.
+    ///
+    /// Growing and trimming keep a prefix. A correction (a word misheard, then
+    /// fixed) can land anywhere, even on the first word, so beyond prefixes
+    /// it is the same utterance when at least half of the old reading's words
+    /// survive, in order. A different utterance in the same element shares
+    /// next to none: Slack's live slot keeps its id and moves on to the next
+    /// sentence when a turnover is missed.
+    ///
+    /// The start of an utterance is what this protects. Treating every
+    /// correction as a new utterance re-stamped it with the time of its last
+    /// correction, so a long line that recognition kept revising was stamped
+    /// near when it ended: on 2026-10-22, a Meet talk that began 11:36:19
+    /// was stamped 11:51:02.
+    static func isSameUtterance(_ old: String, _ new: String) -> Bool {
+        if new.hasPrefix(old) || old.hasPrefix(new) { return true }
+        // Words, case and edge punctuation aside ("Thursday," is "thursday"),
+        // from the start of each reading only: enough to tell the two cases
+        // apart, and it keeps this cheap however long the text grows.
+        func words(_ text: String) -> [String] {
+            text.prefix(800).lowercased().split(whereSeparator: \.isWhitespace).prefix(64)
+                .map { $0.trimmingCharacters(in: .punctuationCharacters) }
+                .filter { !$0.isEmpty }
+        }
+        let before = words(old), after = words(new)
+        guard !before.isEmpty else { return true }
+        guard !after.isEmpty else { return false }
+        // Longest common subsequence of the two word lists, one row at a time.
+        var row = [Int](repeating: 0, count: after.count + 1)
+        for word in before {
+            var diagonal = 0
+            for column in 1...after.count {
+                let above = row[column]
+                row[column] = word == after[column - 1] ? diagonal + 1 : max(above, row[column - 1])
+                diagonal = above
+            }
+        }
+        return row[after.count] * 2 >= before.count
+    }
 }
 
 struct TextMark: Equatable {
@@ -710,9 +751,9 @@ struct TextMark: Equatable {
 /// growing text element. A segment used to be written only once it was done,
 /// so a presenter who never paused became one line: measured live on
 /// 2026-10-22, a lunch-and-learn talk landed as a single 14,400-character
-/// line, stamped with when it began, after sitting unwritten for the whole
-/// stretch. These pieces let the session write each sentence once it has
-/// settled, stamped with when it was spoken.
+/// line after sitting unwritten for the whole stretch (and stamped near when
+/// it ended; see Utterance.isSameUtterance). These pieces let the session
+/// write each sentence once it has settled, stamped with when it was spoken.
 enum CaptionSentences {
     /// One sentence to write: its text, and where it sits in the segment (in
     /// characters), so it can be timed against Utterance.marks.
@@ -4910,8 +4951,10 @@ final class Session {
             if var utterance = activeCaptions[entry.id] {
                 if utterance.text != entry.text {
                     utterance.changedAt = now
-                    // Same node, new sentence (not a live edit growing the text).
-                    if !entry.text.hasPrefix(utterance.text) && !utterance.text.hasPrefix(entry.text) {
+                    // A different utterance in the same element starts now; a
+                    // correction to the same one keeps its start. (Writing by
+                    // sentence stamps from `marks`, which revise() keeps.)
+                    if !bySentence, !Utterance.isSameUtterance(utterance.text, entry.text) {
                         utterance.startedAt = now
                     }
                 }
@@ -4968,12 +5011,16 @@ final class Session {
             guard var utterance = activeCaptions[id],
                   !supersededByActive(utterance, id: id) else { return nil }
             // Only what is not written yet: the live line of a long segment
-            // would otherwise repeat every sentence already on disk.
-            if bySentence, let written = emittedText[id],
-               let resume = CaptionSentences.resumeIndex(in: utterance.text, after: written) {
-                let offset = utterance.text.distance(from: utterance.text.startIndex, to: resume)
+            // would otherwise repeat every sentence already on disk. Stamped
+            // from `marks`, like the sentences it will be written as.
+            if bySentence {
+                var offset = 0
+                if let written = emittedText[id],
+                   let resume = CaptionSentences.resumeIndex(in: utterance.text, after: written) {
+                    offset = utterance.text.distance(from: utterance.text.startIndex, to: resume)
+                    utterance.text = String(utterance.text[resume...]).trimmingCharacters(in: .whitespaces)
+                }
                 utterance.startedAt = utterance.firstSeen(atOffset: offset)
-                utterance.text = String(utterance.text[resume...]).trimmingCharacters(in: .whitespaces)
             }
             return utterance
         }, after: lastStamp)

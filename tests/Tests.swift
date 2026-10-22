@@ -1956,6 +1956,79 @@ do {
     expectTrue(firstGrace > 0 && firstGrace < lastAda, "Zoom: two rows growing at once are written side by side")
 }
 
+// A corrected word keeps a line's start. Teams and Slack write a row whole,
+// stamped with when it began; treating a correction as a new utterance
+// re-stamped it with the time of the correction.
+do {
+    let U = Utterance.self
+    expectTrue(U.isSameUtterance("We should ship", "We should ship it Thursday"), "same utterance: growing")
+    expectTrue(U.isSameUtterance("We should ship the bill on Thursday", "We should ship the build on Thursday after review."),
+               "same utterance: a word corrected mid-line")
+    expectTrue(U.isSameUtterance("Nope, I think we can.", "No, I think we can."), "same utterance: the first word corrected")
+    expectTrue(U.isSameUtterance("Hey, I'll send the deck", "Hey, I'll send the doc tomorrow morning"),
+               "same utterance: corrected and grown in one reading")
+    expectTrue(!U.isSameUtterance("Thanks, that helps a lot.", "So the next item is the budget review."),
+               "different utterance: Slack's live slot moving on")
+    expectTrue(!U.isSameUtterance("Yeah.", "Okay, moving on."), "different utterance: a short reply replaced")
+    expectTrue(!U.isSameUtterance("So the next thing on the agenda is the budget.", "The end."),
+               "different utterance: sharing a word is not enough")
+
+    let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+    func clock(_ seconds: Double) -> String { Recorder.isoFormatter.string(from: t0.addingTimeInterval(seconds)) }
+    func row(_ id: String, _ text: String) -> CaptionEntry { CaptionEntry(id: id, speaker: "Ada Lovelace", text: text) }
+    /// Feed readings at t0 + seconds; returns each caption line's text and real start.
+    func written(_ app: MeetingApp, _ readings: [(at: Double, rows: [CaptionEntry])]) -> [String: String] {
+        let (s, jsonl) = captionSession(app, at: t0)
+        for reading in readings { s.ingestCaptions(reading.rows, now: t0.addingTimeInterval(reading.at)) }
+        s.finish(at: t0.addingTimeInterval((readings.last?.at ?? 0) + 1))
+        let lines = captionLines(jsonl)
+        expectEqual(Set(lines.compactMap { $0["text"] as? String }).count, lines.count, "\(app.displayName): no line written twice")
+        return Dictionary(lines.map { (($0["text"] as? String) ?? "", (($0["started_at"] ?? $0["ts"]) as? String) ?? "") },
+                          uniquingKeysWith: { first, _ in first })
+    }
+
+    let teams = written(TeamsApp(), [
+        (0, [row("seg:0", "We should ship the bill")]),
+        (1, [row("seg:0", "We should ship the bill on Thursday")]),
+        (2, [row("seg:0", "We should ship the build on Thursday after review")]),
+        (3, [row("seg:0", "We should ship the build on Thursday after review.")]),
+        (4, []), // scrolled away
+    ])
+    expectEqual(Array(teams.keys), ["We should ship the build on Thursday after review."], "Teams: the corrected row is written once")
+    expectEqual(teams.values.first, clock(0), "Teams: a word corrected mid-line keeps the line's start, not the time of the correction")
+
+    let slack = written(SlackApp(), [
+        (0, [row("live:0", "Nope, I think we can")]),
+        (1, [row("live:0", "No, I think we can make it")]),
+        (2, [row("live:0", "No, I think we can make it work.")]),
+        (3, []), // faded
+    ])
+    expectEqual(Array(slack.keys), ["No, I think we can make it work."], "Slack: the corrected event is written once")
+    expectEqual(slack.values.first, clock(0), "Slack: a corrected first word keeps the line's start")
+
+    // Slack misses a turnover: the live slot keeps its id and moves on to the
+    // next sentence, while the one it held shows up settled.
+    let slot = written(SlackApp(), [
+        (0, [row("live:0", "Thanks, that helps a lot.")]),
+        (1, [row("seg:0", "Thanks, that helps a lot."), row("live:0", "So the next item")]),
+        (2, [row("seg:0", "Thanks, that helps a lot."), row("live:0", "So the next item is the budget review.")]),
+        (3, []),
+    ])
+    expectEqual(slot.keys.sorted(), ["So the next item is the budget review.", "Thanks, that helps a lot."],
+                "Slack: both sentences from a missed turnover are written")
+    expectEqual(slot["So the next item is the budget review."], clock(1),
+                "Slack: a different sentence in the same slot starts when it appeared")
+
+    // Writing by sentence: the live line of a segment whose first sentence is
+    // still unwritten keeps its start through a correction too.
+    let (s, _) = captionSession(ScriptedApp(), at: t0)
+    s.ingestCaptions([row("seg:0", "We should ship the bill")], now: t0)
+    s.ingestCaptions([row("seg:0", "We should ship the build on Thursday")], now: t0.addingTimeInterval(2))
+    let live = (try? String(contentsOfFile: s.options.stateDirectory + "/live", encoding: .utf8)) ?? ""
+    expectTrue(live.contains("[\(Recorder.clockText(from: t0))] Ada Lovelace: We should ship the build"),
+               "Meet: a correction does not move the live line's stamp (live: \(live.prefix(60)))")
+}
+
 // --- Checking that a captions press took ------------------------------------
 //
 // Regression (Meet, 2026-10-22): two presses at join were accepted and

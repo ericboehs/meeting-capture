@@ -351,7 +351,10 @@ still readable years later on its own:
 Transcript stamps are always the time of day, so a quote can be lined up
 against a calendar entry, a chat message, or someone else's recording without
 arithmetic. The header supplies the date, and — where the app publishes a call
-clock — when the meeting was already running.
+clock — when the meeting was already running. A caption line is stamped with
+when its first words appeared: recognition corrects words after showing them,
+and a correction keeps the line's stamp, while a different sentence put up in
+the same place gets a stamp of its own.
 (One naming caveat: the header line "meeting started" and the jsonl field
 `meeting_started_at` are historical names — they record when this *participant*
 connected per the app's own clock, not when the meeting was convened.)
