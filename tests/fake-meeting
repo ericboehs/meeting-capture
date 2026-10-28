@@ -1,0 +1,265 @@
+#!/usr/bin/env swift
+
+// fake-meeting — act out a meeting on disk, the way the daemon writes one, so
+// the canvas Meeting card (pi-boehsline) can be built and tested without a
+// real call. Writes exactly the files docs/canvas-contract.md describes.
+//
+//   tests/fake-meeting                      ~2 minute meeting under /tmp/meeting-capture-fake
+//   tests/fake-meeting --root DIR --speed 4 four times faster
+//   tests/fake-meeting --no-slides          a meeting where nobody shares
+//
+// Point the canvas at it with MEETING_CAPTURE_STATE_DIR=<root>/state.
+// Everything is synthetic: names, words and slides are made up here.
+
+import AppKit
+import Foundation
+import ImageIO
+import UniformTypeIdentifiers
+
+setvbuf(stdout, nil, _IOLBF, 0)
+
+var root = "/tmp/meeting-capture-fake"
+var speed = 1.0
+var slides = true
+var args = Array(CommandLine.arguments.dropFirst())
+while !args.isEmpty {
+    switch args.removeFirst() {
+    case "--root": root = args.removeFirst()
+    case "--speed": speed = max(0.1, Double(args.removeFirst()) ?? 1)
+    case "--no-slides": slides = false
+    default:
+        print("usage: fake-meeting [--root DIR] [--speed N] [--no-slides]")
+        exit(2)
+    }
+}
+
+let fm = FileManager.default
+let stateDir = root + "/state"
+let dataDir = root + "/data"
+try? fm.removeItem(atPath: root)
+try fm.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+try fm.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
+
+let iso: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ssXXXXX"
+    return f
+}()
+let clock: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss"
+    return f
+}()
+let fileStamp: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "HHmmss"
+    return f
+}()
+let baseStamp: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyyMMdd_HHmmss"
+    return f
+}()
+
+let startedAt = Date()
+let meeting = "Platform Weekly Sync"
+let base = "\(baseStamp.string(from: startedAt))-teams-platform-weekly-sync"
+let jsonlPath = "\(dataDir)/\(base).jsonl"
+let txtPath = "\(dataDir)/\(base).txt"
+let slidesDir = "\(dataDir)/\(base).slides"
+
+func writeJSON(_ object: Any, to path: String, mode: Int = 0o600) {
+    let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    fm.createFile(atPath: path + ".tmp", contents: data, attributes: [.posixPermissions: mode])
+    rename(path + ".tmp", path)
+}
+
+func append(_ line: String, to path: String) {
+    if !fm.fileExists(atPath: path) { fm.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600]) }
+    let handle = FileHandle(forWritingAtPath: path)!
+    handle.seekToEndOfFile()
+    handle.write(Data((line + "\n").utf8))
+    try? handle.close()
+}
+
+var transcriptStarted = false
+func state(ended: Date? = nil) {
+    var object: [String: Any] = [
+        "v": 1, "pid": Int(getpid()), "app": "Microsoft Teams", "app_id": "teams", "meeting": meeting,
+        "started_at": iso.string(from: startedAt),
+        "jsonl": transcriptStarted ? jsonlPath : NSNull(), "txt": transcriptStarted ? txtPath : NSNull(),
+        "slides_dir": slides ? slidesDir : NSNull(), "live": stateDir + "/live.json", "ended": ended != nil,
+    ]
+    if let ended {
+        object["ended_at"] = iso.string(from: ended)
+        let seconds = Int(ended.timeIntervalSince(startedAt))
+        object["duration"] = String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+    }
+    writeJSON(object, to: stateDir + "/state.json")
+}
+
+func event(_ type: String, speaker: String = "", text: String, extra: [String: Any] = [:]) {
+    let now = Date()
+    if !transcriptStarted {
+        transcriptStarted = true
+        append(try! String(data: JSONSerialization.data(withJSONObject: [
+            "type": "metadata", "source": "teams-ax", "app": "Microsoft Teams", "meeting": meeting,
+            "recorded_at": iso.string(from: startedAt), "timestamps": "time-of-day",
+        ], options: [.sortedKeys]), encoding: .utf8)!, to: jsonlPath)
+        append("# \(meeting) (Microsoft Teams)\n# recording started \(iso.string(from: startedAt))\n# [hh:mm:ss] is the time of day\n", to: txtPath)
+        try? (txtPath).write(toFile: stateDir + "/current", atomically: true, encoding: .utf8)
+        state()
+    }
+    var payload: [String: Any] = ["type": type, "speaker": speaker, "text": text, "ts": iso.string(from: now),
+                                  "elapsed": String(format: "%02d:%02d", Int(now.timeIntervalSince(startedAt)) / 60,
+                                                    Int(now.timeIntervalSince(startedAt)) % 60)]
+    payload.merge(extra) { a, _ in a }
+    append(String(data: try! JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]), encoding: .utf8)!,
+           to: jsonlPath)
+    let tag = type == "caption" || type == "slide" ? "" : "(\(type)) "
+    let who = speaker.isEmpty ? "" : "\(speaker): "
+    append("[\(clock.string(from: now))] \(tag)\(who)\(text)", to: txtPath)
+    print("[\(clock.string(from: now))] \(tag)\(who)\(text)")
+}
+
+func live(_ lines: [(String, String)]) {
+    let now = Date()
+    writeJSON(["lines": lines.map { ["speaker": $0.0, "text": $0.1, "ts": iso.string(from: now)] }],
+              to: stateDir + "/live.json")
+}
+
+func pause(_ seconds: Double) { usleep(UInt32(seconds / speed * 1_000_000)) }
+
+/// Speak a line: words appear in live.json a few at a time, then it is final.
+func say(_ speaker: String, _ text: String) {
+    let words = text.split(separator: " ")
+    var shown = 0
+    while shown < words.count {
+        shown = min(words.count, shown + 3)
+        live([(speaker, words[0..<shown].joined(separator: " "))])
+        pause(0.4)
+    }
+    live([])
+    event("caption", speaker: speaker, text: text)
+    pause(0.6)
+}
+
+// MARK: - Slides
+
+var slideCount = 0
+var slideIndex: FileHandle?
+
+func render(title: String, bullets: [String], number: Int, width: Int, height: Int) -> CGImage {
+    let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+    let graphics = NSGraphicsContext(cgContext: context, flipped: false)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = graphics
+    NSColor(white: 0.12, alpha: 1).setFill()
+    NSRect(x: 0, y: 0, width: width, height: height).fill()
+    let slide = NSRect(x: 0, y: CGFloat(height) * 0.17, width: CGFloat(width), height: CGFloat(height) * 0.66)
+    NSColor.white.setFill()
+    slide.fill()
+    NSColor(calibratedRed: 0.2, green: 0.45, blue: 0.85, alpha: 1).setFill()
+    NSRect(x: 0, y: slide.maxY - 24, width: slide.width, height: 24).fill()
+    let scale = CGFloat(width) / 1440
+    (title as NSString).draw(at: NSPoint(x: 60 * scale, y: slide.maxY - 140 * scale), withAttributes: [
+        .font: NSFont.boldSystemFont(ofSize: 56 * scale),
+        .foregroundColor: NSColor(calibratedRed: 0.2, green: 0.45, blue: 0.85, alpha: 1)])
+    for (i, bullet) in bullets.enumerated() {
+        ("•  " + bullet as NSString).draw(at: NSPoint(x: 90 * scale, y: slide.maxY - (250 + CGFloat(i) * 80) * scale),
+                                          withAttributes: [.font: NSFont.systemFont(ofSize: 36 * scale),
+                                                           .foregroundColor: NSColor.darkGray])
+    }
+    ("\(number)" as NSString).draw(at: NSPoint(x: slide.maxX - 90 * scale, y: slide.minY + 30 * scale),
+                                   withAttributes: [.font: NSFont.systemFont(ofSize: 28 * scale),
+                                                    .foregroundColor: NSColor.gray])
+    ("Synthetic test meeting — not real content" as NSString).draw(
+        at: NSPoint(x: 30 * scale, y: 30 * scale),
+        withAttributes: [.font: NSFont.systemFont(ofSize: 22 * scale), .foregroundColor: NSColor.lightGray])
+    NSGraphicsContext.restoreGraphicsState()
+    return context.makeImage()!
+}
+
+func writeJPEG(_ image: CGImage, to path: String, quality: Double) {
+    let temp = URL(fileURLWithPath: path + ".tmp")
+    let destination = CGImageDestinationCreateWithURL(temp as CFURL, UTType.jpeg.identifier as CFString, 1, nil)!
+    CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+    CGImageDestinationFinalize(destination)
+    rename(temp.path, path)
+}
+
+/// One saved frame, in the helper's order: jpg, thumb, index.jsonl, then the
+/// transcript's slide event.
+func showSlide(_ title: String, _ bullets: [String], deckNumber: Int) {
+    guard slides else { return }
+    try? fm.createDirectory(atPath: slidesDir, withIntermediateDirectories: true)
+    slideCount += 1
+    let now = Date()
+    let stem = String(format: "%04d-", slideCount) + fileStamp.string(from: now)
+    writeJPEG(render(title: title, bullets: bullets, number: deckNumber, width: 2880, height: 2560),
+              to: "\(slidesDir)/\(stem).jpg", quality: 0.85)
+    writeJPEG(render(title: title, bullets: bullets, number: deckNumber, width: 480, height: 427),
+              to: "\(slidesDir)/\(stem).thumb.jpg", quality: 0.8)
+    let entry: [String: Any] = ["n": slideCount, "at": iso.string(from: now), "file": "\(stem).jpg",
+                                "thumb": "\(stem).thumb.jpg", "reason": slideCount == 1 ? "first frame" : "change",
+                                "change": slideCount == 1 ? 1 : 0.41, "masked": 0, "width": 2880, "height": 2560]
+    append(String(data: try! JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]), encoding: .utf8)!,
+           to: "\(slidesDir)/index.jsonl")
+    event("slide", text: "▣ slide \(slideCount)  \(base).slides/\(stem).jpg",
+          extra: ["slide": slideCount, "file": "\(slidesDir)/\(stem).jpg", "reason": entry["reason"]!])
+}
+
+// MARK: - The meeting
+
+let ended = { () -> Never in
+    removeItem(stateDir + "/live.json")
+    removeItem(stateDir + "/current")
+    let end = Date()
+    let seconds = Int(end.timeIntervalSince(startedAt))
+    append(String(data: try! JSONSerialization.data(withJSONObject: [
+        "type": "metadata", "event": "stopped", "stopped_at": iso.string(from: end),
+        "duration": String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60), "lost_events": 0,
+    ], options: [.sortedKeys]), encoding: .utf8)!, to: jsonlPath)
+    state(ended: end)
+    print("ended — state.json kept with ended:true. Files under \(root)")
+    exit(0)
+}
+func removeItem(_ path: String) { try? fm.removeItem(atPath: path) }
+signal(SIGINT, SIG_IGN)
+let interrupt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+interrupt.setEventHandler { ended() }
+interrupt.resume()
+
+print("fake meeting: MEETING_CAPTURE_STATE_DIR=\(stateDir)")
+state()
+live([])
+pause(2)
+say("Ada Lovelace", "Morning everyone, let's get started with the platform sync.")
+say("Grace Hopper", "Morning! I can share the deck in a second.")
+event("people", text: "5 in the meeting: Ada Lovelace, Grace Hopper, Alan Turing, Katherine Johnson, Edsger Dijkstra",
+      extra: ["people": ["Ada Lovelace", "Grace Hopper", "Alan Turing", "Katherine Johnson", "Edsger Dijkstra"],
+              "count": 5, "confirmed": true])
+pause(1)
+showSlide("Platform Weekly Sync", ["Agenda", "Deploy pipeline", "Incident review", "Next steps"], deckNumber: 1)
+say("Grace Hopper", "Okay, you should see the agenda now. Four things today.")
+say("Alan Turing", "Yep, looks good.")
+showSlide("Deploy Pipeline", ["Median deploy time 14m → 9m", "Flaky tests quarantined: 12", "Canary on by default"],
+          deckNumber: 2)
+say("Grace Hopper", "Deploys are down to nine minutes median after the caching change.")
+say("Katherine Johnson", "Nice. Is the canary on for every service now?")
+event("chat", speaker: "Edsger Dijkstra", text: "link to the dashboard? 🙏")
+say("Grace Hopper", "Every service except the two legacy ones, those are next sprint.")
+showSlide("Incident Review", ["Auth failures 9/18, ~150 users", "Root cause: vendor cert chain", "Fix: alerting on auth errors"],
+          deckNumber: 3)
+say("Grace Hopper", "One incident this month, the vendor certificate change on the eighteenth.")
+say("Ada Lovelace", "Did we get the alerting in place so we'd catch it sooner next time?")
+say("Grace Hopper", "Alert is live as of Monday, it pages after five minutes of failures.")
+showSlide("Next Steps", ["Legacy services onto canary", "Retire old build agents", "Review alert thresholds"],
+          deckNumber: 4)
+say("Ada Lovelace", "Great, thanks Grace. Anything else before we wrap?")
+say("Alan Turing", "Nothing from me.")
+say("Ada Lovelace", "Alright, thanks all, see you next week.")
+pause(2)
+ended()

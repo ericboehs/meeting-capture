@@ -1,0 +1,691 @@
+#!/usr/bin/env swift
+
+// screen-capture-prototype — save a frame of a meeting window each time what's
+// on it changes (a slide advances, a shared doc scrolls to a new page).
+//
+// A standalone experiment, separate from the daemon, for tuning change
+// detection against real screen shares before it goes anywhere near
+// meeting-capture itself.
+//
+//   screen-capture-prototype --list                 list capturable windows
+//   screen-capture-prototype                        follow the largest meeting window
+//   screen-capture-prototype --app zoom --title share -v
+//   screen-capture-prototype --window 4711 --crop 0,60,1280,720
+//   screen-capture-prototype --snapshot             one frame, then exit (check crop/permission)
+//
+// meeting-capture --slides runs this (installed as meeting-capture-slides) for
+// the length of each meeting with --pid and --wait, so it sits idle until a
+// share window appears and stops when the meeting ends.
+//
+// How a change is detected: every tick the window is captured with
+// ScreenCaptureKit and shrunk to a 128×72 grayscale thumbnail. A pixel has
+// "changed" when it differs from the reference by more than --delta levels.
+//
+//   change  share of pixels changed since the last SAVED frame
+//   motion  share of pixels changed since the PREVIOUS tick
+//
+// A frame is saved once change ≥ --threshold and motion has stayed ≤ --still
+// for --settle seconds, so transitions, scrolling and builds are skipped and
+// the settled result is kept. Pixels that keep changing tick after tick —
+// participant video tiles, an embedded video, a ticking clock — are masked
+// out automatically and stop counting until they calm down (--no-mask to
+// disable).
+//
+// Output, default ~/.local/share/meeting-capture/slides/<stamp>-<window>/:
+//   0001-144210.jpg ...   the saved frames
+//   0001-144210.thumb.jpg the same frame 480 px wide
+//   0001-144210.txt       on-device OCR of the frame (with --ocr)
+//   index.jsonl           one line per frame: time, file, change score
+//
+// Requires Screen Recording permission for whatever runs this (your terminal):
+// System Settings → Privacy & Security → Screen & System Audio Recording.
+
+import AppKit
+import CoreGraphics
+import Foundation
+import ImageIO
+import ScreenCaptureKit
+import UniformTypeIdentifiers
+import Vision
+
+setvbuf(stdout, nil, _IOLBF, 0)
+// SCScreenshotManager asserts (CGS_REQUIRE_INIT) unless this process already
+// has a window-server connection; touching NSApplication makes one.
+_ = NSApplication.shared
+
+// MARK: - Options
+
+struct Options {
+    var list = false
+    var snapshot = false
+    var windowID: CGWindowID?
+    var pid: pid_t?
+    var wait = false
+    var app: String?
+    var title: String?
+    var crop: [Double]?
+    var directory: String?
+    var interval = 1.0
+    var threshold = 0.02
+    var delta = 20
+    var still = 0.005
+    var settle = 1.0
+    var heartbeat = 0.0
+    var mask = true
+    var ocr = false
+    var format = "jpg"
+    var quality = 0.85
+    var verbose = false
+}
+
+func usage(_ status: Int32 = 0) -> Never {
+    print("""
+    usage: screen-capture-prototype [options]
+
+    Window selection (default: the largest window of Teams, Zoom, Slack or a Safari web app):
+      --list               list capturable windows and exit
+      --window ID          capture this window ID (from --list)
+      --app TEXT           match app name or bundle ID (case-insensitive substring)
+      --title TEXT         match window title (case-insensitive substring)
+      --pid PID            only windows of this process
+      --wait               no matching window is not an error: wait for one, and
+                           wait again when it closes (how meeting-capture runs it)
+      --crop X,Y,W,H       capture only this rect of the window, in points from its
+                           top-left; values all ≤ 1 are fractions of the window
+
+    Change detection:
+      --interval SEC       seconds between captures (default 1.0)
+      --threshold FRAC     share of pixels that must differ from the last saved
+                           frame to count as a new slide (default 0.02 = 2%)
+      --delta N            gray levels (0-255) a pixel must move to count as
+                           changed (default 20)
+      --still FRAC         motion at or below this counts as settled (default 0.005)
+      --settle SEC         how long it must stay settled before saving (default 1.0)
+      --heartbeat SEC      also save after this long if anything changed at all,
+                           even below threshold (default 0 = off)
+      --no-mask            don't mask out constantly changing regions (video tiles)
+
+    Output:
+      --out DIR            where to write frames (default ~/.local/share/meeting-capture/slides/…)
+      --format jpg|png     image format (default jpg)
+      --quality Q          JPEG quality 0-1 (default 0.85)
+      --ocr                OCR each saved frame on-device, writing a .txt beside it
+      --snapshot           save one frame and exit
+      -v, --verbose        print motion/change/mask numbers every tick (for tuning)
+      -h, --help           show this help
+    """)
+    exit(status)
+}
+
+func parseOptions() -> Options {
+    var options = Options()
+    var args = Array(CommandLine.arguments.dropFirst())
+    func value(_ flag: String) -> String {
+        guard !args.isEmpty else { fail("\(flag) needs a value") }
+        return args.removeFirst()
+    }
+    func number(_ flag: String) -> Double {
+        let raw = value(flag)
+        guard let parsed = Double(raw), parsed >= 0 else { fail("\(flag): not a number: \(raw)") }
+        return parsed
+    }
+    while !args.isEmpty {
+        let arg = args.removeFirst()
+        switch arg {
+        case "--list": options.list = true
+        case "--snapshot": options.snapshot = true
+        case "--window":
+            let raw = value(arg)
+            guard let id = CGWindowID(raw) else { fail("--window: not a window ID: \(raw)") }
+            options.windowID = id
+        case "--pid":
+            let raw = value(arg)
+            guard let pid = pid_t(raw) else { fail("--pid: not a process ID: \(raw)") }
+            options.pid = pid
+        case "--wait": options.wait = true
+        case "--app": options.app = value(arg)
+        case "--title": options.title = value(arg)
+        case "--crop":
+            let raw = value(arg)
+            let parts = raw.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            guard parts.count == 4, parts[2] > 0, parts[3] > 0 else { fail("--crop: expected X,Y,W,H, got \(raw)") }
+            options.crop = parts
+        case "--out": options.directory = (value(arg) as NSString).expandingTildeInPath
+        case "--interval": options.interval = max(0.1, number(arg))
+        case "--threshold": options.threshold = number(arg)
+        case "--delta": options.delta = Int(number(arg))
+        case "--still": options.still = number(arg)
+        case "--settle": options.settle = number(arg)
+        case "--heartbeat": options.heartbeat = number(arg)
+        case "--no-mask": options.mask = false
+        case "--ocr": options.ocr = true
+        case "--format":
+            options.format = value(arg).lowercased()
+            guard ["jpg", "png"].contains(options.format) else { fail("--format: jpg or png") }
+        case "--quality": options.quality = min(1, number(arg))
+        case "-v", "--verbose": options.verbose = true
+        case "-h", "--help": usage()
+        default: fail("unknown option \(arg) (try --help)")
+        }
+    }
+    return options
+}
+
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write("screen-capture-prototype: \(message)\n".data(using: .utf8)!)
+    exit(1)
+}
+
+/// Under meeting-capture (--wait) lines go to stderr, which lands in its
+/// launchd.log, so they match its "[ISO time] name: message" format there.
+/// stdout is kept for the machine-readable events it reads (see emitEvent).
+func log(_ message: String) {
+    if waitMode {
+        let stamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
+        FileHandle.standardError.write(Data("[\(stamp)] meeting-capture-slides: \(message)\n".utf8))
+    } else {
+        print("[\(clock.string(from: Date()))] \(message)")
+    }
+}
+
+nonisolated(unsafe) var waitMode = false
+
+/// --wait only: one JSON object per line on stdout for meeting-capture, which
+/// writes a "▣ slide N" line into the transcript for each saved frame.
+func emitEvent(_ payload: [String: Any]) {
+    guard waitMode,
+          var line = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else { return }
+    line.append(0x0A)
+    FileHandle.standardOutput.write(line)
+}
+
+let clock: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm:ss"
+    return formatter
+}()
+
+// MARK: - Window selection
+
+/// Apps whose windows are picked when no --app/--window is given.
+/// Safari web apps all share one bundle prefix, so only Meet's — told apart by
+/// its window title — counts.
+func isMeetingWindow(_ window: SCWindow) -> Bool {
+    guard let id = window.owningApplication?.bundleIdentifier else { return false }
+    if id.hasPrefix("com.apple.Safari.WebApp") { return (window.title ?? "").contains("Meet") }
+    return ["com.microsoft.teams2", "com.microsoft.teams", "us.zoom.xos", "com.tinyspeck.slackmacgap"].contains(id)
+}
+
+func describe(_ window: SCWindow) -> String {
+    let app = window.owningApplication?.applicationName ?? "?"
+    let title = (window.title ?? "").isEmpty ? "(untitled)" : window.title!
+    return "\(app) — \"\(title)\" [\(window.windowID), \(Int(window.frame.width))×\(Int(window.frame.height))]"
+}
+
+/// Ordinary app windows big enough to hold a screen share.
+func candidateWindows(_ content: SCShareableContent) -> [SCWindow] {
+    let me = ProcessInfo.processInfo.processIdentifier
+    return content.windows.filter {
+        $0.windowLayer == 0 && $0.frame.width >= 320 && $0.frame.height >= 200
+            && $0.owningApplication != nil && $0.owningApplication?.processID != me
+    }
+}
+
+/// `bundle` pins re-picks to the app first chosen, so a closed share window
+/// isn't replaced by some other app's window.
+func pickWindow(_ content: SCShareableContent, _ options: Options, bundle: String? = nil) -> SCWindow? {
+    if let id = options.windowID {
+        return content.windows.first { $0.windowID == id }
+    }
+    let matches = candidateWindows(content).filter { window in
+        if let bundle, window.owningApplication?.bundleIdentifier != bundle { return false }
+        if let pid = options.pid, window.owningApplication?.processID != pid { return false }
+        if let app = options.app?.lowercased() {
+            let name = window.owningApplication?.applicationName.lowercased() ?? ""
+            let bundle = window.owningApplication?.bundleIdentifier.lowercased() ?? ""
+            guard name.contains(app) || bundle.contains(app) else { return false }
+        } else if options.title == nil, options.pid == nil, !isMeetingWindow(window) {
+            return false
+        }
+        if let title = options.title?.lowercased() {
+            guard (window.title ?? "").lowercased().contains(title) else { return false }
+        }
+        return true
+    }
+    // On-screen first, then largest: Zoom's screen-share viewer and Teams'
+    // stage are usually the biggest window the app has.
+    return matches.max { a, b in
+        if a.isOnScreen != b.isOnScreen { return !a.isOnScreen }
+        return a.frame.width * a.frame.height < b.frame.width * b.frame.height
+    }
+}
+
+/// The window's current bounds from the window server — cheap enough to ask
+/// every tick, unlike SCShareableContent, whose SCWindow frames go stale.
+func liveBounds(_ id: CGWindowID) -> CGRect? {
+    guard let info = (CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]])?.first,
+          let bounds = info[kCGWindowBounds as String] as? NSDictionary else { return nil }
+    return CGRect(dictionaryRepresentation: bounds)
+}
+
+func shareableContent() async -> SCShareableContent {
+    do {
+        return try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+    } catch {
+        fail("can't list windows (\(error.localizedDescription)). Grant Screen Recording to your terminal: "
+            + "System Settings → Privacy & Security → Screen & System Audio Recording, then restart the terminal.")
+    }
+}
+
+// MARK: - Capture
+
+/// Width of the probe captured every tick for change detection. Only a frame
+/// worth keeping is captured again at full resolution, so the per-second cost
+/// is a ~320 px image rather than a 7-megapixel one.
+let probeWidth: CGFloat = 320
+
+/// One capture of the window, cropped per --crop: at full pixel resolution, or
+/// shrunk to `probeWidth` when `probe` is set.
+func capture(_ window: SCWindow, _ options: Options, probe: Bool = false) async throws -> CGImage {
+    let filter = SCContentFilter(desktopIndependentWindow: window)
+    let info = SCShareableContent.info(for: filter)
+    let full = CGFloat(info.pointPixelScale)
+    let scale = probe ? min(full, probeWidth / max(1, info.contentRect.width)) : full
+    let config = SCStreamConfiguration()
+    config.width = Int(info.contentRect.width * scale)
+    config.height = Int(info.contentRect.height * scale)
+    config.showsCursor = false
+    config.ignoreShadowsSingleWindow = true
+    let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+    guard let crop = options.crop else { return image }
+
+    let size = CGSize(width: image.width, height: image.height)
+    let fractional = crop.allSatisfy { $0 <= 1 }
+    let pointsToPixels = CGFloat(image.width) / max(1, info.contentRect.width)
+    let rect = fractional
+        ? CGRect(x: crop[0] * size.width, y: crop[1] * size.height,
+                 width: crop[2] * size.width, height: crop[3] * size.height)
+        : CGRect(x: crop[0], y: crop[1], width: crop[2], height: crop[3])
+            .applying(CGAffineTransform(scaleX: pointsToPixels, y: pointsToPixels))
+    let clipped = rect.integral.intersection(CGRect(origin: .zero, size: size))
+    guard !clipped.isEmpty, let cropped = image.cropping(to: clipped) else {
+        throw NSError(domain: "crop", code: 1, userInfo: [NSLocalizedDescriptionKey:
+            "--crop \(crop.map { String($0) }.joined(separator: ",")) is outside the \(image.width)×\(image.height) px window"])
+    }
+    return cropped
+}
+
+// MARK: - Change detection
+
+let thumbWidth = 128, thumbHeight = 72
+
+/// The image squashed to a small grayscale grid. Averaging while shrinking
+/// irons out video-compression noise; the aspect ratio doesn't matter here.
+func thumbnail(_ image: CGImage) -> [UInt8] {
+    var pixels = [UInt8](repeating: 0, count: thumbWidth * thumbHeight)
+    pixels.withUnsafeMutableBytes { buffer in
+        guard let context = CGContext(data: buffer.baseAddress, width: thumbWidth, height: thumbHeight,
+                                      bitsPerComponent: 8, bytesPerRow: thumbWidth,
+                                      space: CGColorSpaceCreateDeviceGray(),
+                                      bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
+        context.interpolationQuality = .medium
+        context.draw(image, in: CGRect(x: 0, y: 0, width: thumbWidth, height: thumbHeight))
+    }
+    return pixels
+}
+
+struct Detector {
+    let options: Options
+    var previous: [UInt8]?
+    var saved: [UInt8]?
+    /// Per-pixel running average of "changed since last tick". Pixels that
+    /// keep changing (video) climb above maskLevel and are ignored.
+    var heat = [Float](repeating: 0, count: thumbWidth * thumbHeight)
+    var stillSince: Date?
+    /// After a resize the old reference can't be compared pixel for pixel, so
+    /// the next settled frame quietly becomes the new reference instead.
+    var rebaselining = false
+    let decay: Float = 0.85, maskLevel: Float = 0.4
+
+    struct Reading {
+        var motion = 0.0, change = 1.0, masked = 0.0
+        var save = false, reason = ""
+    }
+
+    mutating func feed(_ thumb: [UInt8], at now: Date, lastSave: Date?) -> Reading {
+        var reading = Reading()
+        defer { previous = thumb }
+        let delta = options.delta
+
+        if let previous {
+            for i in thumb.indices {
+                let moved = abs(Int(thumb[i]) - Int(previous[i])) > delta
+                heat[i] = heat[i] * decay + (moved ? 1 - decay : 0)
+            }
+        }
+        let live = options.mask ? heat.map { $0 < maskLevel } : Array(repeating: true, count: heat.count)
+        let liveCount = max(1, live.lazy.filter { $0 }.count)
+        reading.masked = 1 - Double(liveCount) / Double(heat.count)
+
+        func share(against reference: [UInt8]) -> Double {
+            var changed = 0
+            for i in thumb.indices where live[i] && abs(Int(thumb[i]) - Int(reference[i])) > delta { changed += 1 }
+            return Double(changed) / Double(liveCount)
+        }
+        if let previous { reading.motion = share(against: previous) }
+        guard let saved else {
+            reading.save = true; reading.reason = "first frame"
+            return reading
+        }
+        reading.change = share(against: saved)
+
+        if reading.motion <= options.still {
+            if stillSince == nil { stillSince = now }
+        } else {
+            stillSince = nil
+        }
+        let settled = stillSince.map { now.timeIntervalSince($0) >= options.settle } ?? false
+        if rebaselining {
+            if settled { self.saved = thumb; rebaselining = false; reading.reason = "rebaselined" }
+            return reading
+        }
+        if settled && reading.change >= options.threshold {
+            reading.save = true; reading.reason = "change"
+        } else if settled, options.heartbeat > 0, reading.change > 0,
+                  let lastSave, now.timeIntervalSince(lastSave) >= options.heartbeat {
+            reading.save = true; reading.reason = "heartbeat"
+        }
+        return reading
+    }
+
+    mutating func didSave(_ thumb: [UInt8]) { saved = thumb }
+
+    /// Forget motion history (pixels no longer line up) but keep that a frame
+    /// was saved, and wait for the resized window to settle.
+    mutating func resized() {
+        previous = nil
+        heat = [Float](repeating: 0, count: heat.count)
+        stillSince = nil
+        if saved != nil { rebaselining = true }
+    }
+}
+
+// MARK: - Output
+
+/// Written beside the target and renamed into place, so anything watching
+/// the directory (the canvas Meeting card) never reads half an image.
+func write(_ image: CGImage, to url: URL, format: String, quality: Double) throws {
+    let type = format == "png" ? UTType.png : UTType.jpeg
+    let temp = url.appendingPathExtension("tmp")
+    guard let destination = CGImageDestinationCreateWithURL(temp as CFURL, type.identifier as CFString, 1, nil) else {
+        throw NSError(domain: "write", code: 1, userInfo: [NSLocalizedDescriptionKey: "can't create \(temp.path)"])
+    }
+    CGImageDestinationAddImage(destination, image,
+                               [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+    guard CGImageDestinationFinalize(destination), rename(temp.path, url.path) == 0 else {
+        try? FileManager.default.removeItem(at: temp)
+        throw NSError(domain: "write", code: 2, userInfo: [NSLocalizedDescriptionKey: "can't write \(url.path)"])
+    }
+}
+
+/// Width of the NNNN-HHMMSS.thumb.jpg written beside each frame, so a strip
+/// of a long meeting's slides doesn't mean loading megabytes of Retina images.
+let thumbnailWidth = 480
+
+func scaled(_ image: CGImage, width: Int) -> CGImage? {
+    guard image.width > width else { return image }
+    let height = max(1, Int((Double(image.height) * Double(width) / Double(image.width)).rounded()))
+    guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return context.makeImage()
+}
+
+func recognizeText(_ image: CGImage) -> String {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = true
+    try? VNImageRequestHandler(cgImage: image).perform([request])
+    return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+}
+
+func slugify(_ value: String) -> String {
+    let cleaned = String(value.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" })
+    let slug: String = cleaned.split(separator: "-", omittingEmptySubsequences: true).joined(separator: "-")
+    return slug.isEmpty ? "window" : String(slug.prefix(60))
+}
+
+func outputDirectory(for window: SCWindow, _ options: Options) -> URL {
+    if let directory = options.directory { return URL(fileURLWithPath: directory, isDirectory: true) }
+    let base = ProcessInfo.processInfo.environment["XDG_DATA_HOME"] ?? NSHomeDirectory() + "/.local/share"
+    let stamp = DateFormatter()
+    stamp.dateFormat = "yyyyMMdd_HHmmss"
+    let name = [window.owningApplication?.applicationName, window.title]
+        .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " ")
+    return URL(fileURLWithPath: base + "/meeting-capture/slides/\(stamp.string(from: Date()))-\(slugify(name))",
+               isDirectory: true)
+}
+
+final class Saver {
+    let directory: URL
+    let options: Options
+    var count = 0
+    let index: FileHandle
+    let ocrQueue = DispatchQueue(label: "ocr", qos: .utility)
+    let iso = ISO8601DateFormatter()
+    let fileStamp: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HHmmss"
+        return formatter
+    }()
+
+    init(directory: URL, options: Options) throws {
+        self.directory = directory
+        self.options = options
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let indexURL = directory.appendingPathComponent("index.jsonl")
+        if !FileManager.default.fileExists(atPath: indexURL.path) {
+            FileManager.default.createFile(atPath: indexURL.path, contents: nil)
+        }
+        index = try FileHandle(forWritingTo: indexURL)
+        index.seekToEndOfFile()
+        iso.formatOptions = [.withInternetDateTime]
+        iso.timeZone = .current
+    }
+
+    func save(_ image: CGImage, at now: Date, reading: Detector.Reading) throws -> URL {
+        count += 1
+        let stem = String(format: "%04d-", count) + fileStamp.string(from: now)
+        let url = directory.appendingPathComponent("\(stem).\(options.format)")
+        try write(image, to: url, format: options.format, quality: options.quality)
+        let thumb = directory.appendingPathComponent("\(stem).thumb.jpg")
+        if let small = scaled(image, width: thumbnailWidth) {
+            try write(small, to: thumb, format: "jpg", quality: 0.8)
+        }
+        let entry: [String: Any] = [
+            "n": count, "at": iso.string(from: now), "file": url.lastPathComponent,
+            "reason": reading.reason, "change": (reading.change * 1000).rounded() / 1000,
+            "masked": (reading.masked * 1000).rounded() / 1000,
+            "width": image.width, "height": image.height, "thumb": thumb.lastPathComponent,
+        ]
+        if options.ocr {
+            // Off the capture loop: the first Vision call loads its model and
+            // can take most of a minute, long enough to miss whole slides.
+            let textURL = directory.appendingPathComponent("\(stem).txt")
+            ocrQueue.async {
+                try? recognizeText(image).write(to: textURL, atomically: true, encoding: .utf8)
+            }
+        }
+        var line = try JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys])
+        line.append(0x0A)
+        index.write(line)
+        return url
+    }
+}
+
+func percent(_ value: Double) -> String { String(format: "%5.1f%%", value * 100) }
+
+// MARK: - Main
+
+let options = parseOptions()
+
+if !CGPreflightScreenCaptureAccess() {
+    CGRequestScreenCaptureAccess()
+    fail("Screen Recording permission is needed. Grant it in System Settings → Privacy & Security → "
+        + "Screen & System Audio Recording to your terminal (then restart it), or to "
+        + "~/.local/bin/meeting-capture-daemon when meeting-capture runs this.")
+}
+
+var content = await shareableContent()
+
+if options.list {
+    let windows = candidateWindows(content).sorted {
+        ($0.owningApplication?.applicationName ?? "", $0.windowID) < ($1.owningApplication?.applicationName ?? "", $1.windowID)
+    }
+    let pick = pickWindow(content, options)
+    for window in windows {
+        let marker = window.windowID == pick?.windowID ? "→" : " "
+        let screen = window.isOnScreen ? "" : "  (off screen)"
+        print("\(marker) \(String(window.windowID).padding(toLength: 7, withPad: " ", startingAt: 0)) "
+            + "\(window.owningApplication?.bundleIdentifier ?? "?")  \(describe(window))\(screen)")
+    }
+    if pick == nil { print("(no window matches; use --window, --app or --title)") }
+    exit(0)
+}
+
+waitMode = options.wait
+var window = pickWindow(content, options)
+if window == nil && !options.wait {
+    fail("no matching window. Run with --list to see what's available, then pass --window, --app or --title.")
+}
+
+/// Created on the first frame, so a meeting where nobody shares leaves no
+/// empty directory behind.
+var saver: Saver?
+func openSaver(for window: SCWindow) -> Saver {
+    if let saver { return saver }
+    do {
+        let created = try Saver(directory: outputDirectory(for: window, options), options: options)
+        saver = created
+        log("writing to \(created.directory.path)")
+        return created
+    } catch {
+        fail("can't create output directory: \(error.localizedDescription)")
+    }
+}
+
+func stop(_ reason: String) -> Never {
+    if let saver, options.ocr { saver.ocrQueue.sync {} }
+    let where_ = saver.map { " in \($0.directory.path)" } ?? ""
+    log("\(reason) — \(saver?.count ?? 0) frame(s)\(where_)")
+    exit(0)
+}
+
+// SIGTERM is how meeting-capture ends it at the end of a meeting.
+let signalSources = [SIGINT, SIGTERM].map { number -> DispatchSourceSignal in
+    signal(number, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+    source.setEventHandler {
+        if number == SIGINT && isatty(STDOUT_FILENO) == 1 { print("") }
+        stop("stopped")
+    }
+    source.resume()
+    return source
+}
+let parent = getppid()
+
+if let window {
+    log("capturing \(describe(window))")
+} else {
+    log("waiting for a window to share" + (options.title.map { " (title contains \"\($0)\")" } ?? ""))
+}
+if !options.snapshot && !options.wait {
+    log(String(format: "every %.1fs, new frame at ≥%.1f%% change after %.1fs settled%@ — Ctrl-C to stop",
+               options.interval, options.threshold * 100, options.settle, options.mask ? ", video masked" : ""))
+}
+
+var detector = Detector(options: options)
+var lastSave: Date?
+var lastError: String?
+var lastRefresh = Date()
+var frameSize: (Int, Int)?
+var lockedBundle = window?.owningApplication?.bundleIdentifier
+
+while true {
+    let tickStart = Date()
+    // Orphaned (meeting-capture died without stopping us): don't outlive it.
+    if options.wait && getppid() != parent { stop("meeting-capture went away") }
+
+    // Teams and Zoom swap windows when a share starts or the stage changes,
+    // so re-resolve the window every few seconds and follow it. While waiting
+    // for one, look every couple of seconds.
+    let moved = window.flatMap { w in liveBounds(w.windowID).map { $0.size != w.frame.size } } ?? false
+    let refreshEvery: TimeInterval = window == nil ? 2 : 5
+    if moved || tickStart.timeIntervalSince(lastRefresh) >= refreshEvery {
+        lastRefresh = tickStart
+        content = await shareableContent()
+        let current = window.flatMap { w in content.windows.first { $0.windowID == w.windowID } }
+        let next = options.windowID == nil ? pickWindow(content, options, bundle: lockedBundle) : current
+        if let next, next.windowID != window?.windowID {
+            log((window == nil ? "capturing " : "switching to ") + describe(next))
+            detector = Detector(options: options)
+            frameSize = nil
+            lockedBundle = lockedBundle ?? next.owningApplication?.bundleIdentifier
+        }
+        if let next {
+            window = next
+        } else if let gone = window, current == nil {
+            log("window \(gone.windowID) is gone — waiting for another")
+            window = nil
+        }
+    }
+
+    if let window {
+        do {
+            let probe = try await capture(window, options, probe: true)
+            lastError = nil
+            if let size = frameSize, size != (probe.width, probe.height) {
+                log("window resized — re-baselining")
+                detector.resized()
+            }
+            frameSize = (probe.width, probe.height)
+            let thumb = thumbnail(probe)
+            let reading = detector.feed(thumb, at: tickStart, lastSave: lastSave)
+            if options.verbose {
+                log("motion \(percent(reading.motion))  change \(percent(reading.change))  masked \(percent(reading.masked))"
+                    + (detector.stillSince != nil ? "  still" : ""))
+            }
+            if reading.reason == "rebaselined" { log("settled after resize; not a new slide") }
+            if reading.save || options.snapshot {
+                let image = try await capture(window, options)
+                let saver = openSaver(for: window)
+                let url = try saver.save(image, at: tickStart, reading: reading)
+                detector.didSave(thumb)
+                lastSave = tickStart
+                log("▣ frame \(saver.count) (\(reading.reason.isEmpty ? "snapshot" : reading.reason), "
+                    + "change \(percent(reading.change).trimmingCharacters(in: .whitespaces))) → \(url.path)")
+                emitEvent(["type": "slide", "n": saver.count, "at": tickStart.timeIntervalSince1970,
+                           "path": url.path, "reason": reading.reason,
+                           "change": (reading.change * 1000).rounded() / 1000])
+                if options.snapshot { saver.ocrQueue.sync {}; exit(0) }
+            }
+            if reading.masked > 0.9 && options.verbose {
+                log("warning: \(percent(reading.masked)) of the frame is masked as video — try --crop or --no-mask")
+            }
+        } catch {
+            let message = error.localizedDescription
+            if message != lastError {
+                log("capture failed: \(message) (minimised or on another Space?)")
+                lastError = message
+            }
+            if options.snapshot { exit(1) }
+        }
+    }
+
+    let elapsed = Date().timeIntervalSince(tickStart)
+    if elapsed < options.interval {
+        try? await Task.sleep(nanoseconds: UInt64((options.interval - elapsed) * 1_000_000_000))
+    }
+}

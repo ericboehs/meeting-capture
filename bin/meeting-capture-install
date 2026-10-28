@@ -20,6 +20,10 @@ binary="$HOME/.local/bin/meeting-capture-daemon"
 # TCC identity — roster-now needs no Accessibility grant (it only drops a
 # file), while people-snapshot will ask once for this path the first time.
 cli="$HOME/.local/bin/meeting-capture"
+# The daemon runs this beside each meeting (--slides) to save shared slides.
+# TCC charges it to the daemon, so the Screen Recording grant is the daemon's.
+slides_script="${BASH_SOURCE[0]%/*}/screen-capture-prototype"
+slides_helper="$HOME/.local/bin/meeting-capture-slides"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/meeting-capture"
 stamp="$state_dir/source.sha256"
@@ -152,7 +156,7 @@ esac
 case "$action" in
   uninstall)
     launchctl bootout "gui/$UID/$label" 2>/dev/null || true
-    rm -rf "$plist" "$binary" "$stamp"
+    rm -rf "$plist" "$binary" "$slides_helper" "$stamp"
     echo "removed $label"
     exit 0
     ;;
@@ -237,10 +241,10 @@ mkdir -p "${binary%/*}" "$state_dir"
 # ad-hoc signed while everything above claims otherwise. Note it tracks the
 # identity's NAME: rotating a certificate under the same name does not trigger
 # a rebuild (remove $stamp by hand after rotating).
-source_hash=$(shasum -a 256 "$source_script" | cut -d' ' -f1)
+source_hash=$(cat "$source_script" "$slides_script" | shasum -a 256 | cut -d' ' -f1)
 build_hash="$sign_id:$source_hash"
 rebuilt=false
-if [[ ! -x $binary || ! -f $stamp || $(cat "$stamp") != "$build_hash" ]]; then
+if [[ ! -x $binary || ! -x $slides_helper || ! -f $stamp || $(cat "$stamp") != "$build_hash" ]]; then
   echo "building $binary"
   build_dir=$(mktemp -d)
   trap 'rm -rf "$build_dir"' EXIT
@@ -249,6 +253,10 @@ if [[ ! -x $binary || ! -f $stamp || $(cat "$stamp") != "$build_hash" ]]; then
   # No --identifier: giving a bare binary a bundle-style id makes TCC try to
   # resolve it as an app, fail to find one, and reject the grant.
   codesign --force --sign "$sign_id" "$binary"
+  echo "building $slides_helper"
+  cp "$slides_script" "$build_dir/meeting-capture-slides.swift"
+  swiftc -O -o "$slides_helper" "$build_dir/meeting-capture-slides.swift"
+  codesign --force --sign "$sign_id" "$slides_helper"
   echo "$build_hash" > "$stamp"
   rebuilt=true
 else
@@ -272,6 +280,7 @@ cat > "$plist" <<PLIST
     <string>--popout-captions</string>
     <string>--popout-chat</string>
     <string>--people-snapshot</string>
+    <string>--slides</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -305,8 +314,13 @@ installed $label
   plist:       $plist
   log:         $log
   transcripts: ${XDG_DATA_HOME:-$HOME/.local/share}/meeting-capture
+  slides:      <transcript>.slides/ beside each transcript (Teams screen shares)
 
   tail -f $log
+
+Slides need Screen Recording permission for the daemon, granted by hand once:
+  System Settings → Privacy & Security → Screen & System Audio Recording → + →
+  $binary
 INFO
 
 if [[ $rebuilt == true && $sign_id == "-" ]]; then

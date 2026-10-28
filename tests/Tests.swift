@@ -67,6 +67,121 @@ expectEqual(Recorder.slugify("Weekly Sync | Microsoft Teams"), "weekly-sync", "s
 expectEqual(Recorder.slugify("!!!"), "meeting", "all-punctuation title falls back to 'meeting'")
 expectEqual(Recorder.slugify("Ada's 2nd standup!"), "ada-s-2nd-standup", "slug keeps letters and digits")
 
+// --- Recorder.baseName / SlideCapture -----------------------------------
+
+do {
+    var parts = DateComponents()
+    (parts.year, parts.month, parts.day, parts.hour, parts.minute, parts.second) = (2026, 8, 24, 14, 40, 24)
+    let startedAt = Calendar.current.date(from: parts)!
+    let base = Recorder.baseName(app: "teams", meeting: "Weekly Sync | Microsoft Teams", startedAt: startedAt)
+    expectEqual(base, "20260824_144024-teams-weekly-sync", "base name is stamp, app and slug")
+    // The slides directory sits beside the transcript under the same name.
+    expectEqual(SlideCapture.arguments(pid: 42, shareWindowTitle: "Shared content", directory: "/t/\(base).slides"),
+                ["--wait", "--pid", "42", "--title", "Shared content", "--out", "/t/20260824_144024-teams-weekly-sync.slides"],
+                "slide helper waits for the pid's share window and writes beside the transcript")
+}
+do {
+    let line = #"{"at":1793216486.5,"change":0.18,"n":7,"path":"/t/20260824_144024-teams-weekly-sync.slides/0007-144126.jpg","reason":"change","type":"slide"}"#
+    let event = SlideEvent.parse(line)
+    expectEqual(event?.number, 7, "a slide event is read from the helper's stdout")
+    expectEqual(event?.at, Date(timeIntervalSince1970: 1793216486.5), "and keeps when the frame was taken")
+    expectEqual(event?.transcriptBody, "▣ slide 7  20260824_144024-teams-weekly-sync.slides/0007-144126.jpg",
+                "a slide names its image relative to the transcript")
+    expectTrue(SlideEvent.parse("not json") == nil, "a stray stdout line is not a slide")
+    expectTrue(SlideEvent.parse(#"{"type":"other","n":1}"#) == nil, "nor is another event type")
+    if let event, let rendered = renderEvent(kind: "slide", speaker: "", body: event.transcriptBody,
+                                             at: event.at, mode: .timeOfDay, extra: ["slide": event.number]) {
+        let clock = Recorder.clockText(from: event.at)
+        expectEqual(rendered.line, "[\(clock)] ▣ slide 7  20260824_144024-teams-weekly-sync.slides/0007-144126.jpg",
+                    "a slide line reads like a caption line, without a (slide) tag")
+        expectTrue(rendered.json.contains(#""type":"slide""#) && rendered.json.contains(#""slide":7"#),
+                   "and its jsonl event says it is slide 7")
+    } else {
+        expectTrue(false, "a slide event renders")
+    }
+}
+// SlideCapture end to end against a stand-in helper: tests/run.sh builds into
+// a temp dir, so the helper "installed beside this binary" is ours to write.
+do {
+    let helper = SlideCapture.helperPath()
+    if !FileManager.default.fileExists(atPath: helper) {
+        let script = """
+        #!/bin/sh
+        # args: --wait --pid P --title T --out DIR ($7 is DIR)
+        echo '{"type":"slide","n":1,"at":1793216486,"path":"'"$7"'/0001-144126.jpg","reason":"first frame"}'
+        echo "[log] meeting-capture-slides: waiting" >&2
+        trap 'echo "{\\"type\\":\\"slide\\",\\"n\\":2,\\"at\\":1793216500,\\"path\\":\\"$7/0002-144140.jpg\\"}"; exit 0' TERM
+        while :; do sleep 0.1; done
+        """
+        FileManager.default.createFile(atPath: helper, contents: Data(script.utf8),
+                                       attributes: [.posixPermissions: 0o755])
+        var options = Options()
+        options.directory = "/tmp/meeting-capture-test"
+        let capture = SlideCapture.start(options: options, meetingApp: TeamsApp(), pid: 4242,
+                                         title: "Weekly Sync", startedAt: Date(timeIntervalSince1970: 0))
+        expectTrue(capture != nil, "slide helper starts for a Teams meeting")
+        var seen: [SlideEvent] = []
+        for _ in 0..<40 where seen.isEmpty { usleep(50_000); seen += capture?.takeEvents() ?? [] }
+        expectEqual(seen.map(\.number), [1], "a slide the helper reports reaches the session while it runs")
+        expectTrue(seen.first?.path.hasPrefix("/tmp/meeting-capture-test/") == true
+                       && seen.first?.path.contains("-teams-weekly-sync.slides/") == true,
+                   "the helper was told to write beside the transcript")
+        capture?.stop()
+        expectEqual(capture?.takeEvents().map(\.number) ?? [], [2], "a slide reported while stopping is not lost")
+        try? FileManager.default.removeItem(atPath: helper)
+    }
+    expectTrue(SlideCapture.start(options: Options(), meetingApp: SlackApp(), pid: 1, title: "x",
+                                  startedAt: Date()) == nil, "no slide helper for an app without a share window")
+}
+// --- state.json / live.json (docs/canvas-contract.md) -------------------
+
+do {
+    let start = Date(timeIntervalSince1970: 1_793_200_000)
+    let open = MeetingStateFile.state(pid: 77, app: "Microsoft Teams", appID: "teams", meeting: "Weekly Sync",
+                                      startedAt: start, files: nil, slidesDirectory: nil,
+                                      livePath: "/s/live.json", endedAt: nil)
+    expectEqual(open["v"] as? Int, 1, "state.json is versioned")
+    expectEqual(open["pid"] as? Int, 77, "state.json names the daemon pid, so a crash is detectable")
+    expectTrue(open["jsonl"] is NSNull && open["txt"] is NSNull && open["slides_dir"] is NSNull,
+               "before the first line there is no transcript yet, and null says so")
+    expectEqual(open["ended"] as? Bool, false, "a meeting in progress has not ended")
+    expectTrue(open["duration"] == nil, "and has no duration")
+
+    let files = (URL(fileURLWithPath: "/d/b.jsonl"), URL(fileURLWithPath: "/d/b.txt"))
+    let ended = MeetingStateFile.state(pid: 77, app: "Microsoft Teams", appID: "teams", meeting: "Weekly Sync",
+                                       startedAt: start, files: files, slidesDirectory: "/d/b.slides",
+                                       livePath: "/s/live.json", endedAt: start.addingTimeInterval(3723))
+    expectEqual(ended["jsonl"] as? String, "/d/b.jsonl", "state.json points at the transcript once it exists")
+    expectEqual(ended["slides_dir"] as? String, "/d/b.slides", "and at the slides directory")
+    expectEqual(ended["ended"] as? Bool, true, "an ended meeting says so")
+    expectEqual(ended["duration"] as? String, elapsedString(from: start, to: start.addingTimeInterval(3723)),
+                "and how long it ran")
+    expectTrue(JSONSerialization.isValidJSONObject(ended), "state.json serializes")
+
+    let live = MeetingStateFile.liveJSON([LiveEntry(speaker: "Ada", text: "Morning", at: start)])
+    let lines = live["lines"] as? [[String: String]]
+    expectEqual(lines?.first?["speaker"], "Ada", "live.json carries the speaker unrendered")
+    expectEqual(lines?.first?["text"], "Morning", "and the text with no cursor glyph")
+
+    let dir = NSTemporaryDirectory() + "mc-atomic-\(UUID().uuidString)"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let path = dir + "/state.json"
+    expectTrue((try? writeAtomically(open, to: path)) != nil, "state.json is written")
+    let mode = (try? FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? Int) ?? nil
+    expectEqual(mode, 0o600, "readable only by its owner: it names private meetings")
+    expectTrue(!FileManager.default.fileExists(atPath: path + ".tmp"), "no temp file is left behind")
+    try? FileManager.default.removeItem(atPath: dir)
+}
+do {
+    // live.json gets the same high-water clamp as the rendered live lines.
+    let t0 = Date(timeIntervalSince1970: 1000)
+    let early = Utterance(speaker: "A", text: "one", startedAt: t0, changedAt: t0)
+    let entries = Session.liveEntries([early], after: t0.addingTimeInterval(5))
+    expectEqual(entries.first?.at, t0.addingTimeInterval(5), "a live entry never stamps before the last written line")
+}
+expectEqual(TeamsApp().shareWindowTitle, "Shared content", "Teams shares open in a Shared content window")
+expectTrue(SlackApp().shareWindowTitle == nil, "Slack has no share window of its own")
+
 // --- Telling Google Meet's speakers from what they said -------------------
 // Meet writes name, sentences, name, sentences... but prunes old captions off
 // the front, and the alternation does not even hold end to end: one live list

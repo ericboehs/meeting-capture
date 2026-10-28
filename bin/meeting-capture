@@ -45,6 +45,9 @@ struct Options {
     var popOutChat = false
     /// Teams only: record who was in the meeting, once, a minute after joining.
     var peopleSnapshot = false
+    /// Save a frame of shared screens each time the slide changes, by running
+    /// meeting-capture-slides alongside each meeting (see SlideCapture).
+    var slides = false
     var once = false
     var follow = false
     var jsonToStdout = false
@@ -83,6 +86,10 @@ func usage() -> String {
       --people-snapshot    Teams: record who is in the meeting, once, about
                            90 seconds in (waits for a lull; never interrupts;
                            re-read on demand with roster-now)
+      --slides             Teams: save each slide of a shared screen as an image
+                           beside the transcript (<transcript>.slides/), via
+                           meeting-capture-slides; needs Screen Recording
+                           permission
       --interval <ms>      poll interval while in a meeting (default 250)
       --idle-interval <ms> poll interval while waiting for one (default 2000)
       --dir <path>         output directory (default $XDG_DATA_HOME/meeting-capture)
@@ -140,6 +147,7 @@ func parseOptions() -> Options {
         case "--popout-captions": options.popOutCaptions = true
         case "--popout-chat": options.popOutChat = true
         case "--people-snapshot": options.peopleSnapshot = true
+        case "--slides": options.slides = true
         case "--interval": options.intervalMs = UInt32(next(flag)) ?? options.intervalMs
         case "--idle-interval": options.idleIntervalMs = UInt32(next(flag)) ?? options.idleIntervalMs
         case "--dir": options.directory = (next(flag) as NSString).expandingTildeInPath
@@ -1065,7 +1073,9 @@ func renderEvent(kind: String, speaker: String, body: String, at date: Date,
     // "(chat) Alex: hi", "(people) 8 in the meeting" — the kind is worth
     // seeing in the transcript when it is not someone speaking. A roster
     // has no speaker, and "(people) : 8 in" would read like a bug.
-    let tag = kind == "caption" ? "" : "(\(kind)) "
+    // A slide's body opens with ▣, which says what it is; "(slide) ▣ slide 3"
+    // would say it twice.
+    let tag = kind == "caption" || kind == "slide" ? "" : "(\(kind)) "
     let attribution = speaker.isEmpty ? "" : "\(speaker): "
     return (json, "[\(clock)] \(tag)\(attribution)\(body)")
 }
@@ -1123,11 +1133,7 @@ final class Recorder {
         let directory = URL(fileURLWithPath: options.directory, isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        let stamp = DateFormatter()
-        stamp.dateFormat = "yyyyMMdd_HHmmss"
-        // The app is in the name because meeting titles don't say where they
-        // happened, and the same people meet in different places.
-        let base = "\(stamp.string(from: startedAt))-\(app)-\(Recorder.slugify(meeting))"
+        let base = Recorder.baseName(app: app, meeting: meeting, startedAt: startedAt)
         let jsonlURL = directory.appendingPathComponent(base + ".jsonl")
         let textURL = directory.appendingPathComponent(base + ".txt")
 
@@ -1154,6 +1160,15 @@ final class Recorder {
         self.textURL = textURL
         self.jsonl = jsonl
         self.text = text
+    }
+
+    /// The transcript's file name without extension. The app is in the name
+    /// because meeting titles don't say where they happened, and the same
+    /// people meet in different places.
+    static func baseName(app: String, meeting: String, startedAt: Date) -> String {
+        let stamp = DateFormatter()
+        stamp.dateFormat = "yyyyMMdd_HHmmss"
+        return "\(stamp.string(from: startedAt))-\(app)-\(slugify(meeting))"
     }
 
     static func slugify(_ value: String) -> String {
@@ -1599,6 +1614,11 @@ protocol MeetingApp {
     /// detection uses should keep waking until both hold.
     func treeReadiness(_ app: AXUIElement) -> TreeReadiness
 
+    /// Title of the window this app shows a screen share in, matched as a
+    /// substring, for --slides. nil: shares appear inside the meeting window
+    /// alongside video, which slide capture can't single out yet.
+    var shareWindowTitle: String? { get }
+
     /// Whether this app's web content has finished waking up. The default
     /// asks for DOM ids, which is what Chromium and Electron publish; WebKit
     /// publishes none, so Safari web apps override this.
@@ -1606,6 +1626,7 @@ protocol MeetingApp {
 }
 
 extension MeetingApp {
+    var shareWindowTitle: String? { nil }
     // Teams-style: an utterance is done when its element disappears.
     var finalizesWhenSuperseded: Bool { false }
     var idleFinalizeSeconds: TimeInterval? { nil }
@@ -2424,6 +2445,8 @@ enum TeamsChatClasses {
 final class TeamsApp: MeetingApp {
     let id = "teams"
     let displayName = "Microsoft Teams"
+    // Teams opens a viewed share in a window of its own: "Shared content | <meeting>".
+    let shareWindowTitle: String? = "Shared content"
     let processPattern = "Microsoft Teams.app/Contents/MacOS/MSTeams"
     let captionPressToggles = true
     // The People panel lists everyone, expandable page by page — with real
@@ -4270,6 +4293,12 @@ final class Session {
     /// and running twice would double-flush and double-report.
     var finished = false
     private var lastPublishWarning = Date.distantPast
+    /// Set by the daemon (never by tests): keep state.json and live.json, which
+    /// the canvas Meeting card reads.
+    var publishesState = false
+    /// Where meeting-capture-slides writes this meeting's slides, if it runs.
+    var slidesDirectory: String?
+    private var lastLiveEntries: [LiveEntry]?
     private var lastInitWarning = Date.distantPast
     /// The ordered write backlog: everything that failed to persist, oldest
     /// first. ONE queue holds both whole events (.event) and jsonl-only lines
@@ -4453,6 +4482,7 @@ final class Session {
             // Without this pointer --follow has nothing to tail and silently waits forever.
             status("cannot update \(pointer): \(error.localizedDescription)")
         }
+        publishState()
         if !options.quiet {
             status("recording \"\(title)\"\n  jsonl: \(created.jsonlURL.path)\n  text:  \(created.textURL.path)")
         }
@@ -4571,11 +4601,16 @@ final class Session {
     /// too, and because it mirrors the writer's clamp, a line's stamp does not
     /// jump when it graduates from live to transcript.
     static func liveLines(_ pending: [Utterance], after floor: Date?) -> [String] {
+        liveEntries(pending, after: floor).map { "[\(Recorder.clockText(from: $0.at))] \($0.speaker): \($0.text)" }
+    }
+
+    /// The same clamped in-progress lines, unrendered, for live.json.
+    static func liveEntries(_ pending: [Utterance], after floor: Date?) -> [LiveEntry] {
         var floor = floor
         return pending.map { utterance in
             let at = max(utterance.startedAt, floor ?? utterance.startedAt)
             floor = at
-            return "[\(Recorder.clockText(from: at))] \(utterance.speaker): \(utterance.text)"
+            return LiveEntry(speaker: utterance.speaker, text: utterance.text, at: at)
         }
     }
 
@@ -4772,6 +4807,13 @@ final class Session {
         if !options.quiet {
             status("recorded the participant list: \(snapshot.headline)")
         }
+    }
+
+    /// A frame meeting-capture-slides saved, as a transcript line naming the
+    /// image beside the transcript: "[14:42:10] ▣ slide 7  <base>.slides/0007-144210.jpg".
+    func noteSlide(_ event: SlideEvent) {
+        emit(kind: "slide", speaker: "", body: event.transcriptBody,
+             at: event.at, extra: ["slide": event.number, "file": event.path, "reason": event.reason])
     }
 
     /// Retry the ordered backlog on bounded exponential backoff (capped at
@@ -5007,7 +5049,7 @@ final class Session {
         }
         guard recorder != nil || !captionOrder.isEmpty else { return }
         // Mirror every in-progress utterance; finished lines scroll above.
-        let pending = Session.liveLines(captionOrder.compactMap { id -> Utterance? in
+        let entries = Session.liveEntries(captionOrder.compactMap { id -> Utterance? in
             guard var utterance = activeCaptions[id],
                   !supersededByActive(utterance, id: id) else { return nil }
             // Only what is not written yet: the live line of a long segment
@@ -5024,9 +5066,42 @@ final class Session {
             }
             return utterance
         }, after: lastStamp)
+        let pending = entries.map { "[\(Recorder.clockText(from: $0.at))] \($0.speaker): \($0.text)" }
         let shown = pending.enumerated().map { $0.offset == pending.count - 1 ? "\($0.element) ▍" : $0.element }
         live.set(shown)
         publishLive(shown)
+        publishLiveJSON(entries)
+    }
+
+    /// live.json for the canvas Meeting card: the same in-progress lines,
+    /// structured, so nothing has to parse the ▍ cursor. Rewritten only when
+    /// they change, not every poll.
+    private func publishLiveJSON(_ entries: [LiveEntry]) {
+        guard publishesState, entries != lastLiveEntries else { return }
+        lastLiveEntries = entries
+        writeStateJSON(MeetingStateFile.liveJSON(entries), to: options.stateDirectory + "/live.json")
+    }
+
+    /// Rewrite state.json: what is being recorded and where (see
+    /// docs/canvas-contract.md). Only the daemon sets publishesState, so tests
+    /// and one-shot runs never touch the real state directory.
+    func publishState(endedAt: Date? = nil) {
+        guard publishesState else { return }
+        let state = MeetingStateFile.state(
+            pid: getpid(), app: meetingApp.displayName, appID: meetingApp.id, meeting: title,
+            startedAt: startedAt, files: files, slidesDirectory: slidesDirectory,
+            livePath: options.stateDirectory + "/live.json", endedAt: endedAt)
+        writeStateJSON(state, to: options.stateDirectory + "/state.json")
+    }
+
+    private func writeStateJSON(_ payload: [String: Any], to path: String) {
+        do {
+            try writeAtomically(payload, to: path)
+        } catch {
+            guard Date().timeIntervalSince(lastPublishWarning) > 30 else { return }
+            lastPublishWarning = Date()
+            status("cannot update \(path): \(error.localizedDescription)")
+        }
     }
 
     /// So `--follow` can show in-progress speech. The daemon is not a tty, so
@@ -5265,6 +5340,10 @@ final class Session {
         } while (!captionOrder.isEmpty || !pendingWrites.isEmpty) && clock.now() < deadline
         removeStateFile(options.stateDirectory + "/live")
         removeStateFile(options.stateDirectory + "/current")
+        if publishesState {
+            removeStateFile(options.stateDirectory + "/live.json")
+            publishState(endedAt: date)
+        }
         // Known data loss is always reported — even with no recorder at all
         // (nothing ever initialized), even under --quiet, even if the stopped
         // event itself fails to write.
@@ -5294,6 +5373,191 @@ final class Session {
         ]), !options.quiet {
             status("finished \"\(title)\" after \(duration)")
         }
+    }
+}
+
+// MARK: - Canvas state files
+
+/// One in-progress caption line, as live.json carries it.
+struct LiveEntry: Equatable {
+    let speaker: String
+    let text: String
+    let at: Date
+}
+
+/// state.json and live.json, which the canvas Meeting card watches. The shape
+/// is a contract with pi-boehsline's canvas: docs/canvas-contract.md.
+enum MeetingStateFile {
+    static func state(pid: pid_t, app: String, appID: String, meeting: String, startedAt: Date,
+                      files: (jsonl: URL, text: URL)?, slidesDirectory: String?, livePath: String,
+                      endedAt: Date?) -> [String: Any] {
+        var state: [String: Any] = [
+            "v": 1, "pid": Int(pid), "app": app, "app_id": appID, "meeting": meeting,
+            "started_at": Recorder.isoFormatter.string(from: startedAt),
+            "jsonl": files?.jsonl.path ?? NSNull(), "txt": files?.text.path ?? NSNull(),
+            "slides_dir": slidesDirectory ?? NSNull(), "live": livePath,
+            "ended": endedAt != nil,
+        ]
+        if let endedAt {
+            state["ended_at"] = Recorder.isoFormatter.string(from: endedAt)
+            state["duration"] = elapsedString(from: startedAt, to: endedAt)
+        }
+        return state
+    }
+
+    static func liveJSON(_ entries: [LiveEntry]) -> [String: Any] {
+        ["lines": entries.map {
+            ["speaker": $0.speaker, "text": $0.text, "ts": Recorder.isoFormatter.string(from: $0.at)]
+        }]
+    }
+}
+
+/// Write JSON so a reader never sees half a file (temp + rename), readable
+/// only by us: these name private meetings.
+func writeAtomically(_ payload: [String: Any], to path: String) throws {
+    let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+    let temp = path + ".tmp"
+    guard FileManager.default.createFile(atPath: temp, contents: data, attributes: [.posixPermissions: 0o600]) else {
+        throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError,
+                      userInfo: [NSLocalizedDescriptionKey: "cannot write \(temp)"])
+    }
+    guard rename(temp, path) == 0 else {
+        let message = String(cString: strerror(errno))
+        try? FileManager.default.removeItem(atPath: temp)
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                      userInfo: [NSLocalizedDescriptionKey: "cannot rename \(temp): \(message)"])
+    }
+}
+
+// MARK: - Slide capture
+
+/// One frame meeting-capture-slides saved, as reported on its stdout.
+struct SlideEvent: Equatable {
+    let number: Int
+    let at: Date
+    let path: String
+    let reason: String
+
+    /// One stdout line from the helper, or nil for anything that isn't a slide.
+    static func parse(_ line: String) -> SlideEvent? {
+        guard let data = line.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["type"] as? String == "slide",
+              let number = object["n"] as? Int,
+              let at = object["at"] as? Double,
+              let path = object["path"] as? String else { return nil }
+        return SlideEvent(number: number, at: Date(timeIntervalSince1970: at), path: path,
+                          reason: object["reason"] as? String ?? "")
+    }
+
+    /// The image named relative to the transcript's directory — the slides
+    /// directory sits beside the transcript, so this is "<base>.slides/<file>".
+    var transcriptBody: String {
+        let url = URL(fileURLWithPath: path)
+        let relative = url.deletingLastPathComponent().lastPathComponent + "/" + url.lastPathComponent
+        return "▣ slide \(number)  \(relative)"
+    }
+}
+
+/// meeting-capture-slides, run for the length of one meeting under --slides.
+/// It waits for the app's share window, saves a frame each time the slide
+/// changes, and is sent SIGTERM when the meeting ends. It also exits by itself
+/// if this process goes away, so a crash can't leave it running.
+///
+/// A separate process rather than code in the daemon: it is still a
+/// prototype, and its Screen Recording use stays out of the poll loop. TCC
+/// charges a child to the process that launched it, so the grant it needs is
+/// meeting-capture-daemon's.
+final class SlideCapture {
+    static let helperName = "meeting-capture-slides"
+    private let process: Process
+    let directory: String
+    private let output: Pipe
+    private let mutex = NSLock()
+    private var buffer = Data()
+    private var events: [SlideEvent] = []
+
+    private init(process: Process, directory: String, output: Pipe) {
+        self.process = process
+        self.directory = directory
+        self.output = output
+        // Read on the pipe's own queue; the poll loop collects with takeEvents.
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            self?.absorb(handle.availableData)
+        }
+    }
+
+    private func absorb(_ data: Data) {
+        mutex.lock()
+        defer { mutex.unlock() }
+        buffer.append(data)
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            let line = String(decoding: buffer[buffer.startIndex..<newline], as: UTF8.self)
+            buffer.removeSubrange(buffer.startIndex...newline)
+            if let event = SlideEvent.parse(line) { events.append(event) }
+        }
+    }
+
+    /// Slides saved since the last call, oldest first.
+    func takeEvents() -> [SlideEvent] {
+        mutex.lock()
+        defer { events = []; mutex.unlock() }
+        return events
+    }
+
+    /// Where the helper is installed: beside this binary.
+    static func helperPath() -> String {
+        let me = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+        return me.resolvingSymlinksInPath().deletingLastPathComponent()
+            .appendingPathComponent(helperName).path
+    }
+
+    /// The helper's arguments: only `pid`'s windows titled like the app's
+    /// share window, written beside the transcript (`<base>.slides/`).
+    static func arguments(pid: pid_t, shareWindowTitle: String, directory: String) -> [String] {
+        ["--wait", "--pid", String(pid), "--title", shareWindowTitle, "--out", directory]
+    }
+
+    static func start(options: Options, meetingApp: MeetingApp, pid: pid_t,
+                      title: String, startedAt: Date) -> SlideCapture? {
+        guard let shareTitle = meetingApp.shareWindowTitle else {
+            status("--slides: \(meetingApp.displayName) shows shares inside the meeting window, which slide capture can't single out yet")
+            return nil
+        }
+        let helper = helperPath()
+        guard FileManager.default.isExecutableFile(atPath: helper) else {
+            status("--slides: no \(helperName) at \(helper); run meeting-capture-install")
+            return nil
+        }
+        let base = Recorder.baseName(app: meetingApp.id, meeting: title, startedAt: startedAt)
+        let directory = URL(fileURLWithPath: options.directory, isDirectory: true)
+            .appendingPathComponent(base + ".slides").path
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: helper)
+        process.arguments = arguments(pid: pid, shareWindowTitle: shareTitle, directory: directory)
+        // stderr inherited: its log lines land in ours, in our format. stdout
+        // carries one JSON event per saved slide.
+        let output = Pipe()
+        process.standardOutput = output
+        do {
+            try process.run()
+        } catch {
+            status("--slides: cannot start \(helperName): \(error.localizedDescription)")
+            return nil
+        }
+        return SlideCapture(process: process, directory: directory, output: output)
+    }
+
+    /// End the helper and give it a moment to finish writing (and OCR).
+    func stop() {
+        guard process.isRunning else { return }
+        process.terminate()
+        let deadline = Date().addingTimeInterval(5)
+        while process.isRunning && Date() < deadline { usleep(50_000) }
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        // Whatever it wrote before exiting is still in the pipe.
+        output.fileHandleForReading.readabilityHandler = nil
+        absorb(output.fileHandleForReading.readDataToEndOfFile())
     }
 }
 
@@ -5890,6 +6154,28 @@ func runningApps() -> [Attachment] {
 
 var attachment: Attachment?
 var session: Session?
+var slideCapture: SlideCapture?
+
+/// Stop the helper and record any slides it saved on the way out, before the
+/// session's transcript is closed.
+func stopSlides() {
+    guard let capture = slideCapture else { return }
+    capture.stop()
+    for event in capture.takeEvents() { session?.noteSlide(event) }
+    slideCapture = nil
+}
+
+/// Everything that starts alongside a new session: slide capture, and the
+/// state.json the canvas Meeting card watches.
+func startSlides(_ attached: Attachment, title: String, session: Session) {
+    if options.slides {
+        slideCapture = SlideCapture.start(options: options, meetingApp: attached.meetingApp, pid: attached.pid,
+                                          title: title, startedAt: session.startedAt)
+    }
+    session.slidesDirectory = slideCapture?.directory
+    session.publishesState = true
+    session.publishState()
+}
 var waker = TreeWaker(quiet: options.quiet)
 var leaveMissingSince: Date?
 var treeUnreadableSince: Date?
@@ -5917,6 +6203,7 @@ if options.once {
         meetingApp: found.meetingApp,
         title: found.meetingApp.meetingTitle(found.element, anchor: anchor)
     )
+    if let session { startSlides(found, title: session.title, session: session) }
 } else if !options.quiet {
     status("watching for meetings in \(wanted.map(\.displayName).joined(separator: ", "))…")
 }
@@ -5961,6 +6248,7 @@ while !stopRequested {
                 let title = candidate.meetingApp.meetingTitle(candidate.element, anchor: anchor)
                 attachment = candidate
                 session = Session(options: options, live: live, meetingApp: candidate.meetingApp, title: title)
+                if let session { startSlides(candidate, title: title, session: session) }
                 leaveMissingSince = nil
                 if !options.quiet {
                     status("joined \"\(title)\" in \(candidate.meetingApp.displayName) (pid \(candidate.pid))")
@@ -5986,6 +6274,7 @@ while !stopRequested {
         } else if let current = attachment {
             func endSession(_ reason: String) {
                 if !options.quiet { status("\(reason), ending session") }
+                stopSlides()
                 session?.finish(at: now)
                 session = nil
                 attachment = nil
@@ -6058,6 +6347,7 @@ while !stopRequested {
     }
 
     if let active = session, let current = attachment {
+        for event in slideCapture?.takeEvents() ?? [] { active.noteSlide(event) }
         active.tick(app: current.element, pid: current.pid, now: now)
         usleep(options.intervalMs * 1000)
     } else {
@@ -6065,6 +6355,7 @@ while !stopRequested {
     }
 }
 
+stopSlides()
 session?.finish(at: Date())
 
 
