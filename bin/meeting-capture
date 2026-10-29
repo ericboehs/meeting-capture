@@ -2727,7 +2727,7 @@ final class TeamsApp: MeetingApp {
     /// A popped-out share: its title starts with "Shared content".
     private func shareWindow(_ app: AXUIElement) -> AXUIElement? {
         guard let title = shareWindowTitle else { return nil }
-        return axWindows(app).first { (axString($0, kAXTitleAttribute) ?? "").contains(title) }
+        return axWindows(app).first { axString($0, kAXTitleAttribute).contains(title) }
     }
 
     /// Press the share's "Pop out" with a real click (Teams' WebView ignores
@@ -4524,6 +4524,7 @@ final class Session {
             "type": "metadata",
             "source": "\(meetingApp.id)-ax",
             "app": meetingApp.displayName,
+            "app_id": meetingApp.id,
             "meeting": title,
             "recorded_at": Recorder.isoFormatter.string(from: startedAt),
             "timestamps": mode.metadataValue

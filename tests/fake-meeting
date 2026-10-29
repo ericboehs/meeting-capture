@@ -103,7 +103,7 @@ func event(_ type: String, speaker: String = "", text: String, extra: [String: A
     if !transcriptStarted {
         transcriptStarted = true
         append(try! String(data: JSONSerialization.data(withJSONObject: [
-            "type": "metadata", "source": "teams-ax", "app": "Microsoft Teams", "meeting": meeting,
+            "type": "metadata", "source": "teams-ax", "app": "Microsoft Teams", "app_id": "teams", "meeting": meeting,
             "recorded_at": iso.string(from: startedAt), "timestamps": "time-of-day",
         ], options: [.sortedKeys]), encoding: .utf8)!, to: jsonlPath)
         append("# \(meeting) (Microsoft Teams)\n# recording started \(iso.string(from: startedAt))\n# [hh:mm:ss] is the time of day\n", to: txtPath)

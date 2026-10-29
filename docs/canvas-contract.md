@@ -70,7 +70,7 @@ finished meeting.
 
 | `type` | Fields | Transcript line (`txt`) |
 |---|---|---|
-| `metadata` | `app`, `meeting`, `recorded_at`, `timestamps`; at the end: `event: "stopped"`, `stopped_at`, `duration` | header comments |
+| `metadata` | `app`, `app_id` (`teams`, `zoom`, `meet`, `slack`; since 2026-10-29, else take it from `source`, `teams-ax`), `meeting`, `recorded_at`, `timestamps`; merged files add `merged_from`; at the end: `event: "stopped"`, `stopped_at`, `duration` | header comments |
 | `caption` | `speaker`, `text`, `ts`, `elapsed` | `[14:12:05] Ada Lovelace: text` |
 | `chat` | `speaker`, `text`, `ts` | `[14:12:09] (chat) Edsger Dijkstra: text` |
 | `people` | `text` (summary), `people` (names), `count`, `confirmed`, `ts` | `[..] (people) 5 in the meeting: …` |
