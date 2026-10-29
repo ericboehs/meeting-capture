@@ -88,8 +88,9 @@ func usage() -> String {
                            re-read on demand with roster-now)
       --slides             Teams: save each slide of a shared screen as an image
                            beside the transcript (<transcript>.slides/), via
-                           meeting-capture-slides; needs Screen Recording
-                           permission
+                           meeting-capture-slides; pops the share out into
+                           its own window (once per share); needs Screen
+                           Recording permission
       --interval <ms>      poll interval while in a meeting (default 250)
       --idle-interval <ms> poll interval while waiting for one (default 2000)
       --dir <path>         output directory (default $XDG_DATA_HOME/meeting-capture)
@@ -1572,7 +1573,7 @@ protocol MeetingApp {
     /// not even be open. Free to be slow and to touch the UI, but only rarely:
     /// it runs on the polling thread.
     func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
-                          popOutCaptions: Bool, popOutChat: Bool)
+                          popOutCaptions: Bool, popOutChat: Bool, popOutShare: Bool)
 
     /// True when finished utterances stay on screen, so waiting for one to
     /// disappear would hold the whole transcript back. Such an app is assumed
@@ -1664,7 +1665,7 @@ extension MeetingApp {
     func captionHistoryStep(_ app: AXUIElement) -> [SegmentKey]? { [] }
     // Only Teams parks a covered window; everyone else keeps rendering.
     func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
-                          popOutCaptions: Bool, popOutChat: Bool) {}
+                          popOutCaptions: Bool, popOutChat: Bool, popOutShare: Bool) {}
 }
 
 func windowTitle(containing element: AXUIElement) -> String? {
@@ -2507,6 +2508,13 @@ final class TeamsApp: MeetingApp {
     private var nextChatPopOutAttempt = Date.distantPast
     private var warnedMinimized = false
 
+    // --- popping out shared content for --slides (see maintainShareSurface) ---
+    private let sharePopOutButtonID = "popout-content-button"
+    private var nextShareCheck = Date.distantPast
+    private var sharePoppedOut = false
+    private var sharePopOutAttempts = 0
+    private var nextSharePopOutAttempt = Date.distantPast
+
     /// Meeting-only chrome. hangup-button is the obvious one, but Teams'
     /// WebView can take minutes to expose the full toolbar; the call timer
     /// often appears first and is just as reliable.
@@ -2680,10 +2688,73 @@ final class TeamsApp: MeetingApp {
     /// second display. Without --popout-captions, say what is happening rather
     /// than let the transcript trail off in silence.
     func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
-                          popOutCaptions: Bool, popOutChat: Bool) {
+                          popOutCaptions: Bool, popOutChat: Bool, popOutShare: Bool) {
         maintainCaptionSurface(app, pid: pid, now: now, popOut: popOutCaptions)
+        if popOutShare { maintainShareSurface(app, pid: pid, now: now) }
         guard popOutChat else { return }
         maintainChatSurface(app, pid: pid, now: now)
+    }
+
+    /// With --slides, put shared content in its own window: the slide helper
+    /// captures the "Shared content" window, and Teams only makes one when
+    /// someone presses the share's "Pop out". Inline, the share sits among
+    /// video tiles and chrome, which the helper does not try to crop.
+    ///
+    /// Once per share: the button disappears when the share ends, and a new
+    /// share gets its own try. Popping it back in mid-share is an answer, so
+    /// the button coming back does not trigger another press. Looked for every
+    /// five seconds rather than every poll, since it walks the meeting window.
+    private func maintainShareSurface(_ app: AXUIElement, pid: pid_t, now: Date) {
+        guard now >= nextShareCheck else { return }
+        nextShareCheck = now.addingTimeInterval(5)
+        if shareWindow(app) != nil {
+            sharePoppedOut = true
+            return
+        }
+        guard let window = standardWindow(app),
+              findElement(from: window, where: { axDomID($0) == sharePopOutButtonID }) != nil else {
+            // No share (or it ended): the next one starts fresh.
+            sharePoppedOut = false
+            sharePopOutAttempts = 0
+            return
+        }
+        guard !sharePoppedOut, sharePopOutAttempts < 2, now >= nextSharePopOutAttempt, !sessionLocked() else { return }
+        sharePopOutAttempts += 1
+        nextSharePopOutAttempt = now.addingTimeInterval(30)
+        popOutShare(app, pid: pid, window: window)
+    }
+
+    /// A popped-out share: its title starts with "Shared content".
+    private func shareWindow(_ app: AXUIElement) -> AXUIElement? {
+        guard let title = shareWindowTitle else { return nil }
+        return axWindows(app).first { (axString($0, kAXTitleAttribute) ?? "").contains(title) }
+    }
+
+    /// Press the share's "Pop out" with a real click (Teams' WebView ignores
+    /// AXPress), putting the pointer and the front app back afterwards. The
+    /// new window is left where Teams puts it: it is the content being
+    /// presented, and Teams may stop drawing a share it thinks nobody sees.
+    private func popOutShare(_ app: AXUIElement, pid: pid_t, window: AXUIElement) {
+        let priorPointer = CGEvent(source: nil)?.location
+        let priorApp = bringToFront(pid: pid, window: window)
+        defer {
+            if let priorPointer {
+                CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                        mouseCursorPosition: priorPointer, mouseButton: .left)?.post(tap: .cghidEventTap)
+            }
+            restoreFrontmost(priorApp)
+        }
+        guard let button = findElement(from: window, where: { axDomID($0) == sharePopOutButtonID }),
+              verifiedClick(button, in: window, pid: pid, what: "Teams' shared content pop-out control")
+        else { return }
+        for _ in 0..<12 {
+            usleep(500_000)
+            guard shareWindow(app) != nil else { continue }
+            sharePoppedOut = true
+            status("opened the shared content in its own window, so its slides can be saved")
+            return
+        }
+        status("pressed Teams' shared content pop-out, but no shared content window appeared")
     }
 
     private func maintainCaptionSurface(_ app: AXUIElement, pid: pid_t, now: Date, popOut: Bool) {
@@ -2916,6 +2987,10 @@ final class TeamsApp: MeetingApp {
         warnedMinimized = false
         chatPopOutAttempts = 0
         nextChatPopOutAttempt = .distantPast
+        nextShareCheck = .distantPast
+        sharePoppedOut = false
+        sharePopOutAttempts = 0
+        nextSharePopOutAttempt = .distantPast
     }
 
     /// Teams' own shortcut (⇧⌘A), delivered straight to the process so it
@@ -4058,7 +4133,7 @@ final class MeetApp: MeetingApp {
     /// Twice at most, a minute apart: closing the panel again is an answer,
     /// and reopening it forever would be an argument.
     func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
-                          popOutCaptions: Bool, popOutChat: Bool) {
+                          popOutCaptions: Bool, popOutChat: Bool, popOutShare: Bool) {
         guard popOutChat, !chatPanelOpen(app) else { return }
         guard chatOpenAttempts < 2, now >= nextChatOpenAttempt else { return }
         chatOpenAttempts += 1
@@ -4645,7 +4720,8 @@ final class Session {
             if options.autoCaptions { ensureCaptionsOn(app: app, pid: pid, now: now) }
             meetingApp.maintainSurfaces(app, pid: pid, now: now,
                                         popOutCaptions: options.popOutCaptions,
-                                        popOutChat: options.popOutChat)
+                                        popOutChat: options.popOutChat,
+                                        popOutShare: options.slides)
             UIAutomation.leave()
         }
         if historyPending { advanceHistory(app: app, now: now) }
