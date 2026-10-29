@@ -23,9 +23,9 @@ trap 'rm -rf "$work"' EXIT
 # Fixture helpers. Timestamps are a fixed date at a chosen second, so the
 # window rules can be driven exactly.
 day="2026-08-26T11"
-meta() { # meta <file> <recorded mm:ss>
-  printf '{"type":"metadata","source":"zoom-ax","app":"Zoom","meeting":"Standup","recorded_at":"%s:%s-05:00","timestamps":"elapsed"}\n' \
-    "$day" "$1" >> "$2"
+meta() { # meta <recorded mm:ss> <file> [title]
+  printf '{"type":"metadata","source":"zoom-ax","app":"Zoom","meeting":"%s","recorded_at":"%s:%s-05:00","timestamps":"elapsed"}\n' \
+    "${3-Standup}" "$day" "$1" >> "$2"
 }
 caption() { # caption <file> <mm:ss> <speaker> <text> [node] [continues]
   local extra=""
@@ -89,6 +89,26 @@ check "losses are summed across sessions" \
   "1" "$(grep -c '\"lost_events\":2' "$work/two.jsonl")"
 check "the merged file is written with the earliest session's metadata" \
   "1" "$(grep -c '\"recorded_at\":\"2026-08-26T11:46:53-05:00\"' "$work/two.jsonl")"
+
+# --- The title comes from the latest fragment with a real one -------------
+#
+# A capture started while Teams is still joining is titled "Meeting join
+# meeting"; the next fragment has the real title.
+
+t1="$work/t1.jsonl"; t2="$work/t2.jsonl"; t3="$work/t3.jsonl"
+meta "40:00" "$t1" "Meeting join  meeting"
+caption "$t1" "40:05" "Ada Lovelace" "Morning."
+meta "41:00" "$t2" "Daily Stand-Up"
+caption "$t2" "41:05" "Grace Hopper" "Morning all."
+meta "42:00" "$t3" ""
+caption "$t3" "42:05" "Alan Turing" "Hi."
+"$merge" -o "$work/titled" --quiet "$t1" "$t2" "$t3"
+check "a placeholder or empty title gives way to the latest real one" \
+  "1" "$(grep -c '\"meeting\":\"Daily Stand-Up\"' "$work/titled.jsonl")"
+check "the merged header shows the real title" \
+  "# Daily Stand-Up (Zoom)" "$(head -1 "$work/titled.txt")"
+check "times still come from the earliest fragment" \
+  "1" "$(grep -c '\"recorded_at\":\"2026-08-26T11:40:00-05:00\"' "$work/titled.jsonl")"
 
 # Argument order must not matter: sessions are ordered by their own clocks.
 "$merge" -o "$work/rev" --quiet "$b" "$a"

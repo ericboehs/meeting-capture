@@ -39,6 +39,7 @@ the file that carries the structure this needs.
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -190,10 +191,27 @@ def text_line(event):
     return f"[{clock}] {tag}{attribution}{event.get('text', '')}"
 
 
+# What Teams calls a meeting while it is still joining. A capture that starts
+# then keeps the placeholder as its title.
+PLACEHOLDER_TITLE = re.compile(r"^\s*meeting join", re.IGNORECASE)
+
+
+def real_title(title):
+    return bool(title and title.strip()) and not PLACEHOLDER_TITLE.match(title)
+
+
 def merged_metadata(sources, names):
-    """One header for the whole conversation, honest about its provenance."""
-    first = next((metadata for _, (metadata, _, _) in sources if metadata), {})
-    merged = dict(first)
+    """One header for the whole conversation, honest about its provenance.
+
+    Times come from the earliest session, the title from the latest one that
+    has a real one: the first fragment is the one most likely to have caught
+    Teams mid-join, titled "Meeting join meeting".
+    """
+    found = [metadata for _, (metadata, _, _) in sources if metadata]
+    merged = dict(found[0]) if found else {}
+    titles = [metadata.get("meeting") for metadata in found if real_title(metadata.get("meeting"))]
+    if titles:
+        merged["meeting"] = titles[-1]
     merged["merged_from"] = names
     return merged
 
