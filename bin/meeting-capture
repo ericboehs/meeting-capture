@@ -5525,7 +5525,8 @@ final class SlideCapture {
     /// The helper's arguments: only `pid`'s windows titled like the app's
     /// share window, written beside the transcript (`<base>.slides/`).
     static func arguments(pid: pid_t, shareWindowTitle: String, directory: String) -> [String] {
-        ["--wait", "--pid", String(pid), "--title", shareWindowTitle, "--out", directory]
+        // --ocr: every slide gets its text beside it, for the /meeting copilot.
+        ["--wait", "--ocr", "--pid", String(pid), "--title", shareWindowTitle, "--out", directory]
     }
 
     static func start(options: Options, meetingApp: MeetingApp, pid: pid_t,

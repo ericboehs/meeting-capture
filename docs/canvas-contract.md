@@ -103,7 +103,7 @@ deck's own page numbers, which it can't see.
 ```
 NNNN-HHMMSS.jpg        the frame (Retina, e.g. 2880×2560, ~1 MB)
 NNNN-HHMMSS.thumb.jpg  the same frame 480 px wide
-NNNN-HHMMSS.txt        on-device OCR of the frame (only with --ocr)
+NNNN-HHMMSS.txt        on-device OCR of the frame (the daemon always asks for it)
 index.jsonl            one line per frame
 ```
 
@@ -121,7 +121,15 @@ The order of writes guarantees a reader never sees a partial image:
 3. The line is added to `index.jsonl`.
 4. The `slide` event is added to the transcript.
 
-So anything named in `index.jsonl` or a `slide` event is complete. `HHMMSS` is
+So anything named in `index.jsonl` or a `slide` event is complete.
+
+The OCR `.txt` comes **after** all that, on a background queue, and is written
+atomically. Expect it a second or two after the slide event. The first slide of
+a session can take up to a minute while Vision loads its model. A missing
+`.txt` means "not yet", not "no text". Lines are in reading order: a
+two-column slide reads the left column, then the right, between full-width
+lines such as the title. The window's own text (the Teams title bar, the
+presenter's name) can appear in it too. `HHMMSS` is
 the time of day, the same clock as the transcript's `[hh:mm:ss]`. `reason` is
 `first frame` (the share started), `change` (new slide) or `heartbeat`.
 

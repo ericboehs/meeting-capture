@@ -39,7 +39,8 @@
 // Output, default ~/.local/share/meeting-capture/slides/<stamp>-<window>/:
 //   0001-144210.jpg ...   the saved frames
 //   0001-144210.thumb.jpg the same frame 480 px wide
-//   0001-144210.txt       on-device OCR of the frame (with --ocr)
+//   0001-144210.txt       on-device OCR of the frame, columns in reading order
+//                         (with --ocr; appears shortly after the image)
 //   index.jsonl           one line per frame: time, file, change score
 //
 // Requires Screen Recording permission for whatever runs this (your terminal):
@@ -656,12 +657,79 @@ func scaled(_ image: CGImage, width: Int) -> CGImage? {
     return context.makeImage()
 }
 
+/// One recognised line of text and where it sits, in Vision's normalised
+/// coordinates (0–1, origin bottom-left).
+struct TextLine {
+    let text: String
+    let box: CGRect
+}
+
+/// Lines in reading order. Vision returns them roughly top to bottom across
+/// the whole width, which interleaves the columns of a two-column slide line
+/// by line. So: find vertical gutters (x positions no narrow line crosses),
+/// then read top to bottom, and within each band between full-width lines
+/// (titles, footers), one column at a time.
+func readingOrder(_ lines: [TextLine]) -> [String] {
+    guard lines.count > 1 else { return lines.map(\.text) }
+    // Lines wider than half the slide span columns (titles); leave them out
+    // when looking for gutters, or they'd fill every gutter in.
+    let narrow = lines.filter { $0.box.width < 0.5 }
+    // Half-percent bins: a real slide's columns sat 2.2% apart.
+    let bins = 200
+    var covered = [Bool](repeating: false, count: bins)
+    for line in narrow {
+        let from = max(0, Int(line.box.minX * Double(bins)))
+        let to = min(bins - 1, Int(line.box.maxX * Double(bins)))
+        if from <= to { for b in from...to { covered[b] = true } }
+    }
+    // Gutters: runs of at least 1% empty, between text on both sides, away
+    // from the outer tenth on each side.
+    var gutters: [Double] = []
+    let margin = bins / 10
+    var b = margin
+    while b < bins - margin {
+        if !covered[b] {
+            var end = b
+            while end < bins - margin && !covered[end] { end += 1 }
+            let textLeft = covered[..<b].contains(true), textRight = covered[end...].contains(true)
+            if end - b >= 2 && textLeft && textRight { gutters.append(Double(b + end) / 2 / Double(bins)) }
+            b = end
+        } else {
+            b += 1
+        }
+    }
+    guard !gutters.isEmpty else { return lines.sorted { $0.box.midY > $1.box.midY }.map(\.text) }
+
+    func column(_ line: TextLine) -> Int? {
+        // Crosses a gutter: full width.
+        if gutters.contains(where: { line.box.minX < $0 && line.box.maxX > $0 }) { return nil }
+        return gutters.filter { line.box.midX > $0 }.count
+    }
+    var ordered: [String] = []
+    var band: [TextLine] = []
+    func flush() {
+        let byColumn = Dictionary(grouping: band) { column($0) ?? 0 }
+        for key in byColumn.keys.sorted() {
+            ordered += byColumn[key]!.sorted { $0.box.midY > $1.box.midY }.map(\.text)
+        }
+        band = []
+    }
+    for line in lines.sorted(by: { $0.box.midY > $1.box.midY }) {
+        if column(line) == nil { flush(); ordered.append(line.text) } else { band.append(line) }
+    }
+    flush()
+    return ordered
+}
+
 func recognizeText(_ image: CGImage) -> String {
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
     request.usesLanguageCorrection = true
     try? VNImageRequestHandler(cgImage: image).perform([request])
-    return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+    let lines = (request.results ?? []).compactMap { observation in
+        observation.topCandidates(1).first.map { TextLine(text: $0.string, box: observation.boundingBox) }
+    }
+    return readingOrder(lines).joined(separator: "\n")
 }
 
 func slugify(_ value: String) -> String {

@@ -198,5 +198,62 @@ do {
     expectTrue(run.saved == [1, 2, 3], "every new slide is saved (saved \(run.saved))")
 }
 
+// --- OCR reading order --------------------------------------------------
+
+do {
+    // Vision's coordinates: origin bottom-left, so a higher midY is higher up.
+    func line(_ text: String, x: Double, y: Double, width: Double) -> TextLine {
+        TextLine(text: text, box: CGRect(x: x, y: y, width: width, height: 0.03))
+    }
+    let lines = [
+        line("Title across both columns", x: 0.05, y: 0.90, width: 0.80),
+        line("L1", x: 0.05, y: 0.80, width: 0.40), line("R1", x: 0.55, y: 0.80, width: 0.40),
+        line("L2", x: 0.05, y: 0.75, width: 0.40), line("R2", x: 0.55, y: 0.75, width: 0.40),
+        line("L3", x: 0.05, y: 0.70, width: 0.40),
+        line("Footer across both", x: 0.05, y: 0.10, width: 0.80),
+    ]
+    expectTrue(readingOrder(lines) == ["Title across both columns", "L1", "L2", "L3", "R1", "R2", "Footer across both"],
+               "two columns read one at a time, between full-width lines (\(readingOrder(lines)))")
+    // A real slide's layout (OpStat, placeholder text): columns only 2.2% apart.
+    let tight = [
+        line("Title", x: 0.015, y: 0.744, width: 0.849),
+        line("L heading", x: 0.013, y: 0.705, width: 0.291), line("R heading", x: 0.506, y: 0.705, width: 0.356),
+        line("L wide", x: 0.013, y: 0.681, width: 0.471), line("R wide", x: 0.506, y: 0.681, width: 0.443),
+        line("L more", x: 0.013, y: 0.638, width: 0.440), line("R more", x: 0.506, y: 0.631, width: 0.092),
+    ]
+    expectTrue(readingOrder(tight) == ["Title", "L heading", "L wide", "L more", "R heading", "R wide", "R more"],
+               "columns 2.2% apart are still two columns (\(readingOrder(tight)))")
+    let single = [line("one", x: 0.1, y: 0.8, width: 0.3), line("two", x: 0.1, y: 0.7, width: 0.3)]
+    expectTrue(readingOrder(single) == ["one", "two"], "a single column reads top to bottom")
+}
+do {
+    // Real OCR on a drawn two-column slide.
+    let context = CGContext(data: nil, width: 1440, height: 900, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+    context.translateBy(x: 0, y: 900)
+    context.scaleBy(x: 1, y: -1)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+    NSColor.white.setFill()
+    NSRect(x: 0, y: 0, width: 1440, height: 900).fill()
+    let big: [NSAttributedString.Key: Any] = [.font: NSFont.boldSystemFont(ofSize: 48), .foregroundColor: NSColor.black]
+    let body: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 30), .foregroundColor: NSColor.black]
+    ("Incident Review" as NSString).draw(at: NSPoint(x: 60, y: 60), withAttributes: big)
+    for (i, text) in ["Impact was nationwide", "Root cause was a certificate", "Resolved by the vendor"].enumerated() {
+        (text as NSString).draw(at: NSPoint(x: 60, y: 200 + CGFloat(i) * 70), withAttributes: body)
+    }
+    for (i, text) in ["Next thirty days", "Alerting goes live"].enumerated() {
+        (text as NSString).draw(at: NSPoint(x: 800, y: 200 + CGFloat(i) * 70), withAttributes: body)
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    let text = recognizeText(context.makeImage()!)
+    let order = ["Incident Review", "Impact was nationwide", "Root cause was a certificate", "Resolved by the vendor",
+                 "Next thirty days", "Alerting goes live"]
+    let positions = order.map { text.range(of: $0)?.lowerBound }
+    expectTrue(!positions.contains(nil) && zip(positions, positions.dropFirst()).allSatisfy { $0! < $1! },
+               "OCR of a two-column slide reads the left column before the right (\(text.replacingOccurrences(of: "\n", with: " | ")))")
+}
+
 print(failures == 0 ? "all \(count) assertions passed" : "\(failures)/\(count) assertions FAILED")
 exit(failures == 0 ? 0 : 1)

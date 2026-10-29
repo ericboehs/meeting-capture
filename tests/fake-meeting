@@ -204,6 +204,10 @@ func showSlide(_ title: String, _ bullets: [String], deckNumber: Int) {
     slidePaths[slideCount] = "\(slidesDir)/\(stem).jpg"
     writeJPEG(render(title: title, bullets: bullets, number: deckNumber, width: 480, height: 427),
               to: "\(slidesDir)/\(stem).thumb.jpg", quality: 0.8)
+    // OCR text, as the helper writes it shortly after the image.
+    let text = ([title] + bullets.map { "• " + $0 } + ["\(deckNumber)"]).joined(separator: "\n")
+    fm.createFile(atPath: "\(slidesDir)/\(stem).txt.tmp", contents: Data(text.utf8))
+    rename("\(slidesDir)/\(stem).txt.tmp", "\(slidesDir)/\(stem).txt")
     let entry: [String: Any] = ["n": slideCount, "at": iso.string(from: now), "file": "\(stem).jpg",
                                 "thumb": "\(stem).thumb.jpg", "reason": slideCount == 1 ? "first frame" : "change",
                                 "change": slideCount == 1 ? 1 : 0.41, "masked": 0, "width": 2880, "height": 2560]
@@ -249,8 +253,8 @@ live([])
 pause(2)
 say("Ada Lovelace", "Morning everyone, let's get started with the platform sync.")
 say("Grace Hopper", "Morning! I can share the deck in a second.")
-event("people", text: "5 in the meeting: Ada Lovelace, Grace Hopper, Alan Turing, Katherine Johnson, Edsger Dijkstra",
-      extra: ["people": ["Ada Lovelace", "Grace Hopper", "Alan Turing", "Katherine Johnson", "Edsger Dijkstra"],
+event("people", text: "6 in the meeting: Ada Lovelace, Grace Hopper, Alan Turing, Katherine Johnson, Edsger Dijkstra, Eric Boehs",
+      extra: ["people": ["Ada Lovelace", "Grace Hopper", "Alan Turing", "Katherine Johnson", "Edsger Dijkstra", "Eric Boehs"],
               "count": 5, "confirmed": true])
 pause(1)
 showSlide("Platform Weekly Sync", ["Agenda", "Deploy pipeline", "Incident review", "Next steps"], deckNumber: 1)
@@ -269,11 +273,18 @@ say("Ada Lovelace", "Did we get the alerting in place so we'd catch it sooner ne
 say("Grace Hopper", "Alert is live as of Monday, it pages after five minutes of failures.")
 showSlide("Next Steps", ["Legacy services onto canary", "Retire old build agents", "Review alert thresholds"],
           deckNumber: 4)
+// An action item lands on the user (alerts: name + action item).
+say("Ada Lovelace", "Eric, can you own moving the two legacy services onto canary?")
+say("Eric Boehs", "Sure, I'll take that.")
 say("Katherine Johnson", "Can you flip back to the deploy numbers for a second?")
 revisitSlide(2)
 say("Grace Hopper", "Sure, that's the nine minute median there.")
 say("Katherine Johnson", "Got it, thanks.")
 revisitSlide(4)
+// A question to the user left unanswered for a while (suggested reply).
+say("Katherine Johnson", "Eric, do you know if the cert alert covers staging too?")
+say("Grace Hopper", "While he checks, the build agents retire at the end of the month.")
+say("Alan Turing", "Good, those have been flaky.")
 say("Ada Lovelace", "Great, thanks Grace. Anything else before we wrap?")
 say("Alan Turing", "Nothing from me.")
 say("Ada Lovelace", "Alright, thanks all, see you next week.")

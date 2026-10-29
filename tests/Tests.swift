@@ -77,7 +77,7 @@ do {
     expectEqual(base, "20260824_144024-teams-weekly-sync", "base name is stamp, app and slug")
     // The slides directory sits beside the transcript under the same name.
     expectEqual(SlideCapture.arguments(pid: 42, shareWindowTitle: "Shared content", directory: "/t/\(base).slides"),
-                ["--wait", "--pid", "42", "--title", "Shared content", "--out", "/t/20260824_144024-teams-weekly-sync.slides"],
+                ["--wait", "--ocr", "--pid", "42", "--title", "Shared content", "--out", "/t/20260824_144024-teams-weekly-sync.slides"],
                 "slide helper waits for the pid's share window and writes beside the transcript")
 }
 do {
@@ -108,11 +108,11 @@ do {
     if !FileManager.default.fileExists(atPath: helper) {
         let script = """
         #!/bin/sh
-        # args: --wait --pid P --title T --out DIR ($7 is DIR)
-        echo '{"type":"slide","n":1,"at":1793216486,"path":"'"$7"'/0001-144126.jpg","reason":"first frame"}'
-        echo '{"type":"revisit","n":1,"at":1793216490,"path":"'"$7"'/0001-144126.jpg"}'
+        # args: --wait --ocr --pid P --title T --out DIR ($8 is DIR)
+        echo '{"type":"slide","n":1,"at":1793216486,"path":"'"$8"'/0001-144126.jpg","reason":"first frame"}'
+        echo '{"type":"revisit","n":1,"at":1793216490,"path":"'"$8"'/0001-144126.jpg"}'
         echo "[log] meeting-capture-slides: waiting" >&2
-        trap 'echo "{\\"type\\":\\"slide\\",\\"n\\":2,\\"at\\":1793216500,\\"path\\":\\"$7/0002-144140.jpg\\"}"; exit 0' TERM
+        trap 'echo "{\\"type\\":\\"slide\\",\\"n\\":2,\\"at\\":1793216500,\\"path\\":\\"$8/0002-144140.jpg\\"}"; exit 0' TERM
         while :; do sleep 0.1; done
         """
         FileManager.default.createFile(atPath: helper, contents: Data(script.utf8),
