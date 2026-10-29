@@ -400,13 +400,16 @@ caption panel still shows the last few utterances, and the fresh session reads
 them as new.
 
 ```sh
-bin/meeting-capture-merge ~/.local/share/meeting-capture/20260826_11{4653,5435}-zoom-*.jsonl
+meeting-capture-merge ~/.local/share/meeting-capture/20260826_11{4653,5435}-zoom-*.jsonl
 # merged 2 transcript(s) -> …/20260826_114653-zoom-meeting-40-minutes-merged.txt
 #   204 line(s) kept, 94 snapshot(s) collapsed, 0 continuation(s) rejoined
 ```
 
-It writes a new `.jsonl`/`.txt` pair (`-o BASE` to choose where) and never
-touches the originals. Along the way it collapses lines that are snapshots of
+The installer puts it in `~/.local/bin` (it is `bin/meeting-capture-merge` in
+the checkout). It writes a new `.jsonl`/`.txt` pair (`-o BASE` to choose where)
+and never touches the originals. The merged header takes its times from the
+earliest capture and its title from the latest one with a real title, so a
+capture that caught Teams mid-join ("Meeting join meeting") does not name it. Along the way it collapses lines that are snapshots of
 one utterance being spoken — where one is a prefix of another from the same
 speaker, close by — which also cleans up transcripts recorded before the
 growth-flood fixes, and rejoins `"continues": true` tails to the row they

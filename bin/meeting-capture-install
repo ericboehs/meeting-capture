@@ -24,6 +24,10 @@ cli="$HOME/.local/bin/meeting-capture"
 # TCC charges it to the daemon, so the Screen Recording grant is the daemon's.
 slides_script="${BASH_SOURCE[0]%/*}/screen-capture-prototype"
 slides_helper="$HOME/.local/bin/meeting-capture-slides"
+# Merges a meeting split across captures into one transcript. A plain Python
+# script, copied (not linked) so it works after the checkout moves.
+merge_script="${BASH_SOURCE[0]%/*}/meeting-capture-merge"
+merge_tool="$HOME/.local/bin/meeting-capture-merge"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/meeting-capture"
 stamp="$state_dir/source.sha256"
@@ -156,7 +160,7 @@ esac
 case "$action" in
   uninstall)
     launchctl bootout "gui/$UID/$label" 2>/dev/null || true
-    rm -rf "$plist" "$binary" "$slides_helper" "$stamp"
+    rm -rf "$plist" "$binary" "$slides_helper" "$merge_tool" "$stamp"
     echo "removed $label"
     exit 0
     ;;
@@ -265,6 +269,8 @@ fi
 if [[ $rebuilt == true || ! -x $cli ]]; then
   cp -f "$binary" "$cli"
 fi
+# Every run: it is not part of the build stamp, and copying is cheap.
+install -m 0755 "$merge_script" "$merge_tool"
 
 cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -315,6 +321,7 @@ installed $label
   log:         $log
   transcripts: ${XDG_DATA_HOME:-$HOME/.local/share}/meeting-capture
   slides:      <transcript>.slides/ beside each transcript (Teams screen shares)
+  merge:       $merge_tool FRAGMENT.jsonl… (one meeting, split captures)
 
   tail -f $log
 
