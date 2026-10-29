@@ -75,8 +75,28 @@ finished meeting.
 | `chat` | `speaker`, `text`, `ts` | `[14:12:09] (chat) Edsger Dijkstra: text` |
 | `people` | `text` (summary), `people` (names), `count`, `confirmed`, `ts` | `[..] (people) 5 in the meeting: …` |
 | `slide` | `text`, `slide` (number), `file` (absolute path), `reason`, `ts` | `[14:12:10] ▣ slide 3  <base>.slides/0003-141210.jpg` |
+| `revisit` | `text`, `slide` (the earlier slide's number), `file` (its image), `reason: "revisit"`, `ts` | `[14:15:02] ▣ back to slide 2  <base>.slides/0002-141030.jpg` |
 
 `ts` is ISO 8601 with offset. The `txt` stamps are the time of day of `ts`.
+
+### Revisits
+
+A `revisit` means the screen went back to something already saved: an earlier
+slide, or a tab shown before. It matches one of the last 10 saved frames
+(`--repeat`, under 5% new). Nothing new is written to `slides_dir`. `slide` and
+`file` point at the frame saved the first time, which is already in
+`index.jsonl`. Revisits are their own type so that counting `slide` events
+still counts distinct frames. Ways to show one:
+
+- **Current slide:** a revisit makes slide `slide` current again, until the
+  next `slide` or `revisit`.
+- **Transcript:** a marker like a slide's ("▣ back to slide 2"), linked to that
+  slide.
+- **Thumbnail strip:** no new thumbnail. Optionally mark that slide as shown
+  again at `ts`, or treat its click target as the latest showing.
+
+Slide numbers are the helper's save order (`NNNN` in the file name), not the
+deck's own page numbers, which it can't see.
 
 ## Slides (`slides_dir`)
 
@@ -87,7 +107,7 @@ NNNN-HHMMSS.txt        on-device OCR of the frame (only with --ocr)
 index.jsonl            one line per frame
 ```
 
-`index.jsonl`:
+`index.jsonl` (one line per saved frame; revisits don't add lines):
 
 ```json
 {"n": 3, "at": "2026-10-28T14:12:10-05:00", "file": "0003-141210.jpg", "thumb": "0003-141210.thumb.jpg",
@@ -122,4 +142,5 @@ MEETING_CAPTURE_STATE_DIR=/tmp/meeting-capture-fake/state   # point the canvas h
 
 It writes the same files in the same order as a real meeting: captions that
 grow word by word in `live.json`, chat, a people list, four synthetic slides
-with thumbnails, then `ended: true`. Ctrl-C ends it early the same way.
+with thumbnails, two revisits (back to slide 2, then to slide 4), then
+`ended: true`. Ctrl-C ends it early the same way.

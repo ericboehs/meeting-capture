@@ -24,9 +24,14 @@
 //   change  share of pixels changed since the last SAVED frame
 //   motion  share of pixels changed since the PREVIOUS tick
 //
-// A frame is saved once change ≥ --threshold and motion has stayed ≤ --still
-// for --settle seconds, so transitions, scrolling and builds are skipped and
-// the settled result is kept. Pixels that keep changing tick after tick —
+// Once anything has changed (--threshold) and motion has stayed ≤ --still for --settle
+// seconds (so transitions, scrolling and builds are skipped), the settled
+// screen is judged by how much of it is NEW: allowing for one vertical scroll,
+// the share of it that wasn't on screen in the last saved frame. A slide or a
+// new tab is nearly all new; a three-line scroll is a few percent, and is
+// skipped until enough small scrolls add up to --new. A screen that matches
+// one of the last 10 saved frames (back to an earlier tab or slide) is a
+// revisit: logged, not saved again. Pixels that keep changing tick after tick —
 // participant video tiles, an embedded video, a ticking clock — are masked
 // out automatically and stop counting until they calm down (--no-mask to
 // disable).
@@ -66,16 +71,20 @@ struct Options {
     var crop: [Double]?
     var directory: String?
     var interval = 1.0
-    var threshold = 0.02
+    var threshold = 0.005
     var delta = 20
     var still = 0.005
-    var settle = 1.0
+    var settle = 0.0
     var heartbeat = 0.0
+    var newContent = 0.10
+    var repeatLimit = 0.05
     var mask = true
     var ocr = false
     var format = "jpg"
     var quality = 0.85
     var verbose = false
+    var record: String?
+    var replay: String?
 }
 
 func usage(_ status: Int32 = 0) -> Never {
@@ -96,11 +105,20 @@ func usage(_ status: Int32 = 0) -> Never {
     Change detection:
       --interval SEC       seconds between captures (default 1.0)
       --threshold FRAC     share of pixels that must differ from the last saved
-                           frame to count as a new slide (default 0.02 = 2%)
+                           frame before it's judged at all (default 0.005); --new
+                           decides whether it's saved
       --delta N            gray levels (0-255) a pixel must move to count as
                            changed (default 20)
       --still FRAC         motion at or below this counts as settled (default 0.005)
-      --settle SEC         how long it must stay settled before saving (default 1.0)
+      --settle SEC         how long it must stay settled before it's judged
+                           (default 0: one unchanged sample, a second apart).
+                           People pause 1–2 s between scrolls; 1.0 missed most
+                           of those screens in a recorded browsing session
+      --new FRAC           share of the window that must be new — not on screen
+                           in the last saved frame, even allowing for a scroll —
+                           to save it (default 0.10). Small scrolls add up.
+      --repeat FRAC        a screen at most this new against one of the last 10
+                           saved frames is a revisit, not saved again (default 0.05)
       --heartbeat SEC      also save after this long if anything changed at all,
                            even below threshold (default 0 = off)
       --no-mask            don't mask out constantly changing regions (video tiles)
@@ -112,6 +130,11 @@ func usage(_ status: Int32 = 0) -> Never {
       --ocr                OCR each saved frame on-device, writing a .txt beside it
       --snapshot           save one frame and exit
       -v, --verbose        print motion/change/mask numbers every tick (for tuning)
+      --record DIR         also keep every tick's check capture (640 px) in DIR,
+                           as HHMMSS-<ms>.jpg, to see what detection saw
+      --replay DIR         run detection over a --record directory instead of
+                           capturing, with whatever options are given, and print
+                           what would be saved: tuning without a live share
       -h, --help           show this help
     """)
     exit(status)
@@ -157,6 +180,8 @@ func parseOptions() -> Options {
         case "--still": options.still = number(arg)
         case "--settle": options.settle = number(arg)
         case "--heartbeat": options.heartbeat = number(arg)
+        case "--new": options.newContent = number(arg)
+        case "--repeat": options.repeatLimit = number(arg)
         case "--no-mask": options.mask = false
         case "--ocr": options.ocr = true
         case "--format":
@@ -164,6 +189,8 @@ func parseOptions() -> Options {
             guard ["jpg", "png"].contains(options.format) else { fail("--format: jpg or png") }
         case "--quality": options.quality = min(1, number(arg))
         case "-v", "--verbose": options.verbose = true
+        case "--record": options.record = (value(arg) as NSString).expandingTildeInPath
+        case "--replay": options.replay = (value(arg) as NSString).expandingTildeInPath
         case "-h", "--help": usage()
         default: fail("unknown option \(arg) (try --help)")
         }
@@ -198,6 +225,12 @@ func emitEvent(_ payload: [String: Any]) {
     line.append(0x0A)
     FileHandle.standardOutput.write(line)
 }
+
+let tickStamp: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HHmmss"
+    return formatter
+}()
 
 let clock: DateFormatter = {
     let formatter = DateFormatter()
@@ -281,8 +314,8 @@ func shareableContent() async -> SCShareableContent {
 
 /// Width of the probe captured every tick for change detection. Only a frame
 /// worth keeping is captured again at full resolution, so the per-second cost
-/// is a ~320 px image rather than a 7-megapixel one.
-let probeWidth: CGFloat = 320
+/// is a ~640 px image rather than a 7-megapixel one.
+let probeWidth: CGFloat = 640
 
 /// One capture of the window, cropped per --crop: at full pixel resolution, or
 /// shrunk to `probeWidth` when `probe` is set.
@@ -317,27 +350,169 @@ func capture(_ window: SCWindow, _ options: Options, probe: Bool = false) async 
 
 // MARK: - Change detection
 
-let thumbWidth = 128, thumbHeight = 72
+/// Taller than the window's shape on purpose: rows are what a scroll moves
+/// along, so they get the resolution (one row ≈ 0.7% of the window height).
+let thumbWidth = 256, thumbHeight = 144
+
+/// Rows per grid row in Frame.rows, the tall copy a scroll is measured on.
+let rowDetail = 4
 
 /// The image squashed to a small grayscale grid. Averaging while shrinking
 /// irons out video-compression noise; the aspect ratio doesn't matter here.
-func thumbnail(_ image: CGImage) -> [UInt8] {
-    var pixels = [UInt8](repeating: 0, count: thumbWidth * thumbHeight)
+/// Row 0 is the top of the window.
+func thumbnail(_ image: CGImage, width: Int = thumbWidth, height: Int = thumbHeight) -> [UInt8] {
+    var pixels = [UInt8](repeating: 0, count: width * height)
     pixels.withUnsafeMutableBytes { buffer in
-        guard let context = CGContext(data: buffer.baseAddress, width: thumbWidth, height: thumbHeight,
-                                      bitsPerComponent: 8, bytesPerRow: thumbWidth,
+        guard let context = CGContext(data: buffer.baseAddress, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: width,
                                       space: CGColorSpaceCreateDeviceGray(),
                                       bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
         context.interpolationQuality = .medium
-        context.draw(image, in: CGRect(x: 0, y: 0, width: thumbWidth, height: thumbHeight))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
     }
     return pixels
+}
+
+/// What change detection keeps of one capture: the grid everything is
+/// compared on, and the same columns at rowDetail× the rows, for measuring
+/// a scroll finely enough (one row ≈ 0.17% of the window height).
+struct Frame {
+    var grid: [UInt8]
+    var rows: [UInt8]
+}
+
+func frame(_ image: CGImage) -> Frame {
+    Frame(grid: thumbnail(image), rows: thumbnail(image, height: thumbHeight * rowDetail))
+}
+
+/// How much of a frame was not on screen in a reference frame.
+struct Novelty {
+    /// Share of the frame's content (its ink: text, lines, edges) that is
+    /// new: neither unchanged in place nor explained by the scroll.
+    var fraction: Double
+    /// Grid rows the content moved up (scrolled down) since the reference;
+    /// negative is a scroll up. 0 when no scroll explains the change.
+    var shift: Double
+}
+
+/// Contrast with the pixel to the right or below that makes a pixel "ink".
+let inkContrast = 16
+
+/// Pixels of Frame.rows that carry content: an edge against a neighbour.
+/// Blank background is most of a document or slide and matches whatever is
+/// shown, so "how much is new" is measured over ink, not area. `live` is the
+/// grid's mask (video tiles excluded), applied to the rows under each cell.
+func inkMask(_ pixels: [UInt8], live: [Bool]) -> [Bool] {
+    let w = thumbWidth, h = thumbHeight * rowDetail
+    var ink = [Bool](repeating: false, count: w * h)
+    for y in 0..<h {
+        let cell = (y / rowDetail) * w
+        for x in 0..<w where live[cell + x] {
+            let p = Int(pixels[y * w + x])
+            let right = x + 1 < w ? abs(p - Int(pixels[y * w + x + 1])) : 0
+            let below = y + 1 < h ? abs(p - Int(pixels[(y + 1) * w + x])) : 0
+            ink[y * w + x] = max(right, below) >= inkContrast
+        }
+    }
+    return ink
+}
+
+/// The vertical scroll between two frames, in Frame.rows rows (positive:
+/// content moved up), or 0 when no scroll explains the change.
+///
+/// Measured in one dimension: for each row, how much ink it has across only
+/// the columns where something changed (the page, not a static sidebar).
+/// Lines of text differ in length and paragraphs break, so this profile has a
+/// shape a scroll slides along. Two things learned the hard way
+/// (tests/SlidesTests.swift): matching pixel by pixel was unreliable, since
+/// blurred lines of text repeat and a wrong offset lines up nearly as well;
+/// and the grid's 144 rows were too coarse, a scroll of exactly ten lines
+/// looking like none. The offset must cut the profile's mismatch against no
+/// scroll by a quarter. A real scroll measured 0.2–0.55 of it, a wrong one
+/// 0.9 and up; and a wrong offset only makes a frame look newer, never less
+/// new, since novelty then finds its ink unmatched.
+func scrollShift(_ current: [UInt8], against reference: [UInt8], columns: [Int]) -> Int {
+    let w = thumbWidth, h = thumbHeight * rowDetail
+    let used = columns.filter { $0 + 1 < w }
+    guard !used.isEmpty else { return 0 }
+    func profile(_ pixels: [UInt8]) -> [Double] {
+        (0..<h).map { y in
+            let row = y * w
+            return Double(used.lazy.filter { abs(Int(pixels[row + $0]) - Int(pixels[row + $0 + 1])) >= inkContrast }.count)
+        }
+    }
+    let a = profile(current), b = profile(reference)
+    func mismatch(_ dy: Int) -> Double {
+        var sum = 0.0, rows = 0
+        for y in max(0, -dy)..<min(h, h - dy) { sum += abs(a[y] - b[y + dy]); rows += 1 }
+        return rows > 0 ? sum / Double(rows) : .infinity
+    }
+    let still = mismatch(0)
+    guard still > 0 else { return 0 }
+    var best = 0, bestMismatch = Double.infinity
+    let reach = h * 3 / 4
+    for dy in -reach...reach where dy != 0 {
+        let m = mismatch(dy)
+        if m < bestMismatch { bestMismatch = m; best = dy }
+    }
+    return bestMismatch <= 0.75 * still ? best : 0
+}
+
+/// Compare two frames allowing for one vertical scroll, on Frame.rows. A
+/// window is modelled as two layers: what stayed put (toolbar, sidebar, slide
+/// template) and one region that scrolled (the page). An ink pixel is "seen"
+/// when it matches the reference in place, or at the scroll offset. The rest
+/// of the ink is new. Matching has to happen at this height, not on
+/// the grid: text blurs differently depending on where a scroll lands within
+/// a grid row, and on the grid the same three-line scroll scored anywhere
+/// from 2% to 39% new.
+func novelty(_ currentFrame: Frame, against referenceFrame: Frame, live: [Bool], delta: Int) -> Novelty {
+    let w = thumbWidth, h = thumbHeight * rowDetail
+    let current = currentFrame.rows, reference = referenceFrame.rows
+    let ink = inkMask(current, live: live)
+    var inkCount = 0
+    var changed = [Int]() // ink pixels that differ in place
+    var columns = [Bool](repeating: false, count: w)
+    for i in 0..<(w * h) where ink[i] {
+        inkCount += 1
+        if abs(Int(current[i]) - Int(reference[i])) > delta { changed.append(i); columns[i % w] = true }
+    }
+    guard inkCount > 0, !changed.isEmpty else { return Novelty(fraction: 0, shift: 0) }
+
+    let shift = scrollShift(current, against: reference, columns: (0..<w).filter { columns[$0] })
+    // Seen when the pixel lies within the range of the reference rows around
+    // the offset (±delta): a scroll that lands between rows blends them, so
+    // its pixels fall between their values, not on either.
+    func seen(_ i: Int) -> Bool {
+        let y = i / w, x = i % w
+        var low = 255, high = 0
+        for ry in (y + shift - 1)...(y + shift + 1) where ry >= 0 && ry < h {
+            let value = Int(reference[ry * w + x])
+            low = min(low, value)
+            high = max(high, value)
+        }
+        guard low <= high else { return false }
+        let value = Int(current[i])
+        return value >= low - delta && value <= high + delta
+    }
+    let unseen = changed.lazy.filter { i in
+        let target = i / w + shift
+        return shift == 0 || target < -1 || target > h || !seen(i)
+    }.count
+    return Novelty(fraction: Double(unseen) / Double(inkCount), shift: Double(shift) / Double(rowDetail))
 }
 
 struct Detector {
     let options: Options
     var previous: [UInt8]?
-    var saved: [UInt8]?
+    /// The reference for "new": the last frame saved, or an earlier one the
+    /// screen has gone back to.
+    var saved: Frame?
+    /// Which saved frame that is.
+    var savedNumber = 0
+    /// Recent saved frames, newest last, so going back to one isn't saved twice.
+    var history: [(number: Int, frame: Frame)] = []
+    static let historyLimit = 10
     /// Per-pixel running average of "changed since last tick". Pixels that
     /// keep changing (video) climb above maskLevel and are ignored.
     var heat = [Float](repeating: 0, count: thumbWidth * thumbHeight)
@@ -345,14 +520,22 @@ struct Detector {
     /// After a resize the old reference can't be compared pixel for pixel, so
     /// the next settled frame quietly becomes the new reference instead.
     var rebaselining = false
+    /// Whether this settled screen has been judged yet, so it isn't re-judged
+    /// (and re-logged) every tick.
+    private var judged: Bool = false
     let decay: Float = 0.85, maskLevel: Float = 0.4
 
     struct Reading {
         var motion = 0.0, change = 1.0, masked = 0.0
+        /// Filled in when a settled frame was judged against the reference.
+        var novelty: Novelty?
         var save = false, reason = ""
+        /// An earlier saved frame the screen went back to.
+        var revisited: Int?
     }
 
-    mutating func feed(_ thumb: [UInt8], at now: Date, lastSave: Date?) -> Reading {
+    mutating func feed(_ current: Frame, at now: Date, lastSave: Date?) -> Reading {
+        let thumb = current.grid
         var reading = Reading()
         defer { previous = thumb }
         let delta = options.delta
@@ -377,20 +560,42 @@ struct Detector {
             reading.save = true; reading.reason = "first frame"
             return reading
         }
-        reading.change = share(against: saved)
+        reading.change = share(against: saved.grid)
 
         if reading.motion <= options.still {
             if stillSince == nil { stillSince = now }
         } else {
             stillSince = nil
+            judged = false
         }
         let settled = stillSince.map { now.timeIntervalSince($0) >= options.settle } ?? false
         if rebaselining {
-            if settled { self.saved = thumb; rebaselining = false; reading.reason = "rebaselined" }
+            if settled { self.saved = current; rebaselining = false; reading.reason = "rebaselined" }
             return reading
         }
-        if settled && reading.change >= options.threshold {
-            reading.save = true; reading.reason = "change"
+        // Pixel change is the cheap first filter; whether it's worth a frame
+        // is decided once per settled screen by how much of it is new.
+        if settled && reading.change >= options.threshold && !judged {
+            judged = true
+            let fresh = novelty(current, against: saved, live: live, delta: delta)
+            reading.novelty = fresh
+            if fresh.fraction >= options.newContent {
+                // New against the last frame — but maybe a screen shown before.
+                let earlier = history.reversed().first {
+                    $0.number != savedNumber
+                        && novelty(current, against: $0.frame, live: live, delta: delta).fraction < options.repeatLimit
+                }
+                if let earlier {
+                    self.saved = earlier.frame
+                    savedNumber = earlier.number
+                    reading.revisited = earlier.number
+                    reading.reason = "revisit"
+                } else {
+                    reading.save = true; reading.reason = "change"
+                }
+            }
+            // Below the bar (a nudge of a scroll, a typed word): keep the old
+            // reference, so small scrolls add up until they've shown enough new.
         } else if settled, options.heartbeat > 0, reading.change > 0,
                   let lastSave, now.timeIntervalSince(lastSave) >= options.heartbeat {
             reading.save = true; reading.reason = "heartbeat"
@@ -398,14 +603,22 @@ struct Detector {
         return reading
     }
 
-    mutating func didSave(_ thumb: [UInt8]) { saved = thumb }
+    mutating func didSave(_ frame: Frame, number: Int) {
+        saved = frame
+        savedNumber = number
+        history.append((number, frame))
+        if history.count > Detector.historyLimit { history.removeFirst() }
+    }
 
     /// Forget motion history (pixels no longer line up) but keep that a frame
-    /// was saved, and wait for the resized window to settle.
+    /// was saved, and wait for the resized window to settle. Earlier frames
+    /// can't be compared with the new size either.
     mutating func resized() {
         previous = nil
         heat = [Float](repeating: 0, count: heat.count)
         stillSince = nil
+        judged = false
+        history.removeAll()
         if saved != nil { rebaselining = true }
     }
 }
@@ -472,6 +685,8 @@ final class Saver {
     let directory: URL
     let options: Options
     var count = 0
+    /// Every frame saved so far, by number, so a revisit can name its image.
+    var paths: [Int: String] = [:]
     let index: FileHandle
     let ocrQueue = DispatchQueue(label: "ocr", qos: .utility)
     let iso = ISO8601DateFormatter()
@@ -500,6 +715,7 @@ final class Saver {
         let stem = String(format: "%04d-", count) + fileStamp.string(from: now)
         let url = directory.appendingPathComponent("\(stem).\(options.format)")
         try write(image, to: url, format: options.format, quality: options.quality)
+        paths[count] = url.path
         let thumb = directory.appendingPathComponent("\(stem).thumb.jpg")
         if let small = scaled(image, width: thumbnailWidth) {
             try write(small, to: thumb, format: "jpg", quality: 0.8)
@@ -530,6 +746,44 @@ func percent(_ value: Double) -> String { String(format: "%5.1f%%", value * 100)
 // MARK: - Main
 
 let options = parseOptions()
+
+/// --replay: feed a --record directory through the detector, at the times in
+/// the file names, and say what it would have saved. No capture, no output
+/// files, no permission needed.
+func replay(_ directory: String) -> Never {
+    let names = ((try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? [])
+        .filter { $0.hasSuffix(".jpg") }.sorted()
+    func seconds(_ name: String) -> Double? {
+        let digits = name.prefix(6), ms = name.dropFirst(7).prefix(3)
+        guard digits.count == 6, let h = Double(digits.prefix(2)), let m = Double(digits.dropFirst(2).prefix(2)),
+              let s = Double(digits.suffix(2)), let fraction = Double(ms) else { return nil }
+        return h * 3600 + m * 60 + s + fraction / 1000
+    }
+    let ticks = names.compactMap { name in seconds(name).map { (name, $0) } }
+    guard let first = ticks.first else { fail("no recorded ticks (HHMMSS-mmm.jpg) in \(directory)") }
+    var detector = Detector(options: options)
+    var saved = 0
+    for (name, at) in ticks {
+        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: directory + "/" + name) as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { continue }
+        let sample = frame(image)
+        let reading = detector.feed(sample, at: Date(timeIntervalSince1970: at), lastSave: nil)
+        let when = String(format: "%6.1fs %@", at - first.1, name)
+        if reading.save {
+            saved += 1
+            detector.didSave(sample, number: saved)
+            print("\(when)  ▣ \(saved) (\(reading.reason)" + (reading.novelty.map { ", new \(percent($0.fraction).trimmingCharacters(in: .whitespaces))" } ?? "") + ")")
+        } else if let earlier = reading.revisited {
+            print("\(when)  ↺ back to \(earlier)")
+        } else if let fresh = reading.novelty {
+            print("\(when)  judged: new \(percent(fresh.fraction).trimmingCharacters(in: .whitespaces)), skipped")
+        }
+    }
+    print("\(saved) frame(s) from \(ticks.count) ticks")
+    exit(0)
+}
+
+if let directory = options.replay { replay(directory) }
 
 if !CGPreflightScreenCaptureAccess() {
     CGRequestScreenCaptureAccess()
@@ -602,8 +856,8 @@ if let window {
     log("waiting for a window to share" + (options.title.map { " (title contains \"\($0)\")" } ?? ""))
 }
 if !options.snapshot && !options.wait {
-    log(String(format: "every %.1fs, new frame at ≥%.1f%% change after %.1fs settled%@ — Ctrl-C to stop",
-               options.interval, options.threshold * 100, options.settle, options.mask ? ", video masked" : ""))
+    log(String(format: "every %.1fs, a frame when ≥%.0f%% of a settled screen is new (scrolls allowed for)%@ — Ctrl-C to stop",
+               options.interval, options.newContent * 100, options.mask ? ", video masked" : ""))
 }
 
 var detector = Detector(options: options)
@@ -646,23 +900,42 @@ while true {
         do {
             let probe = try await capture(window, options, probe: true)
             lastError = nil
+            if let record = options.record {
+                try? FileManager.default.createDirectory(atPath: record, withIntermediateDirectories: true)
+                let ms = Int(tickStart.timeIntervalSince1970 * 1000) % 1000
+                let name = String(format: "%@-%03d.jpg", tickStamp.string(from: tickStart), ms)
+                try? write(probe, to: URL(fileURLWithPath: record).appendingPathComponent(name), format: "jpg", quality: 0.7)
+            }
             if let size = frameSize, size != (probe.width, probe.height) {
                 log("window resized — re-baselining")
                 detector.resized()
             }
             frameSize = (probe.width, probe.height)
-            let thumb = thumbnail(probe)
-            let reading = detector.feed(thumb, at: tickStart, lastSave: lastSave)
+            let sample = frame(probe)
+            let reading = detector.feed(sample, at: tickStart, lastSave: lastSave)
             if options.verbose {
                 log("motion \(percent(reading.motion))  change \(percent(reading.change))  masked \(percent(reading.masked))"
                     + (detector.stillSince != nil ? "  still" : ""))
             }
             if reading.reason == "rebaselined" { log("settled after resize; not a new slide") }
+            if let fresh = reading.novelty, options.verbose {
+                let shift = fresh.shift == 0 ? "no scroll"
+                    : String(format: "scrolled %@%.0f%%", fresh.shift > 0 ? "down " : "up ",
+                             abs(Double(fresh.shift)) / Double(thumbHeight) * 100)
+                log("settled: \(shift), new \(percent(fresh.fraction).trimmingCharacters(in: .whitespaces))"
+                    + (fresh.fraction >= options.newContent ? "" : " — under --new, not saved"))
+            }
+            if let earlier = reading.revisited {
+                log("back to frame \(earlier); not saved again")
+                var event: [String: Any] = ["type": "revisit", "n": earlier, "at": tickStart.timeIntervalSince1970]
+                if let path = saver?.paths[earlier] { event["path"] = path }
+                emitEvent(event)
+            }
             if reading.save || options.snapshot {
                 let image = try await capture(window, options)
                 let saver = openSaver(for: window)
                 let url = try saver.save(image, at: tickStart, reading: reading)
-                detector.didSave(thumb)
+                detector.didSave(sample, number: saver.count)
                 lastSave = tickStart
                 log("▣ frame \(saver.count) (\(reading.reason.isEmpty ? "snapshot" : reading.reason), "
                     + "change \(percent(reading.change).trimmingCharacters(in: .whitespaces))) → \(url.path)")

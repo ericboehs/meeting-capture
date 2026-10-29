@@ -1074,8 +1074,8 @@ func renderEvent(kind: String, speaker: String, body: String, at date: Date,
     // seeing in the transcript when it is not someone speaking. A roster
     // has no speaker, and "(people) : 8 in" would read like a bug.
     // A slide's body opens with ▣, which says what it is; "(slide) ▣ slide 3"
-    // would say it twice.
-    let tag = kind == "caption" || kind == "slide" ? "" : "(\(kind)) "
+    // would say it twice. Likewise a revisit's "▣ back to slide 3".
+    let tag = ["caption", "slide", "revisit"].contains(kind) ? "" : "(\(kind)) "
     let attribution = speaker.isEmpty ? "" : "\(speaker): "
     return (json, "[\(clock)] \(tag)\(attribution)\(body)")
 }
@@ -4810,9 +4810,10 @@ final class Session {
     }
 
     /// A frame meeting-capture-slides saved, as a transcript line naming the
-    /// image beside the transcript: "[14:42:10] ▣ slide 7  <base>.slides/0007-144210.jpg".
+    /// image beside the transcript: "[14:42:10] ▣ slide 7  <base>.slides/0007-144210.jpg";
+    /// or a return to one: "[14:45:02] ▣ back to slide 4  <base>.slides/0004-143801.jpg".
     func noteSlide(_ event: SlideEvent) {
-        emit(kind: "slide", speaker: "", body: event.transcriptBody,
+        emit(kind: event.kind, speaker: "", body: event.transcriptBody,
              at: event.at, extra: ["slide": event.number, "file": event.path, "reason": event.reason])
     }
 
@@ -5431,31 +5432,40 @@ func writeAtomically(_ payload: [String: Any], to path: String) throws {
 
 // MARK: - Slide capture
 
-/// One frame meeting-capture-slides saved, as reported on its stdout.
+/// What meeting-capture-slides reports on its stdout: a frame it saved, or
+/// the screen going back to one it saved earlier (an earlier slide or tab),
+/// which it doesn't save again.
 struct SlideEvent: Equatable {
     let number: Int
     let at: Date
     let path: String
     let reason: String
+    /// A screen already saved as slide `number`, shown again.
+    var revisit = false
 
-    /// One stdout line from the helper, or nil for anything that isn't a slide.
+    /// One stdout line from the helper, or nil for anything else.
     static func parse(_ line: String) -> SlideEvent? {
         guard let data = line.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              object["type"] as? String == "slide",
+              let type = object["type"] as? String, type == "slide" || type == "revisit",
               let number = object["n"] as? Int,
               let at = object["at"] as? Double,
               let path = object["path"] as? String else { return nil }
         return SlideEvent(number: number, at: Date(timeIntervalSince1970: at), path: path,
-                          reason: object["reason"] as? String ?? "")
+                          reason: object["reason"] as? String ?? (type == "revisit" ? "revisit" : ""),
+                          revisit: type == "revisit")
     }
+
+    /// The transcript event's type: "slide" for a new frame, "revisit" for
+    /// one shown again, so slide counts and strips needn't check a flag.
+    var kind: String { revisit ? "revisit" : "slide" }
 
     /// The image named relative to the transcript's directory — the slides
     /// directory sits beside the transcript, so this is "<base>.slides/<file>".
     var transcriptBody: String {
         let url = URL(fileURLWithPath: path)
         let relative = url.deletingLastPathComponent().lastPathComponent + "/" + url.lastPathComponent
-        return "▣ slide \(number)  \(relative)"
+        return (revisit ? "▣ back to slide \(number)  " : "▣ slide \(number)  ") + relative
     }
 }
 

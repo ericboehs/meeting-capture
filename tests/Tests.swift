@@ -87,6 +87,7 @@ do {
     expectEqual(event?.at, Date(timeIntervalSince1970: 1793216486.5), "and keeps when the frame was taken")
     expectEqual(event?.transcriptBody, "▣ slide 7  20260824_144024-teams-weekly-sync.slides/0007-144126.jpg",
                 "a slide names its image relative to the transcript")
+    expectEqual(event?.kind, "slide", "a saved frame is a slide event")
     expectTrue(SlideEvent.parse("not json") == nil, "a stray stdout line is not a slide")
     expectTrue(SlideEvent.parse(#"{"type":"other","n":1}"#) == nil, "nor is another event type")
     if let event, let rendered = renderEvent(kind: "slide", speaker: "", body: event.transcriptBody,
@@ -109,6 +110,7 @@ do {
         #!/bin/sh
         # args: --wait --pid P --title T --out DIR ($7 is DIR)
         echo '{"type":"slide","n":1,"at":1793216486,"path":"'"$7"'/0001-144126.jpg","reason":"first frame"}'
+        echo '{"type":"revisit","n":1,"at":1793216490,"path":"'"$7"'/0001-144126.jpg"}'
         echo "[log] meeting-capture-slides: waiting" >&2
         trap 'echo "{\\"type\\":\\"slide\\",\\"n\\":2,\\"at\\":1793216500,\\"path\\":\\"$7/0002-144140.jpg\\"}"; exit 0' TERM
         while :; do sleep 0.1; done
@@ -121,8 +123,9 @@ do {
                                          title: "Weekly Sync", startedAt: Date(timeIntervalSince1970: 0))
         expectTrue(capture != nil, "slide helper starts for a Teams meeting")
         var seen: [SlideEvent] = []
-        for _ in 0..<40 where seen.isEmpty { usleep(50_000); seen += capture?.takeEvents() ?? [] }
-        expectEqual(seen.map(\.number), [1], "a slide the helper reports reaches the session while it runs")
+        for _ in 0..<40 where seen.count < 2 { usleep(50_000); seen += capture?.takeEvents() ?? [] }
+        expectEqual(seen.map(\.number), [1, 1], "a slide the helper reports reaches the session while it runs")
+        expectEqual(seen.map(\.revisit), [false, true], "and so does a revisit, in order")
         expectTrue(seen.first?.path.hasPrefix("/tmp/meeting-capture-test/") == true
                        && seen.first?.path.contains("-teams-weekly-sync.slides/") == true,
                    "the helper was told to write beside the transcript")
@@ -178,6 +181,24 @@ do {
     let early = Utterance(speaker: "A", text: "one", startedAt: t0, changedAt: t0)
     let entries = Session.liveEntries([early], after: t0.addingTimeInterval(5))
     expectEqual(entries.first?.at, t0.addingTimeInterval(5), "a live entry never stamps before the last written line")
+}
+do {
+    let line = #"{"at":1793216600,"n":4,"path":"/t/20260824_144024-teams-weekly-sync.slides/0004-143801.jpg","type":"revisit"}"#
+    let event = SlideEvent.parse(line)
+    expectTrue(event?.revisit == true, "the helper's revisit report is read")
+    expectEqual(event?.kind, "revisit", "and is its own event type, so slide counts don't include it")
+    expectEqual(event?.reason, "revisit", "with revisit as its reason")
+    expectEqual(event?.transcriptBody, "▣ back to slide 4  20260824_144024-teams-weekly-sync.slides/0004-143801.jpg",
+                "a revisit names the earlier slide and its image")
+    if let event, let rendered = renderEvent(kind: event.kind, speaker: "", body: event.transcriptBody,
+                                             at: event.at, mode: .timeOfDay, extra: ["slide": event.number]) {
+        expectEqual(rendered.line, "[\(Recorder.clockText(from: event.at))] ▣ back to slide 4  20260824_144024-teams-weekly-sync.slides/0004-143801.jpg",
+                    "a revisit line has no (revisit) tag either")
+        expectTrue(rendered.json.contains(#""type":"revisit""#), "its jsonl event is a revisit")
+    } else {
+        expectTrue(false, "a revisit renders")
+    }
+    expectTrue(SlideEvent.parse(#"{"type":"revisit","n":4,"at":1}"#) == nil, "a revisit without an image is ignored")
 }
 expectEqual(TeamsApp().shareWindowTitle, "Shared content", "Teams shares open in a Shared content window")
 expectTrue(SlackApp().shareWindowTitle == nil, "Slack has no share window of its own")

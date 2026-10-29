@@ -116,7 +116,7 @@ func event(_ type: String, speaker: String = "", text: String, extra: [String: A
     payload.merge(extra) { a, _ in a }
     append(String(data: try! JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]), encoding: .utf8)!,
            to: jsonlPath)
-    let tag = type == "caption" || type == "slide" ? "" : "(\(type)) "
+    let tag = ["caption", "slide", "revisit"].contains(type) ? "" : "(\(type)) "
     let who = speaker.isEmpty ? "" : "\(speaker): "
     append("[\(clock.string(from: now))] \(tag)\(who)\(text)", to: txtPath)
     print("[\(clock.string(from: now))] \(tag)\(who)\(text)")
@@ -147,6 +147,7 @@ func say(_ speaker: String, _ text: String) {
 // MARK: - Slides
 
 var slideCount = 0
+var slidePaths: [Int: String] = [:]
 var slideIndex: FileHandle?
 
 func render(title: String, bullets: [String], number: Int, width: Int, height: Int) -> CGImage {
@@ -200,6 +201,7 @@ func showSlide(_ title: String, _ bullets: [String], deckNumber: Int) {
     let stem = String(format: "%04d-", slideCount) + fileStamp.string(from: now)
     writeJPEG(render(title: title, bullets: bullets, number: deckNumber, width: 2880, height: 2560),
               to: "\(slidesDir)/\(stem).jpg", quality: 0.85)
+    slidePaths[slideCount] = "\(slidesDir)/\(stem).jpg"
     writeJPEG(render(title: title, bullets: bullets, number: deckNumber, width: 480, height: 427),
               to: "\(slidesDir)/\(stem).thumb.jpg", quality: 0.8)
     let entry: [String: Any] = ["n": slideCount, "at": iso.string(from: now), "file": "\(stem).jpg",
@@ -209,6 +211,15 @@ func showSlide(_ title: String, _ bullets: [String], deckNumber: Int) {
            to: "\(slidesDir)/index.jsonl")
     event("slide", text: "▣ slide \(slideCount)  \(base).slides/\(stem).jpg",
           extra: ["slide": slideCount, "file": "\(slidesDir)/\(stem).jpg", "reason": entry["reason"]!])
+}
+
+/// The screen going back to a slide already saved: nothing new is written to
+/// the slides directory, only a revisit event to the transcript.
+func revisitSlide(_ number: Int) {
+    guard slides, let path = slidePaths[number] else { return }
+    let file = URL(fileURLWithPath: path).lastPathComponent
+    event("revisit", text: "▣ back to slide \(number)  \(base).slides/\(file)",
+          extra: ["slide": number, "file": path, "reason": "revisit"])
 }
 
 // MARK: - The meeting
@@ -258,6 +269,11 @@ say("Ada Lovelace", "Did we get the alerting in place so we'd catch it sooner ne
 say("Grace Hopper", "Alert is live as of Monday, it pages after five minutes of failures.")
 showSlide("Next Steps", ["Legacy services onto canary", "Retire old build agents", "Review alert thresholds"],
           deckNumber: 4)
+say("Katherine Johnson", "Can you flip back to the deploy numbers for a second?")
+revisitSlide(2)
+say("Grace Hopper", "Sure, that's the nine minute median there.")
+say("Katherine Johnson", "Got it, thanks.")
+revisitSlide(4)
 say("Ada Lovelace", "Great, thanks Grace. Anything else before we wrap?")
 say("Alan Turing", "Nothing from me.")
 say("Ada Lovelace", "Alright, thanks all, see you next week.")

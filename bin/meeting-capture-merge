@@ -182,8 +182,9 @@ def text_line(event):
     # Mirrors the recorder: anything that is not someone speaking is tagged by
     # kind, and an event with no speaker (a roster) gets no attribution.
     kind = event.get("type", "caption")
-    # A slide's text opens with ▣, which already says what it is.
-    tag = "" if kind in ("caption", "slide") else f"({kind}) "
+    # A slide's text opens with ▣, which already says what it is (so does a
+    # revisit's "▣ back to slide 3").
+    tag = "" if kind in ("caption", "slide", "revisit") else f"({kind}) "
     speaker = event.get("speaker", "")
     attribution = f"{speaker}: " if speaker else ""
     return f"[{clock}] {tag}{attribution}{event.get('text', '')}"
