@@ -106,6 +106,7 @@ write a second transcript of the same meeting.
 | `--popout-captions` | Teams: move captions into their own window, which a covered window can't pause |
 | `--popout-chat` | Open the meeting chat so it is recorded unattended; in Teams it also gets its own window |
 | `--people-snapshot` | Record who was in the meeting, once (Teams, Meet) |
+| `--slides` | Save each slide or page of a screen share as an image, with OCR text (Teams, Meet); see [Slides](#slides) |
 | `--dir <path>` | Output directory |
 | `--follow`, `--watch` | Watch whatever the running daemon is recording, never record |
 | `--interval <ms>` | Poll interval during a meeting (default 250) |
@@ -322,6 +323,39 @@ spends no attempts at all.
 
 Without the flag, a stalled call timer is reported in the log rather than left
 to look like a quiet meeting.
+
+### Slides
+
+With `--slides` (on in the agent) the daemon starts `meeting-capture-slides`
+beside each meeting. It saves the shared screen to `<transcript>.slides/`
+whenever something new settles on it, and adds a `▣ slide N` line to the
+transcript at that moment:
+
+- **Teams** opens a share in its own "Shared content" window once someone
+  presses the share's Pop out. The daemon presses it for you, once per share.
+  The helper captures that window.
+- **Google Meet** shows a presentation as a tile on its stage, among the
+  video tiles. The helper crops the meeting window to that tile, found by
+  accessibility every couple of seconds, so it follows the layout as it
+  changes. Nothing is saved while nobody presents.
+- Zoom and Slack show shares inline with no way to single them out yet.
+
+A frame is saved when at least 10% of what's on screen is new, allowing for
+scrolling, so paging through a document or a web app counts as well as a
+slide deck. Going back to an earlier slide adds `▣ back to slide N`, not a
+second copy. Each saved frame gets a 480 px thumbnail and on-device OCR text
+(`.txt`, columns in reading order) a moment later. The folder's layout is in
+[docs/canvas-contract.md](docs/canvas-contract.md#slides-slides_dir).
+
+Captures need **Screen Recording** permission for
+`~/.local/bin/meeting-capture-daemon`, granted once by hand (System Settings →
+Privacy & Security → Screen & System Audio Recording). Only the share is
+captured, never the whole screen, and it fails while the Mac is locked.
+
+```sh
+meeting-capture-slides --list                    # windows it could capture
+meeting-capture-slides --snapshot --window ID    # one frame, to check
+```
 
 ## Output
 
@@ -552,7 +586,9 @@ and agent restart (`tests/installer.sh`) and the merge tool's collapse rules
 
 Everything stays on your machine: transcripts are plain files under
 `~/.local/share/meeting-capture` and nothing is sent anywhere. It reads only
-the caption and chat panels of a meeting you are already in.
+the caption and chat panels of a meeting you are already in, and with
+`--slides` the screen share: the share window or Meet's presentation tile,
+never the rest of the screen.
 
 Recording people has laws and manners attached to it, both of which vary by
 where you live. Tell your colleagues.

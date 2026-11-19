@@ -40,9 +40,10 @@ the meeting ends.
   crashed mid-meeting, so treat the meeting as over.
 - `jsonl` and `txt` are `null` until the first line is written. A meeting with
   no captions yet has no transcript.
-- `slides_dir` is `null` when slides are off (no `--slides`) or the app has no
-  share window that can be captured (only Teams has one today). When it's set,
-  the folder may not exist until the first slide is saved.
+- `slides_dir` is `null` when slides are off (no `--slides`) or the app's
+  shares can't be captured: Teams and Google Meet are supported, Zoom and
+  Slack aren't. When it's set, the folder may not exist until the first slide
+  is saved.
 - When the meeting ends, `state.json` is rewritten with `"ended": true`,
   `"ended_at"` and `"duration"` (`"1:02:03"`). It stays until the next meeting
   starts, so the card can show "Ended · 1:02:03".
@@ -106,6 +107,11 @@ NNNN-HHMMSS.thumb.jpg  the same frame 480 px wide
 NNNN-HHMMSS.txt        on-device OCR of the frame (the daemon always asks for it)
 index.jsonl            one line per frame
 ```
+
+What a frame shows depends on the app. Teams: the whole "Shared content"
+window, title bar included. Google Meet: just the presentation tile, cropped
+out of the meeting window, so it's the size of that tile on screen (e.g.
+2052×1150) and changes size when the layout does.
 
 `index.jsonl` (one line per saved frame; revisits don't add lines):
 
