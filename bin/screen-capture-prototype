@@ -70,6 +70,7 @@ struct Options {
     var app: String?
     var title: String?
     var crop: [Double]?
+    var meetStage = false
     var directory: String?
     var interval = 1.0
     var threshold = 0.005
@@ -104,6 +105,10 @@ func usage(_ status: Int32 = 0) -> Never {
                            top-left; values all ≤ 1 are fractions of the window
 
     Change detection:
+      --meet-stage         Google Meet: crop to the presentation tile on the
+                           stage, following it as the layout changes (found
+                           by accessibility every 2s); nothing is saved while
+                           nobody presents
       --interval SEC       seconds between captures (default 1.0)
       --threshold FRAC     share of pixels that must differ from the last saved
                            frame before it's judged at all (default 0.005); --new
@@ -174,6 +179,7 @@ func parseOptions() -> Options {
             let parts = raw.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
             guard parts.count == 4, parts[2] > 0, parts[3] > 0 else { fail("--crop: expected X,Y,W,H, got \(raw)") }
             options.crop = parts
+        case "--meet-stage": options.meetStage = true
         case "--out": options.directory = (value(arg) as NSString).expandingTildeInPath
         case "--interval": options.interval = max(0.1, number(arg))
         case "--threshold": options.threshold = number(arg)
@@ -320,7 +326,8 @@ let probeWidth: CGFloat = 640
 
 /// One capture of the window, cropped per --crop: at full pixel resolution, or
 /// shrunk to `probeWidth` when `probe` is set.
-func capture(_ window: SCWindow, _ options: Options, probe: Bool = false) async throws -> CGImage {
+func capture(_ window: SCWindow, _ options: Options, probe: Bool = false,
+             stage: CGRect? = nil) async throws -> CGImage {
     let filter = SCContentFilter(desktopIndependentWindow: window)
     let info = SCShareableContent.info(for: filter)
     let full = CGFloat(info.pointPixelScale)
@@ -331,7 +338,8 @@ func capture(_ window: SCWindow, _ options: Options, probe: Bool = false) async 
     config.showsCursor = false
     config.ignoreShadowsSingleWindow = true
     let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-    guard let crop = options.crop else { return image }
+    guard let crop = stage.map({ [Double($0.minX), Double($0.minY), Double($0.width), Double($0.height)] })
+            ?? options.crop else { return image }
 
     let size = CGSize(width: image.width, height: image.height)
     let fractional = crop.allSatisfy { $0 <= 1 }
@@ -347,6 +355,73 @@ func capture(_ window: SCWindow, _ options: Options, probe: Bool = false) async 
             "--crop \(crop.map { String($0) }.joined(separator: ",")) is outside the \(image.width)×\(image.height) px window"])
     }
     return cropped
+}
+
+// MARK: - Google Meet's stage
+
+/// Google Meet has no share window: a presentation is one tile on the stage,
+/// among the video tiles, inside the browser window. Its tile is the one
+/// carrying the presentation's own controls ("Open in new window", "Zoom
+/// in"); a person's tile carries their name instead. Found by accessibility,
+/// since Meet's class names are build output that changes without notice.
+/// Measured on a live call 2026-11-19 (Safari web app): the tiles are the
+/// children of the AXLandmarkMain group.
+enum MeetStage {
+    static let presentationControls: Set<String> = ["Open in new window", "Zoom in"]
+
+    static func attribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
+        var value: AnyObject?
+        AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        return value
+    }
+    static func children(_ element: AXUIElement) -> [AXUIElement] {
+        attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []
+    }
+    static func frame(_ element: AXUIElement) -> CGRect {
+        var origin = CGPoint.zero, size = CGSize.zero
+        if let value = attribute(element, kAXPositionAttribute) { AXValueGetValue(value as! AXValue, .cgPoint, &origin) }
+        if let value = attribute(element, kAXSizeAttribute) { AXValueGetValue(value as! AXValue, .cgSize, &size) }
+        return CGRect(origin: origin, size: size)
+    }
+    static func find(_ element: AXUIElement, depth: Int = 0, maxDepth: Int,
+                     _ match: (AXUIElement) -> Bool) -> AXUIElement? {
+        if match(element) { return element }
+        guard depth < maxDepth else { return nil }
+        for child in children(element) {
+            if let found = find(child, depth: depth + 1, maxDepth: maxDepth, match) { return found }
+        }
+        return nil
+    }
+
+    /// The presentation tile, in points from the top-left of `window`
+    /// (global window-server bounds, which accessibility frames share), or
+    /// nil when nobody is presenting.
+    static func presentation(pid: pid_t, window: CGRect) -> CGRect? {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 2.0)
+        let windows = attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
+        guard let axWindow = windows.first(where: {
+            let f = frame($0)
+            return abs(f.minX - window.minX) < 4 && abs(f.minY - window.minY) < 4 && abs(f.width - window.width) < 4
+        }) ?? (windows.count == 1 ? windows.first : nil),
+              let main = find(axWindow, maxDepth: 12, {
+                  (attribute($0, kAXSubroleAttribute) as? String) == "AXLandmarkMain"
+              }) else { return nil }
+        guard let tile = children(main).first(where: { tile in
+            find(tile, maxDepth: 3) {
+                presentationControls.contains(attribute($0, kAXDescriptionAttribute) as? String ?? "")
+            } != nil
+        }) else { return nil }
+        let rect = frame(tile).offsetBy(dx: -window.minX, dy: -window.minY).insetBy(dx: 2, dy: 2)
+        return rect.width > 100 && rect.height > 60 ? rect.integral : nil
+    }
+
+    /// Whether two crops differ enough to call it a new layout: a tile
+    /// reflowing by a point or two is not.
+    static func moved(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.minX - b.minX) > 6 || abs(a.minY - b.minY) > 6
+            || abs(a.width - b.width) > 6 || abs(a.height - b.height) > 6
+    }
 }
 
 // MARK: - Change detection
@@ -934,6 +1009,10 @@ var lastError: String?
 var lastRefresh = Date()
 var frameSize: (Int, Int)?
 var lockedBundle = window?.owningApplication?.bundleIdentifier
+// --meet-stage: the presentation tile's rect, re-found every couple of seconds.
+var stage: CGRect?
+var lastStageLook = Date.distantPast
+var stageAbsentLogged = false
 
 while true {
     let tickStart = Date()
@@ -964,9 +1043,33 @@ while true {
         }
     }
 
-    if let window {
+    if options.meetStage, let current = window, tickStart.timeIntervalSince(lastStageLook) >= 2 {
+        lastStageLook = tickStart
+        let bounds = liveBounds(current.windowID) ?? current.frame
+        let found = current.owningApplication.flatMap { MeetStage.presentation(pid: $0.processID, window: bounds) }
+        switch (stage, found) {
+        case (nil, let rect?):
+            log("presentation on Meet's stage at \(Int(rect.minX)),\(Int(rect.minY)) \(Int(rect.width))×\(Int(rect.height))")
+            detector.resized()
+            stageAbsentLogged = false
+        case (let old?, let rect?) where MeetStage.moved(old, rect):
+            log("presentation moved to \(Int(rect.minX)),\(Int(rect.minY)) \(Int(rect.width))×\(Int(rect.height)) — re-baselining")
+            detector.resized()
+        case (_?, nil):
+            log("presentation left Meet's stage")
+        case (nil, nil) where !stageAbsentLogged:
+            log("nobody is presenting on Meet's stage; waiting")
+            stageAbsentLogged = true
+        default: break
+        }
+        if let found, stage.map({ MeetStage.moved($0, found) }) ?? true { stage = found }
+        if found == nil { stage = nil }
+    }
+    let skipForStage = options.meetStage && stage == nil
+
+    if let window, !skipForStage {
         do {
-            let probe = try await capture(window, options, probe: true)
+            let probe = try await capture(window, options, probe: true, stage: stage)
             lastError = nil
             if let record = options.record {
                 try? FileManager.default.createDirectory(atPath: record, withIntermediateDirectories: true)
@@ -1000,7 +1103,7 @@ while true {
                 emitEvent(event)
             }
             if reading.save || options.snapshot {
-                let image = try await capture(window, options)
+                let image = try await capture(window, options, stage: stage)
                 let saver = openSaver(for: window)
                 let url = try saver.save(image, at: tickStart, reading: reading)
                 detector.didSave(sample, number: saver.count)

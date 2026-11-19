@@ -76,9 +76,13 @@ do {
     let base = Recorder.baseName(app: "teams", meeting: "Weekly Sync | Microsoft Teams", startedAt: startedAt)
     expectEqual(base, "20260824_144024-teams-weekly-sync", "base name is stamp, app and slug")
     // The slides directory sits beside the transcript under the same name.
-    expectEqual(SlideCapture.arguments(pid: 42, shareWindowTitle: "Shared content", directory: "/t/\(base).slides"),
+    expectEqual(SlideCapture.arguments(pid: 42, selection: TeamsApp().slideSelection!, directory: "/t/\(base).slides"),
                 ["--wait", "--ocr", "--pid", "42", "--title", "Shared content", "--out", "/t/20260824_144024-teams-weekly-sync.slides"],
                 "slide helper waits for the pid's share window and writes beside the transcript")
+    expectEqual(SlideCapture.arguments(pid: 7, selection: MeetApp().slideSelection!, directory: "/t/m.slides"),
+                ["--wait", "--ocr", "--pid", "7", "--title", "Meet - ", "--meet-stage", "--out", "/t/m.slides"],
+                "Meet: the meeting window, cropped to the presentation on its stage")
+    expectTrue(ZoomApp().slideSelection == nil && SlackApp().slideSelection == nil, "Zoom and Slack have no slide capture yet")
 }
 do {
     let line = #"{"at":1793216486.5,"change":0.18,"n":7,"path":"/t/20260824_144024-teams-weekly-sync.slides/0007-144126.jpg","reason":"change","type":"slide"}"#
@@ -291,6 +295,25 @@ do {
     expectEqual(MeetApp.messages(from: [Row(sender: "", text: "no name yet", age: "1 min")])
                     .first?.author,
                 "Unknown", "a message with no name above it still gets recorded")
+}
+
+// Meet's chat as of 2026-11: a flat list of sender, time, message groups,
+// with follow-ups from the same person as bare message groups.
+do {
+    let items: [(text: String, isTime: Bool)] = [
+        ("Louis Umile", false), ("11:00 AM", true), ("good morning", false),
+        ("a follow-up", false),
+        ("Helen French", false), ("11:01 AM", true), ("hello all", false),
+    ]
+    let messages = MeetApp.messages(from: MeetApp.flatChatRows(items))
+    expectEqual(messages.map { $0.author }, ["Louis Umile", "Louis Umile", "Helen French"],
+                "flat chat: the row before a time is the sender, carried to follow-ups")
+    expectEqual(messages.map { $0.text }, ["good morning", "a follow-up", "hello all"],
+                "flat chat: time rows are not messages")
+    expectTrue(isMeetClockTime("11:06 AM") && isMeetClockTime("9:05 pm") && isMeetClockTime("14:30"),
+               "clock times in 12- and 24-hour forms are time rows")
+    expectTrue(!isMeetClockTime("Weinars") && !isMeetClockTime("at 11:06 AM we start"),
+               "a message is not a time row, even one mentioning a time")
 }
 
 // --- Tucking the popped-out captions window ------------------------------

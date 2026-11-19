@@ -1620,6 +1620,10 @@ protocol MeetingApp {
     /// alongside video, which slide capture can't single out yet.
     var shareWindowTitle: String? { get }
 
+    /// How the slide helper finds the share, for --slides: its window
+    /// selection arguments. nil: slides aren't supported for this app.
+    var slideSelection: [String]? { get }
+
     /// Whether this app's web content has finished waking up. The default
     /// asks for DOM ids, which is what Chromium and Electron publish; WebKit
     /// publishes none, so Safari web apps override this.
@@ -1628,6 +1632,7 @@ protocol MeetingApp {
 
 extension MeetingApp {
     var shareWindowTitle: String? { nil }
+    var slideSelection: [String]? { shareWindowTitle.map { ["--title", $0] } }
     // Teams-style: an utterance is done when its element disappears.
     var finalizesWhenSuperseded: Bool { false }
     var idleFinalizeSeconds: TimeInterval? { nil }
@@ -3721,7 +3726,7 @@ func captureMeetRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
         if findElement(from: panel, where: {
             axString($0, kAXRoleAttribute) == "AXWebArea"
                 && axDescription($0) == meetChatWebAreaDescription
-        }) != nil { return .chat }
+        }) != nil || meetChatList(in: window) != nil { return .chat }
         return .other
     }
 
@@ -3848,6 +3853,34 @@ func meetContributorCount(from title: String) -> Int? {
 
 let meetLeaveDescription = "Leave call"
 let meetSidePanelDescription = "Side panel"
+
+/// Meet's chat as of 2026-11: back in the main document, as one flat list of
+/// groups — the sender, then the time ("11:06 AM"), then the message; a
+/// follow-up from the same person is just another message group. A time row
+/// is what marks it out from the rest of the side panel.
+func isMeetChatTimeRow(_ element: AXUIElement) -> Bool {
+    guard axString(element, kAXRoleAttribute) == kAXGroupRole else { return false }
+    let texts = axStaticTexts(element)
+    return texts.count == 1 && isMeetClockTime(texts[0])
+}
+
+func isMeetClockTime(_ text: String) -> Bool {
+    text.range(of: #"^\d{1,2}:\d{2}(\s?[AaPp]\.?[Mm]\.?)?$"#, options: .regularExpression) != nil
+}
+
+/// The flat chat list: the group in the side panel with time rows among its
+/// children. Looked for only inside the side panel, so the stage's own
+/// clock ("11:06 AM" in the top bar) can't pass for one.
+func meetChatList(in root: AXUIElement) -> AXUIElement? {
+    guard let panel = findElement(from: root, where: {
+        axDescription($0) == meetSidePanelDescription && !axChildren($0).isEmpty
+    }) else { return nil }
+    return findElement(from: panel) { element in
+        axString(element, kAXRoleAttribute) == kAXGroupRole
+            && axChildren(element).count >= 2
+            && axChildren(element).contains(where: isMeetChatTimeRow)
+    }
+}
 let meetParticipantsListDescription = "Participants"
 let meetPeoplePanelHeading = "People"
 let meetChatWebAreaDescription = "Chat"
@@ -3886,6 +3919,9 @@ func scrollWheel(at point: CGPoint, direction: Int32) {
 final class MeetApp: MeetingApp {
     let id = "meet"
     let displayName = "Google Meet"
+    /// Meet shows a presentation as a tile on its stage, not in a window of
+    /// its own, so the helper crops the meeting window to that tile.
+    let slideSelection: [String]? = ["--title", "Meet - ", "--meet-stage"]
     // Matches the --bundlepath argument. The bundle identifier carries a UUID
     // generated when the web app was installed, so it is useless here.
     let processPattern = "Web App .*Google Meet.app"
@@ -3930,8 +3966,14 @@ final class MeetApp: MeetingApp {
     /// here keys off them.
     private let leaveDescription = "Leave call"
     private let captionsDescription = "Captions"
-    private let captionsOnLabel = "Turn off captions"
-    private let captionsOffLabel = "Turn on captions"
+    /// The labels the captions button has worn. Since 2026-11 it lives in a
+    /// "Captions and translation" dialog and says "live captions".
+    private let captionsOnLabels: Set<String> = ["Turn off captions", "Turn off live captions"]
+    private let captionsOffLabels: Set<String> = ["Turn on captions", "Turn on live captions"]
+    /// The toolbar control since 2026-11: a toggle whose value is 1 while
+    /// captions are on, but pressing it opens the dialog with the real button
+    /// rather than switching anything; pressed again, it closes the dialog.
+    private let captionsToggleDescription = "Captions and translation"
     /// The chat composer. Kept only as a historical note: Google's move to
     /// the Chat iframe removed it from the tree (see chatContainer).
     private let composerDescription = "Send a message"
@@ -3971,22 +4013,75 @@ final class MeetApp: MeetingApp {
         // The button label is the authority: the caption group keeps its last
         // text long after anyone stopped speaking, so its presence says only
         // that captions were on at some point.
-        captionsButton(app).map { axDescription($0) == captionsOnLabel } ?? false
+        if let toggle = captionsToggle(app) { return toggleIsOn(toggle) }
+        return captionsButton(app).map { captionsOnLabels.contains(axDescription($0)) } ?? false
     }
 
     func requestCaptions(pid: pid_t) -> CaptionRequest {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 5.0)
+        if let toggle = captionsToggle(app) { return requestCaptions(app, toggle: toggle) }
         guard let button = captionsButton(app) else { return .unreachable }
-        guard axDescription(button) == captionsOffLabel else { return .alreadyOn }
+        guard captionsOffLabels.contains(axDescription(button)) else { return .alreadyOn }
         return AXUIElementPerformAction(button, kAXPressAction as CFString) == .success
             ? .pressed : .unreachable
+    }
+
+    /// The dialog dance: open it, press "Turn on captions" inside, close it.
+    /// Measured live 2026-11-19: Escape posted to the app does not close the
+    /// dialog (the web view lacks focus), the toggle pressed again does, and
+    /// captions stay on.
+    private func requestCaptions(_ app: AXUIElement, toggle: AXUIElement) -> CaptionRequest {
+        guard !toggleIsOn(toggle) else { return .alreadyOn }
+        var opened = false
+        if captionsDialog(app) == nil {
+            guard AXUIElementPerformAction(toggle, kAXPressAction as CFString) == .success else { return .unreachable }
+            opened = true
+        }
+        defer {
+            if opened, captionsDialog(app) != nil {
+                AXUIElementPerformAction(toggle, kAXPressAction as CFString)
+            }
+        }
+        var button: AXUIElement?
+        for _ in 0..<10 where button == nil {
+            button = captionsDialog(app).flatMap { dialog in
+                findElement(from: dialog) { captionsOffLabels.contains(axDescription($0)) }
+            }
+            if button == nil { usleep(200_000) }
+        }
+        guard let button,
+              AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else { return .unreachable }
+        for _ in 0..<10 where !toggleIsOn(toggle) { usleep(200_000) }
+        return .pressed
+    }
+
+    /// Asked every second, so the element is kept and checked with one call
+    /// rather than found again from the top of the tree each time.
+    private var cachedCaptionsToggle: AXUIElement?
+
+    private func captionsToggle(_ app: AXUIElement) -> AXUIElement? {
+        if let cached = cachedCaptionsToggle, axDescription(cached) == captionsToggleDescription { return cached }
+        cachedCaptionsToggle = findElement(from: app) {
+            axDescription($0) == captionsToggleDescription && axString($0, kAXRoleAttribute) == "AXCheckBox"
+        }
+        return cachedCaptionsToggle
+    }
+
+    private func captionsDialog(_ app: AXUIElement) -> AXUIElement? {
+        findElement(from: app) {
+            axDescription($0) == captionsToggleDescription && axString($0, kAXRoleAttribute) == kAXGroupRole
+        }
+    }
+
+    private func toggleIsOn(_ toggle: AXUIElement) -> Bool {
+        (axAttribute(toggle, kAXValueAttribute) as? NSNumber)?.intValue == 1
     }
 
     private func captionsButton(_ app: AXUIElement) -> AXUIElement? {
         findElement(from: app) {
             let label = axDescription($0)
-            return label == captionsOnLabel || label == captionsOffLabel
+            return captionsOnLabels.contains(label) || captionsOffLabels.contains(label)
         }
     }
 
@@ -3997,7 +4092,10 @@ final class MeetApp: MeetingApp {
     func captionsControlDescription(_ app: AXUIElement) -> String? {
         let buttons = findElements(from: app, limit: 4) {
             let label = axDescription($0)
-            return label == captionsOnLabel || label == captionsOffLabel
+            return captionsOnLabels.contains(label) || captionsOffLabels.contains(label)
+        }
+        if buttons.isEmpty, let toggle = captionsToggle(app) {
+            return "its \"\(captionsToggleDescription)\" toggle reads \(toggleIsOn(toggle) ? "on" : "off")"
         }
         let labels = buttons.map { "\"\(axDescription($0))\"" }.joined(separator: ", ")
         switch buttons.count {
@@ -4120,6 +4218,7 @@ final class MeetApp: MeetingApp {
 
     func resetCaptureState() {
         history.reset()
+        cachedCaptionsToggle = nil
         chatOpenAttempts = 0
         nextChatOpenAttempt = .distantPast
     }
@@ -4134,8 +4233,13 @@ final class MeetApp: MeetingApp {
     /// and reopening it forever would be an argument.
     func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
                           popOutCaptions: Bool, popOutChat: Bool, popOutShare: Bool) {
-        guard popOutChat, !chatPanelOpen(app) else { return }
-        guard chatOpenAttempts < 2, now >= nextChatOpenAttempt else { return }
+        // Attempts first: the open check walks the tree, and once both tries
+        // are spent (or between them) there is nothing to decide.
+        guard popOutChat, chatOpenAttempts < 2, now >= nextChatOpenAttempt else { return }
+        guard !chatPanelOpen(app) else {
+            nextChatOpenAttempt = now.addingTimeInterval(10)
+            return
+        }
         chatOpenAttempts += 1
         nextChatOpenAttempt = now.addingTimeInterval(60)
         guard let button = findElement(from: app, where: {
@@ -4149,10 +4253,17 @@ final class MeetApp: MeetingApp {
     /// is open, so its presence is the test (the composer this used to look
     /// for is no longer in the tree at all).
     private func chatPanelOpen(_ app: AXUIElement) -> Bool {
-        findElement(from: app) {
-            axString($0, kAXRoleAttribute) == "AXWebArea"
-                && axDescription($0) == meetChatWebAreaDescription
-        } != nil
+        if chatContainer(app) != nil { return true }
+        // The flat list needs one message to be recognised. Chat open on a
+        // quiet call has none, and the chat button is a toggle: pressing it
+        // then would close the panel. A side panel showing anything but the
+        // participant list counts as open.
+        guard let panel = findElement(from: app, where: {
+            axDescription($0) == meetSidePanelDescription && !axChildren($0).isEmpty
+        }) else { return false }
+        return findElement(from: panel) {
+            axString($0, kAXRoleAttribute) == kAXListRole && axDescription($0) == meetParticipantsListDescription
+        } == nil
     }
 
     /// Meet's chat lives in its own web area now.
@@ -4171,7 +4282,7 @@ final class MeetApp: MeetingApp {
         findElement(from: app) {
             axString($0, kAXRoleAttribute) == "AXWebArea"
                 && axDescription($0) == meetChatWebAreaDescription
-        }
+        } ?? meetChatList(in: app)
     }
 
     /// Pull the messages out of that web area.
@@ -4187,6 +4298,26 @@ final class MeetApp: MeetingApp {
     /// message alone when the same person sends two in a row. A reactions
     /// AXList can sit between them and is skipped by role.
     func chatMessages(in container: AXUIElement) -> [ChatMessage] {
+        if axString(container, kAXRoleAttribute) != "AXWebArea" {
+            // Read from the end only: this runs every poll, and the list keeps
+            // every message of the call. Back far enough for ~20 messages,
+            // then on to the nearest sender row, so a follow-up at the edge
+            // keeps its author (and so its id).
+            let children = axChildren(container)
+            var items: [(text: String, isTime: Bool)] = []
+            var index = children.count - 1
+            while index >= 0 {
+                let child = children[index]
+                let texts = axStaticTexts(child)
+                let isTime = texts.count == 1 && isMeetClockTime(texts[0])
+                    && axString(child, kAXRoleAttribute) == kAXGroupRole
+                items.insert((texts.joined(separator: " "), isTime), at: 0)
+                // items[0] is a sender when items[1] is a time.
+                if items.count >= 60, items.count >= 2, items[1].isTime { break }
+                index -= 1
+            }
+            return MeetApp.messages(from: MeetApp.flatChatRows(items)).suffix(20)
+        }
         var rows: [MeetChatRow] = []
         func walk(_ element: AXUIElement, depth: Int) {
             guard depth < 12 else { return }
@@ -4219,6 +4350,28 @@ final class MeetApp: MeetingApp {
         guard let text = parts.last else { return nil }
         return MeetChatRow(sender: parts.count >= 2 ? parts[parts.count - 2] : "",
                            text: text, age: age)
+    }
+
+    /// The 2026-11 flat list, as (text, is-a-time-row) per child: a row just
+    /// before a time row is the sender, a time row is skipped, and anything
+    /// else is a message from the latest sender.
+    static func flatChatRows(_ items: [(text: String, isTime: Bool)]) -> [MeetChatRow] {
+        var rows: [MeetChatRow] = []
+        var sender = "", time = ""
+        var index = 0
+        while index < items.count {
+            let item = items[index]
+            if item.isTime {
+                time = item.text
+            } else if index + 1 < items.count, items[index + 1].isTime {
+                sender = item.text
+            } else if !item.text.isEmpty {
+                rows.append(MeetChatRow(sender: sender, text: item.text, age: time))
+                sender = ""  // carried down by messages(from:)
+            }
+            index += 1
+        }
+        return rows
     }
 
     /// The comma-wrapped age that ends every message row.
@@ -5601,14 +5754,14 @@ final class SlideCapture {
 
     /// The helper's arguments: only `pid`'s windows titled like the app's
     /// share window, written beside the transcript (`<base>.slides/`).
-    static func arguments(pid: pid_t, shareWindowTitle: String, directory: String) -> [String] {
+    static func arguments(pid: pid_t, selection: [String], directory: String) -> [String] {
         // --ocr: every slide gets its text beside it, for the /meeting copilot.
-        ["--wait", "--ocr", "--pid", String(pid), "--title", shareWindowTitle, "--out", directory]
+        ["--wait", "--ocr", "--pid", String(pid)] + selection + ["--out", directory]
     }
 
     static func start(options: Options, meetingApp: MeetingApp, pid: pid_t,
                       title: String, startedAt: Date) -> SlideCapture? {
-        guard let shareTitle = meetingApp.shareWindowTitle else {
+        guard let selection = meetingApp.slideSelection else {
             status("--slides: \(meetingApp.displayName) shows shares inside the meeting window, which slide capture can't single out yet")
             return nil
         }
@@ -5622,7 +5775,7 @@ final class SlideCapture {
             .appendingPathComponent(base + ".slides").path
         let process = Process()
         process.executableURL = URL(fileURLWithPath: helper)
-        process.arguments = arguments(pid: pid, shareWindowTitle: shareTitle, directory: directory)
+        process.arguments = arguments(pid: pid, selection: selection, directory: directory)
         // stderr inherited: its log lines land in ours, in our format. stdout
         // carries one JSON event per saved slide.
         let output = Pipe()
