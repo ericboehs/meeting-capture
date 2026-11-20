@@ -19,6 +19,7 @@
 
 import ApplicationServices
 import AppKit
+import Carbon
 import CoreGraphics
 import Foundation
 
@@ -3006,8 +3007,12 @@ final class TeamsApp: MeetingApp {
         let prior = bringToFront(pid: pid, window: standardWindow(app))
         defer { usleep(250_000); restoreFrontmost(prior) }
         let source = CGEventSource(stateID: .privateState)
-        let keyA: CGKeyCode = 0
-        guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyA, keyDown: true),
+        // A virtual key code is a physical position, not a letter: code 0 is
+        // A on QWERTY but Q on AZERTY, where ⇧⌘Q logs the user out. So find
+        // whichever key types "a" in the layout in use right now, and press
+        // nothing if there is none.
+        guard let keyA = keyCode(typing: "a"),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: keyA, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: keyA, keyDown: false) else {
             return .unreachable
         }
@@ -3045,6 +3050,32 @@ final class TeamsApp: MeetingApp {
             let id = String(axDomID(body).dropFirst("message-body-".count))
             return ChatMessage(id: id, author: author.isEmpty ? "Unknown" : author, text: text)
         }
+    }
+}
+
+/// The virtual key that types `character` (unmodified) in the current
+/// keyboard layout, or nil when no key does. Synthesized shortcuts must go
+/// through this: key codes name physical keys, and the letter on them depends
+/// on the layout. Looked up per press so a layout switch is honoured.
+func keyCode(typing character: String) -> CGKeyCode? {
+    guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue()
+            ?? TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
+          let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return nil }
+    let data = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue() as Data
+    return data.withUnsafeBytes { buffer -> CGKeyCode? in
+        guard let layout = buffer.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else { return nil }
+        for code in 0..<128 {
+            var deadKeys: UInt32 = 0
+            var length = 0
+            var chars = [UniChar](repeating: 0, count: 4)
+            let status = UCKeyTranslate(layout, UInt16(code), UInt16(kUCKeyActionDown), 0,
+                                        UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysBit),
+                                        &deadKeys, chars.count, &length, &chars)
+            if status == noErr, String(utf16CodeUnits: chars, count: length) == character {
+                return CGKeyCode(code)
+            }
+        }
+        return nil
     }
 }
 

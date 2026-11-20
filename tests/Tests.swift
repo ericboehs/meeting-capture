@@ -2256,6 +2256,18 @@ do {
     }
 }
 
+// --- keyCode(typing:) ---------------------------------------------------
+//
+// The captions shortcut is ⇧⌘A, but a key code is a physical key: code 0 is A
+// on QWERTY and Q on AZERTY, where ⇧⌘Q logs the user out. The key is looked
+// up by the letter it types in whatever layout this machine has.
+
+do {
+    expectTrue(keyCode(typing: "a") != nil, "some key types 'a' in the current layout")
+    expectTrue(keyCode(typing: "a") != keyCode(typing: "q"), "the A key is never the Q key")
+    expectEqual(keyCode(typing: "ab"), nil, "no single key types two letters")
+}
+
 // --- Summary ------------------------------------------------------------
 
 print(failures == 0 ? "\nall \(count) assertions passed" : "\n\(failures)/\(count) assertions FAILED")
